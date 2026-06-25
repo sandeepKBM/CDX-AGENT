@@ -1,0 +1,33 @@
+# Example workspace configuration for CDX-AGENT
+
+primary_repo: /path/to/primary/repo
+dependency_repos:
+  - name: openpi
+    package: openpi
+    repo_root: /path/to/OpenPI
+    mode: read_only
+    editable: false
+    present: true
+  - name: robosuite
+    package: robosuite
+    repo_root: /path/to/robosuite
+    mode: read_only
+    editable: false
+    present: true
+exclude_dirs:
+  - .git
+  - .venv
+  - checkpoints
+  - data
+  - datasets
+  - logs
+  - outputs
+  - runs
+  - wandb
+include_third_party_dependencies: false
+edit_policy:
+  primary_repo: editable
+  dependency_repos: read_only_unless_explicit
+scan_limits:
+  primary: 20000
+  dependency: 5000

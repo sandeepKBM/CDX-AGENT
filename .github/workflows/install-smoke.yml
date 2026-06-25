@@ -1,0 +1,33 @@
+name: install-smoke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run Linux installer
+        run: bash scripts/install.sh
+      - name: Verify non-editable install
+        run: |
+          python -m venv /tmp/cdx-agent-wheel
+          /tmp/cdx-agent-wheel/bin/python -m pip install --upgrade pip
+          /tmp/cdx-agent-wheel/bin/python -m pip install .
+          /tmp/cdx-agent-wheel/bin/cdx-agent --help
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run Windows installer
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/install.ps1
