@@ -14,9 +14,9 @@ import subprocess
 import sys
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 try:  # Python 3.11+ ships tomllib; Python 3.10 uses tomli.
@@ -196,10 +196,15 @@ def _repo_root(repo: Path) -> Path:
 
 
 def _is_home_like_dir(path: Path) -> bool:
+    # Ancestor check, not exact-match-only: a subdirectory of home (or a
+    # symlink resolving into it) is just as unsafe to bulk-scan as home
+    # itself. Matches the fix applied to config.py::is_home_like_dir.
     try:
-        return path.resolve() == HOME_ROOT.resolve()
+        resolved = path.resolve()
+        home = HOME_ROOT.resolve()
     except OSError:
         return False
+    return resolved == home or home in resolved.parents
 
 
 def resolve_repo_root(repo_arg: str, force_home_scan: bool = False) -> Path:
@@ -215,30 +220,118 @@ def _looks_like_project_dir(repo: Path) -> bool:
     return any(marker.exists() for marker in _project_markers(repo))
 
 
+# Upper bound on how many files a single scan will ever walk, independent of
+# `max_files`. Exists so prioritized truncation (below) doesn't turn into an
+# unbounded walk on a pathologically large tree.
+SCAN_HARD_CEILING = 200_000
+
+
+def _file_priority_key(path: Path, repo: Path) -> tuple[int, int, float, str]:
+    """Lower sorts first. Prefers entrypoint-name-like files, then shallower
+    paths, then most-recently-modified, so truncation (when the scan exceeds
+    `max_files`) is more likely to keep the files that actually matter instead
+    of whatever `os.walk` happened to reach first."""
+    try:
+        rel = path.relative_to(repo)
+    except ValueError:
+        rel = path
+    depth = len(rel.parts)
+    entrypoint_rank = 0 if ENTRYPOINT_RE.search(path.name) else 1
+    try:
+        mtime_rank = -path.stat().st_mtime
+    except OSError:
+        mtime_rank = 0.0
+    return (entrypoint_rank, depth, mtime_rank, str(rel))
+
+
 def _iter_files(
     repo: Path,
     max_files: int,
     skip_dirs: set[str] | None = None,
-) -> tuple[list[Path], bool]:
-    files: list[Path] = []
-    truncated = False
+) -> tuple[list[Path], bool, list[Path]]:
+    """Returns (kept_files, truncated, dropped_sample). `dropped_sample` is a
+    representative slice (not exhaustive) of files cut by truncation, so
+    callers can report *what* was dropped instead of just *that* something
+    was dropped."""
+    all_files: list[Path] = []
     blocked_dirs = set(SKIP_DIRS)
     if skip_dirs:
         blocked_dirs.update(skip_dirs)
+    hit_hard_ceiling = False
     for root, dirs, filenames in os.walk(repo):
         dirs[:] = [d for d in dirs if d not in blocked_dirs]
         root_path = Path(root)
         for filename in filenames:
-            files.append(root_path / filename)
-            if len(files) >= max_files:
-                truncated = True
-                return files, truncated
-    return files, truncated
+            all_files.append(root_path / filename)
+            if len(all_files) >= SCAN_HARD_CEILING:
+                hit_hard_ceiling = True
+                break
+        if hit_hard_ceiling:
+            break
+
+    if len(all_files) <= max_files and not hit_hard_ceiling:
+        return all_files, False, []
+
+    ranked = sorted(all_files, key=lambda p: _file_priority_key(p, repo))
+    kept = ranked[:max_files]
+    dropped = ranked[max_files:]
+    kept_set = set(kept)
+    # Preserve original walk order for kept files so downstream node/edge
+    # ordering stays stable and predictable, prioritization only decides
+    # *which* files survive the cap, not the order they're processed in.
+    ordered_kept = [p for p in all_files if p in kept_set]
+    return ordered_kept, True, dropped[:50]
 
 
-def _tags_from_text(text: str) -> list[str]:
+def _tags_from_text(text: str, hints: Iterable[str] = TOPIC_HINTS) -> list[str]:
     lower = text.lower()
-    return sorted({hint for hint in TOPIC_HINTS if hint in lower})
+    return sorted({hint for hint in hints if hint in lower})
+
+
+def _discover_topic_hints_from_repo(repo: Path) -> set[str]:
+    """Cheap, domain-agnostic discovery fallback: pulls `[project].keywords`
+    and top-level local package/module names out of pyproject.toml, so a
+    repo with no explicit `topic_hints` override in workspace.yaml still gets
+    some non-generic tags instead of only ever matching the shipped
+    robotics-flavored defaults (E2 fix)."""
+    discovered: set[str] = set()
+    pyproject = repo / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        project = data.get("project") if isinstance(data, dict) else {}
+        if isinstance(project, dict):
+            keywords = project.get("keywords")
+            if isinstance(keywords, list):
+                for keyword in keywords:
+                    if isinstance(keyword, str) and keyword.strip():
+                        discovered.add(_normalize_name(keyword.strip()))
+    for parent in (repo, repo / "src"):
+        if not parent.is_dir():
+            continue
+        for child in parent.iterdir():
+            if child.is_dir() and (child / "__init__.py").exists():
+                discovered.add(_normalize_name(child.name))
+    return {hint for hint in discovered if hint}
+
+
+def resolve_topic_hints(repo: Path) -> tuple[str, ...]:
+    """Topic hints used to tag scanned files (see `_tags_from_text`).
+    Precedence: an explicit `topic_hints` list in workspace.yaml if present,
+    else the shipped defaults (`TOPIC_HINTS`) merged with a cheap discovery
+    pass over the repo's own pyproject.toml (E2 fix -- previously this was
+    only ever the fixed, robotics-flavored constant tuple with no override or
+    discovery mechanism)."""
+    try:
+        payload = _workspace_read_yaml(_workspace_config_path(repo))
+    except (RuntimeError, ValueError):
+        payload = {}
+    override = payload.get("topic_hints") if isinstance(payload, dict) else None
+    if isinstance(override, list) and override:
+        return tuple(sorted({_normalize_name(str(item)) for item in override if str(item).strip()}))
+    return tuple(sorted(set(TOPIC_HINTS) | _discover_topic_hints_from_repo(repo)))
 
 
 def _path_refs_from_text(text: str) -> list[str]:
@@ -262,7 +355,7 @@ def _parse_python_ast(path: Path) -> tuple[ast.AST | None, list[dict[str, Any]],
         return None, [error], text
 
 
-def _scan_python(path: Path, repo: Path) -> tuple[FileNode, list[dict[str, Any]]]:
+def _scan_python(path: Path, repo: Path, hints: Iterable[str] = TOPIC_HINTS) -> tuple[FileNode, list[dict[str, Any]]]:
     tree, parse_errors, text = _parse_python_ast(path)
     imports: list[str] = []
     functions: list[str] = []
@@ -275,7 +368,7 @@ def _scan_python(path: Path, repo: Path) -> tuple[FileNode, list[dict[str, Any]]
                 imports=[],
                 classes=[],
                 functions=[],
-                tags=_tags_from_text(text),
+                tags=_tags_from_text(text, hints),
                 path_refs=_path_refs_from_text(text),
             ),
             parse_errors,
@@ -301,14 +394,14 @@ def _scan_python(path: Path, repo: Path) -> tuple[FileNode, list[dict[str, Any]]
             imports=sorted(set(imports)),
             classes=sorted(set(classes)),
             functions=sorted(set(functions)),
-            tags=_tags_from_text(text),
+            tags=_tags_from_text(text, hints),
             path_refs=_path_refs_from_text(text),
         ),
         parse_errors,
     )
 
 
-def _scan_textual(path: Path, repo: Path, kind: str) -> FileNode:
+def _scan_textual(path: Path, repo: Path, kind: str, hints: Iterable[str] = TOPIC_HINTS) -> FileNode:
     text = path.read_text(encoding="utf-8", errors="ignore")
     return FileNode(
         path=str(path.relative_to(repo)),
@@ -316,7 +409,7 @@ def _scan_textual(path: Path, repo: Path, kind: str) -> FileNode:
         imports=[],
         classes=[],
         functions=[],
-        tags=_tags_from_text(text),
+        tags=_tags_from_text(text, hints),
         path_refs=_path_refs_from_text(text),
     )
 
@@ -477,24 +570,26 @@ def _scan_repository(
     repo: Path,
     max_files: int,
     skip_dirs: set[str] | None = None,
-) -> tuple[list[FileNode], list[dict[str, Any]], list[Path], bool]:
+    topic_hints: Iterable[str] | None = None,
+) -> tuple[list[FileNode], list[dict[str, Any]], list[Path], bool, list[Path]]:
     nodes: list[FileNode] = []
     parse_errors: list[dict[str, Any]] = []
-    files, truncated = _iter_files(repo, max_files=max_files, skip_dirs=skip_dirs)
+    hints = tuple(topic_hints) if topic_hints is not None else resolve_topic_hints(repo)
+    files, truncated, dropped = _iter_files(repo, max_files=max_files, skip_dirs=skip_dirs)
     for path in files:
         kind = _classify_file(path)
         if kind is None:
             continue
         try:
             if kind == "python":
-                node, node_errors = _scan_python(path, repo)
+                node, node_errors = _scan_python(path, repo, hints)
                 nodes.append(node)
                 parse_errors.extend(node_errors)
             else:
-                nodes.append(_scan_textual(path, repo, kind))
+                nodes.append(_scan_textual(path, repo, kind, hints))
         except OSError:
             continue
-    return nodes, parse_errors, files, truncated
+    return nodes, parse_errors, files, truncated, dropped
 
 
 def _normalize_name(text: str) -> str:
@@ -533,18 +628,26 @@ def build_graph(
     task: str = "",
     max_files: int = 20000,
     skip_dirs: set[str] | None = None,
+    topic_hints: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     repo = _repo_root(Path(repo_arg))
     graph_dir = repo / ".codex_graph"
     graph_dir.mkdir(parents=True, exist_ok=True)
-    nodes, parse_errors, files, truncated = _scan_repository(repo, max_files=max_files, skip_dirs=skip_dirs)
+    effective_hints = tuple(topic_hints) if topic_hints is not None else resolve_topic_hints(repo)
+    nodes, parse_errors, files, truncated, dropped = _scan_repository(
+        repo, max_files=max_files, skip_dirs=skip_dirs, topic_hints=effective_hints
+    )
     entrypoints = _likely_entrypoints(nodes)
     edges = _config_edges(nodes)
+    dropped_sample = [_relative_or_self(path, repo) for path in dropped]
     graph = {
         "repo": str(repo),
         "node_count": len(nodes),
         "scan_file_count": len(files),
         "scan_truncated": truncated,
+        "scan_dropped_count": len(dropped),
+        "scan_dropped_sample": dropped_sample,
+        "topic_hints": list(effective_hints),
         "nodes": [node.__dict__ for node in nodes],
         "entrypoints": entrypoints,
         "config_edges": edges,
@@ -559,7 +662,14 @@ def build_graph(
     if truncated or parse_errors:
         extra: list[str] = ["", "## Graph notes"]
         if truncated:
-            extra.append(f"- Scan truncated after `{len(files)}` candidate files.")
+            extra.append(
+                f"- Scan truncated after `{len(files)}` candidate files "
+                f"(`{len(dropped)}` lower-priority files dropped; entrypoint-like and "
+                "shallower/recently-modified files were kept preferentially)."
+            )
+            if dropped_sample:
+                extra.append("- Dropped file sample (not exhaustive):")
+                extra.extend(f"  - `{item}`" for item in dropped_sample[:10])
         if parse_errors:
             extra.append(f"- Python parse issues: `{len(parse_errors)}` file(s).")
             for item in parse_errors[:10]:
@@ -971,7 +1081,7 @@ def _resolve_dependency_record(package: str, repo: Path) -> dict[str, Any]:
 def _workspace_detect_dependencies(repo: Path) -> list[dict[str, Any]]:
     include_third_party = _workspace_include_third_party_dependencies()
     primary_root = repo.resolve()
-    imports, _, _, _ = _scan_repository(repo, max_files=5000)
+    imports, _, _, _, _ = _scan_repository(repo, max_files=5000)
     import_names: set[str] = set()
     for node in imports:
         for imported in node.imports:
@@ -1302,7 +1412,6 @@ def _workspace_collect_edges(
     seen: set[tuple[str, str, str, str, str, str]] = set()
     for scan in repo_scans:
         source_repo = Path(scan["repo"])
-        source_role = scan.get("role", "dependency")
         source_kind = _workspace_source_edge_kind(scan.get("primary_path_hint", scan.get("name", "")) or scan.get("package", ""))
         nodes = scan.get("nodes", [])
         for node in nodes:
@@ -1392,7 +1501,7 @@ def _workspace_dependency_scan(
     max_files: int,
     skip_dirs: set[str],
 ) -> tuple[dict[str, Any], list[FileNode]]:
-    nodes, parse_errors, files, truncated = _scan_repository(repo_root, max_files=max_files, skip_dirs=skip_dirs)
+    nodes, parse_errors, files, truncated, _dropped = _scan_repository(repo_root, max_files=max_files, skip_dirs=skip_dirs)
     summary = _workspace_summary_lines(
         repo=repo_root,
         nodes=nodes,
@@ -1505,7 +1614,7 @@ def _workspace_context_pack_text(
         f"- Workspace graph: `{_workspace_context_pack_path(repo)}`",
         f"- Dependency edge file: `{_workspace_dependency_edges_path(repo)}`",
         f"- Dependency repo file: `{_workspace_dependency_repos_path(repo)}`",
-        f"- Edit policy: primary repo editable; dependency repos read-only unless explicit task instruction says otherwise.",
+        "- Edit policy: primary repo editable; dependency repos read-only unless explicit task instruction says otherwise.",
         f"- Third-party dependency roots: {'included' if _workspace_include_third_party_dependencies(workspace) else f'excluded by default via `{WORKSPACE_INCLUDE_THIRD_PARTY_ENV}`'}",
         f"- Excluded dirs: {', '.join(workspace.get('exclude_dirs', list(WORKSPACE_DEFAULT_EXCLUDES)))}",
         "",

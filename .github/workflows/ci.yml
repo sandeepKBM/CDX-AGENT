@@ -1,11 +1,28 @@
-name: install-smoke
+name: ci
 
 on:
   push:
   pull_request:
 
 jobs:
-  linux:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev extras
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check src tests
+      - name: Pytest
+        run: pytest -q
+
+  install-smoke-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +38,7 @@ jobs:
           /tmp/cdx-agent-wheel/bin/python -m pip install .
           /tmp/cdx-agent-wheel/bin/cdx-agent --help
 
-  windows:
+  install-smoke-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
