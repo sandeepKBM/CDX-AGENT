@@ -50,11 +50,77 @@ def test_launch_dry_run_via_cli(cli_env, capsys):
     assert "DRY_RUN_COMMAND=" in out
 
 
+def test_launch_token_saver_flag_keeps_block_via_cli(cli_env, monkeypatch, capsys):
+    from cdx_agent import config as config_mod
+    from cdx_agent import context_docs
+
+    cfg = config_mod.load_config()
+    base_agents = cfg.tools_root / "base" / "AGENTS.md"
+    base_agents.parent.mkdir(parents=True, exist_ok=True)
+    base_agents.write_text(
+        f"{context_docs.TOKEN_SAVER_START_MARKER}\nsaver text\n{context_docs.TOKEN_SAVER_END_MARKER}\n"
+    )
+
+    marker_dir = cli_env["tmp_path"] / "markers"
+    marker_dir.mkdir()
+    stub_bin = cli_env["tmp_path"] / "stub_bin"
+    _write_stub_binary(stub_bin, "codex", marker_dir)
+    monkeypatch.setenv("PATH", f"{stub_bin}{os.pathsep}{os.environ['PATH']}")
+
+    exit_code = main(["launch", "--repo", str(cli_env["repo"]), "--engine", "codex", "--safe", "--token-saver"])
+    assert exit_code == 0
+    capsys.readouterr()
+
+    from cdx_agent import runtime as runtime_mod
+
+    repo = config_mod.repo_root(cli_env["repo"])
+    rctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="codex")
+    assert "saver text" in rctx.agents_path.read_text()
+
+
+def test_launch_default_omits_token_saver_block_via_cli(cli_env, monkeypatch, capsys):
+    from cdx_agent import config as config_mod
+    from cdx_agent import context_docs
+
+    cfg = config_mod.load_config()
+    base_agents = cfg.tools_root / "base" / "AGENTS.md"
+    base_agents.parent.mkdir(parents=True, exist_ok=True)
+    base_agents.write_text(
+        f"{context_docs.TOKEN_SAVER_START_MARKER}\nsaver text\n{context_docs.TOKEN_SAVER_END_MARKER}\n"
+    )
+
+    marker_dir = cli_env["tmp_path"] / "markers"
+    marker_dir.mkdir()
+    stub_bin = cli_env["tmp_path"] / "stub_bin"
+    _write_stub_binary(stub_bin, "codex", marker_dir)
+    monkeypatch.setenv("PATH", f"{stub_bin}{os.pathsep}{os.environ['PATH']}")
+
+    exit_code = main(["launch", "--repo", str(cli_env["repo"]), "--engine", "codex", "--safe"])
+    assert exit_code == 0
+    capsys.readouterr()
+
+    from cdx_agent import runtime as runtime_mod
+
+    repo = config_mod.repo_root(cli_env["repo"])
+    rctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="codex")
+    assert "saver text" not in rctx.agents_path.read_text()
+
+
 def test_claude_shorthand_dry_run_via_cli(cli_env, capsys):
     exit_code = main(["--claude", "--repo", str(cli_env["repo"]), "--dry-run"])
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "ENGINE=claude" in out
+
+
+def test_codex_shorthand_dry_run_via_cli(cli_env, capsys):
+    # The one-flag way back to codex now that claude is the default engine;
+    # bash's arg parser has had --codex since the cutover, the python CLI
+    # previously only had --claude.
+    exit_code = main(["--codex", "--repo", str(cli_env["repo"]), "--dry-run"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "ENGINE=codex" in out
 
 
 def test_launch_real_invokes_stub_binary_via_cli(cli_env, monkeypatch, capsys):

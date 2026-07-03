@@ -112,20 +112,88 @@ def test_is_generated_detects_marker(tmp_path):
     assert context_docs.is_generated(tmp_path / "missing.md") is False
 
 
-def test_load_canonical_template_falls_back_to_default(tmp_path):
+def test_load_repo_template_falls_back_to_default(tmp_path):
     from cdx_agent import config as config_mod
 
     cfg = config_mod.Config.defaults(home=tmp_path / "home")
-    template = context_docs.load_canonical_template(cfg)
+    template = context_docs.load_repo_template(cfg)
     assert context_docs.GENERATED_MARKER in template
 
 
-def test_load_canonical_template_reads_from_tools_root_when_present(tmp_path):
+def test_load_repo_template_reads_from_tools_root_when_present(tmp_path):
     from cdx_agent import config as config_mod
 
     cfg = config_mod.Config.defaults(home=tmp_path / "home")
     template_path = cfg.tools_root / "templates" / "repo.AGENTS.md"
     template_path.parent.mkdir(parents=True)
     template_path.write_text("custom template for __REPO_NAME__\n")
-    template = context_docs.load_canonical_template(cfg)
+    template = context_docs.load_repo_template(cfg)
     assert "custom template" in template
+
+
+def test_load_working_rules_template_falls_back_to_default(tmp_path):
+    from cdx_agent import config as config_mod
+
+    cfg = config_mod.Config.defaults(home=tmp_path / "home")
+    template = context_docs.load_working_rules_template(cfg)
+    assert context_docs.TOKEN_SAVER_START_MARKER in template
+    assert context_docs.TOKEN_SAVER_END_MARKER in template
+
+
+def test_load_working_rules_template_reads_from_tools_root_base_when_present(tmp_path):
+    from cdx_agent import config as config_mod
+
+    cfg = config_mod.Config.defaults(home=tmp_path / "home")
+    template_path = cfg.tools_root / "base" / "AGENTS.md"
+    template_path.parent.mkdir(parents=True)
+    template_path.write_text("custom working rules\n")
+    template = context_docs.load_working_rules_template(cfg)
+    assert "custom working rules" in template
+
+
+def test_render_working_rules_strips_token_saver_block_by_default():
+    template = (
+        "before\n"
+        f"{context_docs.TOKEN_SAVER_START_MARKER}\n"
+        "token saver content\n"
+        f"{context_docs.TOKEN_SAVER_END_MARKER}\n"
+        "after\n"
+    )
+    rendered = context_docs.render_working_rules(template)
+    assert "token saver content" not in rendered
+    assert "before" in rendered
+    assert "after" in rendered
+
+
+def test_render_working_rules_keeps_token_saver_block_when_enabled():
+    template = (
+        "before\n"
+        f"{context_docs.TOKEN_SAVER_START_MARKER}\n"
+        "token saver content\n"
+        f"{context_docs.TOKEN_SAVER_END_MARKER}\n"
+        "after\n"
+    )
+    rendered = context_docs.render_working_rules(template, token_saver=True)
+    assert "token saver content" in rendered
+
+
+def test_sync_runtime_docs_creates_then_updates_then_unchanged(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    first = context_docs.sync_runtime_docs(runtime_dir, "rules v1", engine="codex")
+    assert first.action == "created"
+    assert (runtime_dir / "AGENTS.md").read_text() == "rules v1"
+
+    unchanged = context_docs.sync_runtime_docs(runtime_dir, "rules v1", engine="codex")
+    assert unchanged.action == "unchanged"
+
+    updated = context_docs.sync_runtime_docs(runtime_dir, "rules v2", engine="codex")
+    assert updated.action == "updated"
+    assert (runtime_dir / "AGENTS.md").read_text() == "rules v2"
+    backups = list(runtime_dir.glob("AGENTS.md.bak.*"))
+    assert len(backups) == 1
+
+
+def test_sync_runtime_docs_uses_engine_filename(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    result = context_docs.sync_runtime_docs(runtime_dir, "rules", engine="claude")
+    assert result.path.name == "CLAUDE.md"

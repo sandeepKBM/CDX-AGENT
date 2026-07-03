@@ -162,3 +162,27 @@ def test_build_graph_uses_discovered_hints_for_non_robotics_repo(tmp_path, monke
     assert "gearbox" in result["topic_hints"]
     node = next(n for n in result["nodes"] if n["path"] == "main.py")
     assert "gearbox" in node["tags"]
+
+
+# --- E4: Dockerfile classification -------------------------------------------------------
+
+
+def test_classify_file_recognizes_dockerfile():
+    assert graph._classify_file(Path("Dockerfile")) == "dockerfile"
+    assert graph._classify_file(Path("Dockerfile.train")) is None  # doesn't match name or suffix pattern
+    assert graph._classify_file(Path("train.dockerfile")) == "dockerfile"
+    assert graph._classify_file(Path("main.py")) == "python"
+
+
+def test_build_graph_includes_dockerfile_node_with_tags_and_path_refs(tmp_path, monkeypatch):
+    monkeypatch.setattr(graph, "HOME_ROOT", tmp_path / "unrelated-home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "train.py").write_text("def main():\n    pass\n")
+    (repo / "Dockerfile").write_text('FROM python:3.12\nCOPY . /app\nCMD ["python", "train.py"]\n')
+
+    result = graph.build_graph(str(repo))
+    docker_node = next((n for n in result["nodes"] if n["path"] == "Dockerfile"), None)
+    assert docker_node is not None
+    assert docker_node["kind"] == "dockerfile"
+    assert "train.py" in docker_node["path_refs"]

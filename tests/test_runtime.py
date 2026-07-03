@@ -48,6 +48,34 @@ def test_codex_and_claude_engines_get_isolated_runtime_dirs(tmp_path):
     assert codex_dir != claude_dir
 
 
+def test_runtime_context_claude_skills_dir_is_dot_claude_skills(tmp_path):
+    # Claude Code only discovers skills from <added-dir>/.claude/skills/
+    # (empirically verified against a live claude invocation), unlike Codex
+    # which reads $CODEX_HOME/skills because CODEX_HOME redirects its whole
+    # config home. The two engines need different skills_dir layouts.
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+
+    codex_ctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="codex")
+    claude_ctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="claude")
+
+    assert codex_ctx.skills_dir == codex_ctx.runtime_dir / "skills"
+    assert claude_ctx.skills_dir == claude_ctx.runtime_dir / ".claude" / "skills"
+
+
+def test_sync_runtime_auth_skips_for_claude(tmp_path):
+    # Claude Code manages its own auth; there's nothing to sync, and syncing
+    # a copied credentials-shaped file would sit in a directory granted
+    # broad tool-read access via --add-dir for no benefit.
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+    rctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="claude")
+
+    result = runtime_mod.sync_runtime_auth(cfg, rctx)
+    assert result.action == "skipped"
+    assert not rctx.auth_path.exists()
+
+
 def test_provisioning_one_access_mode_does_not_touch_the_other(tmp_path):
     cfg = _make_config(tmp_path)
     repo = _make_repo(tmp_path)
@@ -178,3 +206,43 @@ def test_reap_stale_runtimes_refuses_to_delete_outside_runtime_root(tmp_path, mo
     with pytest.raises(ValueError):
         runtime_mod._safe_remove_runtime_tree(cfg, outside)
     assert outside.exists()
+
+
+def test_provision_claude_prunes_legacy_top_level_skills_dir(tmp_path):
+    # Pre-engine-split claude runtimes linked skills into a top-level skills/
+    # (the codex layout); Claude Code only discovers .claude/skills/ via
+    # --add-dir, so the orphan just feeds stale symlinks forever unless pruned.
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+    rctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="claude")
+    legacy = rctx.runtime_dir / "skills"
+    legacy.mkdir(parents=True)
+    real_skill = tmp_path / "some-skill"
+    real_skill.mkdir()
+    (legacy / "some-skill").symlink_to(real_skill)
+
+    runtime_mod.provision_runtime(cfg, repo, access_mode="safe", engine="claude")
+    assert not legacy.exists()
+    assert real_skill.is_dir()  # only the symlink container goes, never the target
+
+
+def test_provision_codex_keeps_top_level_skills_dir(tmp_path):
+    # For codex the top-level skills/ IS the active layout (CODEX_HOME/skills).
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+    rctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="codex")
+    rctx.skills_dir.mkdir(parents=True)
+
+    runtime_mod.provision_runtime(cfg, repo, access_mode="safe", engine="codex")
+    assert rctx.skills_dir.is_dir()
+
+
+def test_provision_claude_dry_run_does_not_prune(tmp_path):
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+    rctx = runtime_mod.runtime_context(cfg, repo, access_mode="safe", engine="claude")
+    legacy = rctx.runtime_dir / "skills"
+    legacy.mkdir(parents=True)
+
+    runtime_mod.provision_runtime(cfg, repo, access_mode="safe", engine="claude", dry_run=True)
+    assert legacy.is_dir()

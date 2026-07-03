@@ -74,6 +74,13 @@ def runtime_context(config: Config, repo: Path, access_mode: AccessMode = "safe"
     resolved_repo = repo_root(repo)
     runtime_dir = runtime_home(config, resolved_repo, access_mode, engine)
     is_codex = engine == "codex"
+    # Codex reads $CODEX_HOME/skills because CODEX_HOME redirects its whole
+    # config/skills/auth home to runtime_dir (see env_overrides in launch.py).
+    # Claude Code has no equivalent single-env-var redirect; it only picks up
+    # skills from `<added-dir>/.claude/skills/*/SKILL.md` when that directory
+    # is passed via `--add-dir` (empirically verified) -- so the skills_dir
+    # layout itself must differ per engine, not just the launch flags.
+    skills_dir = runtime_dir / "skills" if is_codex else runtime_dir / ".claude" / "skills"
     return RuntimeContext(
         repo=resolved_repo,
         engine=engine,
@@ -82,7 +89,7 @@ def runtime_context(config: Config, repo: Path, access_mode: AccessMode = "safe"
         config_path=runtime_dir / ("config.toml" if is_codex else "claude_settings.json"),
         auth_path=runtime_dir / ("auth.json" if is_codex else "claude_credentials.json"),
         lock_path=runtime_dir / ".cdx-session.lock",
-        skills_dir=runtime_dir / "skills",
+        skills_dir=skills_dir,
         agents_path=runtime_dir / ("AGENTS.md" if is_codex else "CLAUDE.md"),
     )
 
@@ -227,10 +234,15 @@ def sync_runtime_config(config: Config, rctx: RuntimeContext, dry_run: bool = Fa
 
 
 def sync_runtime_auth(config: Config, rctx: RuntimeContext, dry_run: bool = False) -> SyncResult:
-    if rctx.engine == "codex":
-        source = config.account_home / ".codex" / "auth.json"
-    else:
-        source = config.account_home / ".claude" / ".credentials.json"
+    if rctx.engine == "claude":
+        # Claude Code manages its own auth (ANTHROPIC_API_KEY / OAuth /
+        # keychain via ~/.claude) -- unlike Codex, it does not read
+        # credentials from an arbitrary CODEX_HOME-style copied file, so
+        # there's nothing for this to sync. Skipping also avoids needlessly
+        # placing credential-shaped material in a directory that gets broad
+        # tool-read access via --add-dir.
+        return SyncResult("auth", "skipped", "claude manages its own auth; nothing to sync")
+    source = config.account_home / ".codex" / "auth.json"
     return sync_runtime_file(rctx.runtime_dir, "auth", source, rctx.auth_path, dry_run=dry_run)
 
 
@@ -257,9 +269,26 @@ def provision_runtime(
     rctx = runtime_context(config, repo, access_mode=access_mode, engine=engine)
     if not dry_run:
         rctx.runtime_dir.mkdir(parents=True, exist_ok=True)
+        _remove_legacy_claude_skills_dir(config, rctx)
     sync_runtime_config(config, rctx, dry_run=dry_run)
     sync_runtime_auth(config, rctx, dry_run=dry_run)
     return rctx
+
+
+def _remove_legacy_claude_skills_dir(config: Config, rctx: RuntimeContext) -> None:
+    """Claude runtimes originally linked skills into a top-level `skills/`
+    (the codex layout) before the engine split moved them to
+    `.claude/skills/` -- the only place Claude Code actually discovers them
+    via `--add-dir`. The orphaned top-level dir never expires on its own and
+    keeps feeding stale symlinks into the added directory, so prune it here.
+    Contents are only symlinks (skills are linked, never copied), and removal
+    is containment-checked to the runtime root."""
+    if rctx.engine != "claude":
+        return
+    legacy = rctx.runtime_dir / "skills"
+    if legacy == rctx.skills_dir or not legacy.is_dir() or legacy.is_symlink():
+        return
+    _safe_remove_runtime_tree(config, legacy)
 
 
 # --- stale runtime reaping (A2) -----------------------------------------------------

@@ -55,6 +55,27 @@ PERMISSION_MODE_BY_ACCESS: dict[AccessMode, str] = {
 }
 
 
+def translate_passthrough_for_engine(engine: Engine, passthrough: list[str]) -> list[str]:
+    """Codex has a `resume` SUBCOMMAND (`codex resume [--last] [SESSION_ID]
+    [PROMPT]`); Claude Code has no such subcommand -- resuming is a `-c`/
+    `--continue` or `-r`/`--resume [sessionId]` FLAG instead. Someone typing
+    `cdx-agent resume` out of Codex muscle memory (very plausible now that
+    Claude is the default engine) would otherwise silently get "resume"
+    forwarded as a literal Claude prompt -- confirmed live: `claude resume`
+    starts a fresh session that just replies conversationally to the word
+    "resume", it does not resume anything. Only fires for the exact
+    Codex-subcommand shape (`resume` as the first token); anything else
+    (e.g. already using `-c`/`--resume`) passes through untouched."""
+    if engine != "claude" or not passthrough or passthrough[0] != "resume":
+        return passthrough
+    rest = passthrough[1:]
+    if "--last" in rest:
+        return ["--continue", *(tok for tok in rest if tok != "--last")]
+    if rest and not rest[0].startswith("-"):
+        return ["--resume", *rest]  # first token is a session id/name
+    return ["--resume", *rest]
+
+
 def build_codex_command(repo: Path, access_mode: AccessMode, passthrough: list[str]) -> list[str]:
     return [
         "codex",
@@ -70,21 +91,60 @@ def build_codex_command(repo: Path, access_mode: AccessMode, passthrough: list[s
     ]
 
 
-def build_claude_command(repo: Path, access_mode: AccessMode, passthrough: list[str]) -> list[str]:
+def build_claude_command(
+    repo: Path, access_mode: AccessMode, passthrough: list[str], runtime_dir: Path | None = None
+) -> list[str]:
+    """Claude Code has no CODEX_HOME-style single env var that redirects its
+    whole config/skills home to an arbitrary directory, so getting it to
+    actually use what cdx-agent provisions takes three separate,
+    empirically-verified mechanisms instead of one:
+
+    - ``--add-dir <runtime_dir>``: extends skill discovery to
+      ``<runtime_dir>/.claude/skills/*/SKILL.md`` (confirmed by a live test:
+      a marker skill placed there showed up in Claude's available-skills
+      list). Does NOT auto-load a CLAUDE.md from the added directory,
+      despite `--help`'s wording suggesting otherwise (confirmed by a live
+      test: a marker string in ``<dir>/CLAUDE.md`` never reached context).
+    - ``--append-system-prompt <text>``: the reliable way to actually get the
+      working-rules content into context, since file-based discovery from an
+      added directory doesn't work. Reads ``<runtime_dir>/CLAUDE.md`` (the
+      already-rendered working-rules doc `sync_runtime_docs` writes) and
+      passes its content directly.
+    - ``--settings <path>``: loads a JSON file whose top-level ``"hooks"`` key
+      is honored (confirmed by a live test: a Stop hook in a `--settings`
+      file actually fired). Points at the merged settings file
+      `hooks.claude_settings_path_for_runtime` writes.
+
+    All three are skipped gracefully if their source file doesn't exist yet
+    (e.g. dry-run, or a `--secondary` join before any primary launch has
+    provisioned the runtime)."""
     del repo  # cwd is set separately; claude has no -C-style flag
-    return [
-        "claude",
-        "--permission-mode",
-        PERMISSION_MODE_BY_ACCESS[access_mode],
-        *passthrough,
-    ]
+    cmd = ["claude", "--permission-mode", PERMISSION_MODE_BY_ACCESS[access_mode]]
+    if runtime_dir is not None:
+        cmd += ["--add-dir", str(runtime_dir)]
+        agents_path = context_docs.target_path(runtime_dir, "claude")
+        if agents_path.is_file():
+            rules_text = agents_path.read_text().strip()
+            if rules_text:
+                cmd += ["--append-system-prompt", rules_text]
+        settings_path = hooks.claude_settings_path_for_runtime(runtime_dir)
+        if settings_path.is_file():
+            cmd += ["--settings", str(settings_path)]
+    cmd += passthrough
+    return cmd
 
 
-def build_command(engine: Engine, repo: Path, access_mode: AccessMode, passthrough: list[str] | None = None) -> list[str]:
+def build_command(
+    engine: Engine,
+    repo: Path,
+    access_mode: AccessMode,
+    passthrough: list[str] | None = None,
+    runtime_dir: Path | None = None,
+) -> list[str]:
     passthrough = passthrough or []
     if engine == "codex":
         return build_codex_command(repo, access_mode, passthrough)
-    return build_claude_command(repo, access_mode, passthrough)
+    return build_claude_command(repo, access_mode, passthrough, runtime_dir=runtime_dir)
 
 
 def env_overrides(engine: Engine, rctx: RuntimeContext) -> dict[str, str]:
@@ -124,6 +184,7 @@ def prepare_launch(
     skill_allowlist: frozenset[str] = frozenset(),
     dry_run: bool = False,
     secondary: bool = False,
+    token_saver: bool = False,
 ) -> PrepareResult:
     """Provision the runtime, acquire the session lock, link skills, and sync
     hooks/docs -- everything short of actually exec'ing the engine binary.
@@ -160,13 +221,14 @@ def prepare_launch(
         link_decisions = tuple(
             skills.link_all_skill_roots(config, resolved_repo, rctx.skills_dir, allowlist=skill_allowlist)
         )
-        template = context_docs.load_canonical_template(config)
-        doc_sync = context_docs.sync_repo_docs(rctx.runtime_dir, template, engine=engine)
+        working_rules = context_docs.load_working_rules_template(config)
+        rendered_rules = context_docs.render_working_rules(working_rules, token_saver=token_saver)
+        doc_sync = context_docs.sync_runtime_docs(rctx.runtime_dir, rendered_rules, engine=engine)
         hook_install = hooks.install_hooks_for_runtime(config, rctx.runtime_dir, engine=engine)
 
     plan = None
     if plan_allowed:
-        command = build_command(engine, resolved_repo, access_mode, passthrough)
+        command = build_command(engine, resolved_repo, access_mode, passthrough, runtime_dir=rctx.runtime_dir)
         plan = LaunchPlan(
             engine=engine,
             access_mode=access_mode,
@@ -203,6 +265,7 @@ def launch(
     skill_allowlist: frozenset[str] = frozenset(),
     dry_run: bool = False,
     secondary: bool = False,
+    token_saver: bool = False,
 ) -> LaunchOutcome:
     prepare = prepare_launch(
         config,
@@ -213,6 +276,7 @@ def launch(
         skill_allowlist=skill_allowlist,
         dry_run=dry_run,
         secondary=secondary,
+        token_saver=token_saver,
     )
     if prepare.plan is None:
         return LaunchOutcome(prepare=prepare, exit_code=None)
@@ -235,7 +299,7 @@ def sync_docs_for_repo(
     """Standalone entry point for `cdx-agent sync-docs --repo .` -- lets a
     plain Claude Code (or Codex) session pick up the same generated
     AGENTS.md/CLAUDE.md without going through a special launch mode."""
-    template = context_docs.load_canonical_template(config)
+    template = context_docs.load_repo_template(config)
     return context_docs.sync_repo_docs(repo_root(repo), template, engine=engine, adopt=adopt, force=force)
 
 
@@ -250,7 +314,9 @@ def command_launch(args) -> int:
     repo = Path(args.repo)
     access_mode: AccessMode = "full" if args.full else "safe" if args.safe else cfg.default_access_mode
     passthrough = [tok for tok in (args.passthrough or []) if tok != "--"]
+    passthrough = translate_passthrough_for_engine(args.engine, passthrough)
     secondary = getattr(args, "secondary", False)
+    token_saver = getattr(args, "token_saver", False)
 
     outcome = launch(
         cfg,
@@ -260,6 +326,7 @@ def command_launch(args) -> int:
         passthrough=passthrough,
         dry_run=args.dry_run,
         secondary=secondary,
+        token_saver=token_saver,
     )
 
     if outcome.prepare.plan is None:
@@ -330,4 +397,5 @@ __all__ = [
     "launch",
     "prepare_launch",
     "sync_docs_for_repo",
+    "translate_passthrough_for_engine",
 ]

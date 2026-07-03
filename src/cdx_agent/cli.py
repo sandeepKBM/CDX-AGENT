@@ -217,6 +217,19 @@ def _launch_parser(mode: str) -> argparse.ArgumentParser:
         help="Join an already-running session's runtime for a second concurrent window "
         "(e.g. a second terminal) instead of fighting over the lock or killing it.",
     )
+    token_saver = parser.add_mutually_exclusive_group()
+    token_saver.add_argument(
+        "--token-saver",
+        action="store_true",
+        help="Include the token-saving rules block in the session's working-rules doc (off by default).",
+    )
+    token_saver.add_argument(
+        "--no-token-saver",
+        dest="token_saver",
+        action="store_false",
+        help="Omit the token-saving rules block (default).",
+    )
+    parser.set_defaults(token_saver=False)
     parser.add_argument("passthrough", nargs=argparse.REMAINDER, help="Extra args forwarded to the engine binary.")
     return parser
 
@@ -224,17 +237,19 @@ def _launch_parser(mode: str) -> argparse.ArgumentParser:
 def _session_target_parser(mode: str) -> argparse.ArgumentParser:
     parser = _parser_base(f"cdx-agent {mode}", "Target a repo's session/runtime for a given engine + access mode.")
     parser.add_argument("--repo", default=".", help="Repository root or current directory.")
-    parser.add_argument("--engine", choices=["codex", "claude"], default=launch.DEFAULT_ENGINE)
-    parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--engine", choices=["codex", "claude"], default=launch.DEFAULT_ENGINE, help="Engine whose runtime to target."
+    )
+    parser.add_argument("--config", default=None, help="Path to a cdx-agent config file (overrides discovery).")
     access = parser.add_mutually_exclusive_group()
-    access.add_argument("--full", action="store_true")
-    access.add_argument("--safe", action="store_true")
+    access.add_argument("--full", action="store_true", help="Target the full-access runtime.")
+    access.add_argument("--safe", action="store_true", help="Target the safe (workspace-write) runtime.")
     return parser
 
 
 def _cancel_active_parser(mode: str) -> argparse.ArgumentParser:
     parser = _session_target_parser(mode)
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Diagnose only; never signal any process.")
     return parser
 
 
@@ -296,11 +311,11 @@ def _dg_parser(mode: str) -> argparse.ArgumentParser:
 
 def _dg_workspace_init_parser(mode: str) -> argparse.ArgumentParser:
     parser = _parser_base(f"cdx-agent {mode}", "Create or overwrite a multi-folder workspace manifest.")
-    parser.add_argument("--name", required=True)
-    parser.add_argument("paths", nargs="+")
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--config", default=None)
+    parser.add_argument("--name", required=True, help="Workspace name (manifest filename stem).")
+    parser.add_argument("paths", nargs="+", help="Member directories to include in the workspace.")
+    parser.add_argument("--force", action="store_true", help="Overwrite an existing manifest of the same name.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be written without writing it.")
+    parser.add_argument("--config", default=None, help="Path to a cdx-agent config file (overrides discovery).")
     return parser
 
 
@@ -312,16 +327,16 @@ def _dg_workspace_list_parser(mode: str) -> argparse.ArgumentParser:
 
 def _dg_workspace_name_parser(mode: str) -> argparse.ArgumentParser:
     parser = _parser_base(f"cdx-agent {mode}", "Target a named (or manifest-path) workspace.")
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--config", default=None)
+    parser.add_argument("--name", required=True, help="Workspace name or path to its manifest file.")
+    parser.add_argument("--config", default=None, help="Path to a cdx-agent config file (overrides discovery).")
     return parser
 
 
 def _dg_workspace_run_parser(mode: str) -> argparse.ArgumentParser:
     parser = _dg_workspace_name_parser(mode)
-    parser.add_argument("--force-home-scan", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("passthrough", nargs=argparse.REMAINDER)
+    parser.add_argument("--force-home-scan", action="store_true", help="Allow scanning a home-like directory.")
+    parser.add_argument("--dry-run", action="store_true", help="Show the dg invocation without running it.")
+    parser.add_argument("passthrough", nargs=argparse.REMAINDER, help="Extra args forwarded to dg.")
     return parser
 
 
@@ -369,12 +384,14 @@ def main(argv: list[str] | None = None) -> int:
 
     mode_token = args[0]
     rest = args[1:]
-    if mode_token == "--claude":
-        # `--claude` is shorthand for `launch --engine claude`, which can't be
-        # expressed as a plain LEGACY_ALIASES table lookup since it also
-        # injects a default flag value.
+    if mode_token in ("--claude", "--codex"):
+        # `--claude`/`--codex` are shorthand for `launch --engine <engine>`,
+        # which can't be expressed as a plain LEGACY_ALIASES table lookup
+        # since they also inject a default flag value. `--codex` matters now
+        # that the default engine is claude -- it's the one-flag way back.
+        engine = mode_token.lstrip("-")
         mode_token = "launch"
-        rest = ["--engine", "claude", *rest]
+        rest = ["--engine", engine, *rest]
 
     mode = LEGACY_ALIASES.get(mode_token)
     if mode is None:

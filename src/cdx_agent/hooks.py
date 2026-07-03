@@ -107,6 +107,7 @@ class HookInstallResult:
     hooks_dir: Path
     hooks_json_path: Path
     linked_scripts: tuple[Path, ...]
+    claude_settings_path: Path | None = None
 
 
 def install_hook_scripts(hooks_source_root: Path, dst_dir: Path) -> list[Path]:
@@ -116,6 +117,11 @@ def install_hook_scripts(hooks_source_root: Path, dst_dir: Path) -> list[Path]:
         src = hooks_source_root / script
         target = dst_dir / script
         if not src.is_file():
+            continue
+        if target.is_symlink() and target.readlink() == src:
+            # Already linked to the right source: relinking (and the backup it
+            # takes) would just accumulate a .bak per launch forever.
+            linked.append(target)
             continue
         if target.exists() or target.is_symlink():
             backup_path(target)
@@ -129,11 +135,50 @@ def install_hook_scripts(hooks_source_root: Path, dst_dir: Path) -> list[Path]:
 
 
 def write_hooks_json(hooks_dir: Path, hooks_json_path: Path) -> None:
+    payload = build_hooks_payload(hooks_dir)
+    rendered = json.dumps(payload, indent=2) + "\n"
     if hooks_json_path.exists():
+        if hooks_json_path.read_text(errors="ignore") == rendered:
+            return  # unchanged: rewriting would accumulate a .bak per launch
         backup_path(hooks_json_path)
     hooks_json_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = build_hooks_payload(hooks_dir)
-    hooks_json_path.write_text(json.dumps(payload, indent=2) + "\n")
+    hooks_json_path.write_text(rendered)
+
+
+def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | None = None) -> dict:
+    """Claude Code loads hooks from a settings file's top-level "hooks" key
+    (confirmed empirically: `claude --settings <path>` with
+    `{"hooks": {...}}` fires the configured hooks) -- unlike Codex, which
+    reads a bare hooks.json directly. Starts from the user's own synced
+    settings (theme/model/etc, if present) so `--settings` doesn't shadow
+    preferences the user would otherwise get by default, then adds hooks."""
+    payload: dict = {}
+    if base_settings_path is not None and base_settings_path.is_file():
+        try:
+            payload = json.loads(base_settings_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            payload = {}
+    payload["hooks"] = build_hooks_payload(hooks_dir)
+    return payload
+
+
+def claude_settings_path_for_runtime(runtime_dir: Path) -> Path:
+    # Deliberately not "claude_settings.json" -- that name is already used by
+    # runtime.py's synced copy of the user's real ~/.claude/settings.json
+    # (RuntimeContext.config_path). This is the merged file actually passed
+    # to `--settings` (base settings + hooks).
+    return runtime_dir / "claude_hooks_settings.json"
+
+
+def write_claude_settings(hooks_dir: Path, base_settings_path: Path | None, output_path: Path) -> None:
+    payload = build_claude_settings_payload(hooks_dir, base_settings_path)
+    rendered = json.dumps(payload, indent=2) + "\n"
+    if output_path.exists():
+        if output_path.read_text(errors="ignore") == rendered:
+            return  # unchanged: rewriting would accumulate a .bak per launch
+        backup_path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(rendered)
 
 
 def hooks_locations_for_repo(repo: Path, engine: Engine) -> tuple[Path, Path]:
@@ -159,7 +204,17 @@ def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine 
     hooks_dir, hooks_json_path = hooks_locations_for_runtime(runtime_dir)
     linked = install_hook_scripts(config.tools_root / "hooks", hooks_dir)
     write_hooks_json(hooks_dir, hooks_json_path)
-    return HookInstallResult(hooks_dir=hooks_dir, hooks_json_path=hooks_json_path, linked_scripts=tuple(linked))
+    claude_settings_path = None
+    if engine == "claude":
+        claude_settings_path = claude_settings_path_for_runtime(runtime_dir)
+        base_settings_path = runtime_dir / "claude_settings.json"
+        write_claude_settings(hooks_dir, base_settings_path, claude_settings_path)
+    return HookInstallResult(
+        hooks_dir=hooks_dir,
+        hooks_json_path=hooks_json_path,
+        linked_scripts=tuple(linked),
+        claude_settings_path=claude_settings_path,
+    )
 
 
 # --- CLI commands --------------------------------------------------------------------
@@ -178,7 +233,9 @@ __all__ = [
     "HOOK_SCRIPTS",
     "Engine",
     "HookInstallResult",
+    "build_claude_settings_payload",
     "build_hooks_payload",
+    "claude_settings_path_for_runtime",
     "command_install_hooks",
     "hooks_locations_for_repo",
     "hooks_locations_for_runtime",
@@ -186,5 +243,6 @@ __all__ = [
     "install_hooks_for_repo",
     "install_hooks_for_runtime",
     "referenced_scripts",
+    "write_claude_settings",
     "write_hooks_json",
 ]

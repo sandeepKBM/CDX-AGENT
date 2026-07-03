@@ -101,7 +101,7 @@ def _seed_builtin_defaults(config: Config) -> list[Path]:
     agents_path = config.tools_root / "base" / "AGENTS.md"
     if not agents_path.is_file():
         agents_path.parent.mkdir(parents=True, exist_ok=True)
-        agents_path.write_text(context_docs.DEFAULT_TEMPLATE)
+        agents_path.write_text(context_docs.DEFAULT_WORKING_RULES_TEMPLATE)
         seeded.append(agents_path)
 
     hooks_dir = config.tools_root / "hooks"

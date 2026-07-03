@@ -43,33 +43,57 @@ discovery-driven rather than hardcoded-only — the constant is just extra seed 
 not the sole source, and touching it carried more risk than the marginal value justified
 given the E1/E2 effort budget for this pass.
 
-## Backlog (not started this pass — ranked by original value/effort estimate)
+**E3 — real import resolution (2026-07-02).** `_reverse_import_index` (bare module name →
+importing files) is ambiguous for same-named modules in different packages and is now kept
+only as a fallback. `import_edges` on each `FileNode` resolves every `import`/`from ... import`
+statement to a concrete file where possible — walking package roots (repo root, `src/` if
+present), handling relative imports via `level`, and preferring the submodule form
+(`from pkg import sub` → `pkg/sub.py`) over the package `__init__.py` when both exist.
+`file_reverse_import_index` (file-path-keyed, only resolved edges) replaces the ambiguous
+index as `--impact`'s primary source, with the bare-name index as a fallback for anything
+that doesn't resolve (e.g. dynamic imports). `_config_edges` now verifies every regex-matched
+path-looking string actually resolves to a real file (tried relative to the repo root and to
+the referencing file's own directory) before keeping the edge, instead of keeping every match
+unconditionally. See `tests/test_graph_import_resolution.py`.
 
-- **E3 — real import resolution.** `_reverse_import_index` still maps bare module names
-  (not resolved to a specific file) to importing files, ambiguous for same-named modules
-  in different packages; `_config_edges` still keeps every regex-matched path-looking
-  string without verifying it resolves to a real file. This is the highest remaining
-  value item — it directly affects `--impact`/context-pack accuracy — and the highest
-  effort (needs package-root walking + relative/absolute import resolution per file, not
-  just per workspace-dependency as `_resolve_dependency_record` already does).
-- **E5 — incremental/cached builds.** Every `--graph`/`--context` invocation does a full
-  rescan. A `(path, mtime, size)`-keyed cache in `.codex_graph/` would let unchanged files
-  skip re-parsing. Matters more once E3 makes per-file analysis heavier.
-- **E4 — broader language coverage.** Still python/shell/yaml/json/toml only. Dockerfile
-  support (cheap, high-signal for entrypoint detection) is the easiest next addition;
-  broader AST-level support for other languages is a much bigger lift (tree-sitter or
-  similar) and should be scoped separately once it's clear which languages actually
-  matter across the user's working repos.
-- **E6 — smarter entrypoint scoring.** `_likely_entrypoints` still scores purely by
-  filename regex + presence of a `main` function + hardcoded domain tags. Weighting
-  `pyproject.toml [project.scripts]`/`setup.py console_scripts`/Makefile/CI `run:` steps
-  as stronger signals is a contained, low-risk follow-up.
-- **E7 — task-relevance scoring.** `_score_node_for_task`'s naive token-overlap could get
-  a cheap TF-IDF-style improvement (penalize tokens common across most files, reward rare
-  discriminating tokens) using only `collections.Counter` — no new dependency. Lowest
-  priority; do after the above if time permits.
+**E5 — incremental/cached builds (2026-07-02).** `_scan_repository` now keys a per-repo cache
+(`.codex_graph/.scan_cache.json`) by `(path, mtime, size, kind)`; an unchanged file's
+previously-computed `FileNode` and parse errors are reused instead of re-parsed. The whole
+cache is invalidated at once if `topic_hints` changed since tags depend on them. Confirmed on
+a real 385-file repo (real_Cartpole): 2.45s cold → 0.43s warm, ~5.7x. See
+`tests/test_graph_incremental.py`.
+
+**E4 — Dockerfile support (2026-07-02).** `_classify_file` recognizes `Dockerfile`,
+`Dockerfile.*`, and `*.dockerfile` and routes them through the existing generic textual scan
+(tags + path_refs), so `CMD`/`ENTRYPOINT` lines referencing a real `.py`/`.sh` file are picked
+up automatically by the existing path-ref regex with no dedicated parser. See
+`test_classify_file_recognizes_dockerfile` in `tests/test_graph_scan_quality.py`.
+
+**E6 — smarter entrypoint scoring (2026-07-02).** `_likely_entrypoints` now also discovers
+project-declared entrypoints — `pyproject.toml [project.scripts]`, `setup.py`
+`console_scripts` (best-effort regex, not exec/AST since setup.py can run arbitrary code),
+Makefile targets, and CI `run:` steps (`.github/workflows/*.yml`, `.gitlab-ci.yml`) — and
+weights a match 2x over the old filename-keyword-regex signal, with the reason recorded in a
+new `declared_by` field. See `tests/test_graph_entrypoint_scoring.py`.
+
+**E7 — task-relevance scoring (2026-07-02).** `_score_node_for_task` gained an optional
+TF-IDF-style weighting: `_document_frequencies` counts, per task token, how many nodes contain
+it; matches are weighted by a smoothed idf (`log((N+1)/(df+1)) + 1`) so a token appearing in
+nearly every file (weak signal) contributes far less than one appearing in a handful (strong,
+specific signal). Falls back to the original flat weighting when called without
+`doc_freqs`/`total_nodes` (backward compatible). See `tests/test_graph_task_relevance.py`.
 
 ## Test coverage added this pass
 
-`tests/test_graph_scan_quality.py` — 14 tests covering the home-dir ancestor fix,
-truncation prioritization/reporting, and topic-hint override/discovery/precedence.
+- `tests/test_graph_scan_quality.py` — 16 tests: home-dir ancestor fix, truncation
+  prioritization/reporting, topic-hint override/discovery/precedence, Dockerfile
+  classification (E4).
+- `tests/test_graph_import_resolution.py` — 15 tests (E3): absolute/relative import
+  resolution, the same-named-module disambiguation regression, `--impact` output,
+  `config_edges` resolution.
+- `tests/test_graph_incremental.py` — 9 tests (E5): cache reuse, content-change detection,
+  hint-change invalidation, corrupt-cache tolerance.
+- `tests/test_graph_entrypoint_scoring.py` — 7 tests (E6): pyproject/setup.py/Makefile/CI
+  discovery, declared-entrypoint outranking filename heuristics.
+- `tests/test_graph_task_relevance.py` — 5 tests (E7): document-frequency counting, idf
+  weighting outranking a common token, backward-compat flat fallback.

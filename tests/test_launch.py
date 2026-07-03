@@ -63,6 +63,108 @@ def test_build_claude_command_maps_safe_to_default(tmp_path):
     assert cmd[cmd.index("--permission-mode") + 1] == "default"
 
 
+def test_build_claude_command_without_runtime_dir_omits_new_flags(tmp_path):
+    cmd = launch.build_claude_command(tmp_path, "safe", [])
+    assert "--add-dir" not in cmd
+    assert "--append-system-prompt" not in cmd
+    assert "--settings" not in cmd
+
+
+def test_build_claude_command_includes_add_dir_when_runtime_dir_given(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    cmd = launch.build_claude_command(tmp_path, "safe", [], runtime_dir=runtime_dir)
+    assert cmd[cmd.index("--add-dir") + 1] == str(runtime_dir)
+
+
+def test_build_claude_command_appends_system_prompt_from_claude_md(tmp_path):
+    from cdx_agent import context_docs
+
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    context_docs.target_path(runtime_dir, "claude").write_text("distinctive working rules text")
+    cmd = launch.build_claude_command(tmp_path, "safe", [], runtime_dir=runtime_dir)
+    assert cmd[cmd.index("--append-system-prompt") + 1] == "distinctive working rules text"
+
+
+def test_build_claude_command_omits_append_system_prompt_when_no_claude_md(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    cmd = launch.build_claude_command(tmp_path, "safe", [], runtime_dir=runtime_dir)
+    assert "--append-system-prompt" not in cmd
+
+
+def test_build_claude_command_includes_settings_when_present(tmp_path):
+    from cdx_agent import hooks as hooks_mod
+
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    settings_path = hooks_mod.claude_settings_path_for_runtime(runtime_dir)
+    settings_path.write_text('{"hooks": {}}')
+    cmd = launch.build_claude_command(tmp_path, "safe", [], runtime_dir=runtime_dir)
+    assert cmd[cmd.index("--settings") + 1] == str(settings_path)
+
+
+def test_translate_passthrough_bare_resume_becomes_claude_resume_flag():
+    # `codex resume` (bare) opens a session picker; Claude's equivalent is
+    # `-r`/`--resume` with no argument.
+    assert launch.translate_passthrough_for_engine("claude", ["resume"]) == ["--resume"]
+
+
+def test_translate_passthrough_resume_last_becomes_claude_continue():
+    assert launch.translate_passthrough_for_engine("claude", ["resume", "--last"]) == ["--continue"]
+
+
+def test_translate_passthrough_resume_with_session_id_becomes_claude_resume_with_id():
+    result = launch.translate_passthrough_for_engine("claude", ["resume", "abc-123"])
+    assert result == ["--resume", "abc-123"]
+
+
+def test_translate_passthrough_codex_engine_untouched():
+    # codex genuinely has a `resume` subcommand -- must not be rewritten.
+    assert launch.translate_passthrough_for_engine("codex", ["resume", "--last"]) == ["resume", "--last"]
+
+
+def test_translate_passthrough_non_resume_untouched():
+    assert launch.translate_passthrough_for_engine("claude", ["-p", "hello"]) == ["-p", "hello"]
+
+
+def test_translate_passthrough_empty_untouched():
+    assert launch.translate_passthrough_for_engine("claude", []) == []
+
+
+def test_translate_passthrough_already_claude_flag_untouched():
+    # someone already using Claude's own syntax should pass through as-is
+    assert launch.translate_passthrough_for_engine("claude", ["--continue"]) == ["--continue"]
+    assert launch.translate_passthrough_for_engine("claude", ["--resume", "xyz"]) == ["--resume", "xyz"]
+
+
+def test_command_launch_translates_resume_for_claude_engine(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    args = SimpleNamespace(
+        config=None,
+        repo=str(repo),
+        full=False,
+        safe=True,
+        engine="claude",
+        passthrough=["resume"],
+        dry_run=True,
+        secondary=False,
+        token_saver=False,
+        cancel_active=False,
+    )
+    monkeypatch.setattr(launch, "load_config", lambda _config: cfg)
+    launch.command_launch(args)
+    out = capsys.readouterr().out
+    command_line = next(line for line in out.splitlines() if line.startswith("DRY_RUN_COMMAND="))
+    tokens = command_line.removeprefix("DRY_RUN_COMMAND=").split(" ")
+    assert "--resume" in tokens
+    assert "resume" not in tokens  # bare "resume" must not survive as a literal Claude prompt
+
+
 def test_build_command_dispatches_by_engine(tmp_path):
     codex_cmd = launch.build_command("codex", tmp_path, "safe")
     claude_cmd = launch.build_command("claude", tmp_path, "safe")
@@ -101,6 +203,88 @@ def test_prepare_launch_links_skills_and_installs_hooks(tmp_path):
     if result.lock_handle is not None:
         from cdx_agent import session
 
+        session.release_lock(result.lock_handle)
+
+
+def test_prepare_launch_claude_end_to_end_wires_skills_docs_and_hooks(tmp_path):
+    # Full pipeline check: skills land under .claude/skills (where Claude Code
+    # actually looks), and the launch command carries --add-dir/
+    # --append-system-prompt/--settings so they're all reachable.
+    from cdx_agent import session
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    skill_dir = cfg.tools_root / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: A perfectly safe demo skill for tests.\n---\n\nDo safe things.\n"
+    )
+
+    result = launch.prepare_launch(cfg, repo, engine="claude", access_mode="safe")
+    assert result.plan is not None
+
+    # skills linked under .claude/skills, not the flat codex-style layout
+    assert result.plan.runtime.skills_dir == result.plan.runtime.runtime_dir / ".claude" / "skills"
+    assert result.plan.runtime.skills_dir.joinpath("demo-skill").is_symlink()
+
+    command = result.plan.command
+    assert "--add-dir" in command
+    assert command[command.index("--add-dir") + 1] == str(result.plan.runtime.runtime_dir)
+    assert "--append-system-prompt" in command
+    assert "--settings" in command
+    settings_path = command[command.index("--settings") + 1]
+    assert Path(settings_path).is_file()
+
+    if result.lock_handle is not None:
+        session.release_lock(result.lock_handle)
+
+
+def test_prepare_launch_writes_working_rules_not_repo_template(tmp_path):
+    # Regression test: prepare_launch's runtime-dir doc must come from the
+    # fuller working-rules template (base/AGENTS.md, with the TOKEN_SAVER
+    # block), not the condensed per-repo template -- they were conflated in
+    # an earlier version of this module.
+    from cdx_agent import context_docs, session
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    base_agents = cfg.tools_root / "base" / "AGENTS.md"
+    base_agents.parent.mkdir(parents=True, exist_ok=True)
+    base_agents.write_text(
+        "distinctive working rules content\n"
+        f"{context_docs.TOKEN_SAVER_START_MARKER}\n"
+        "token saver only content\n"
+        f"{context_docs.TOKEN_SAVER_END_MARKER}\n"
+    )
+
+    result = launch.prepare_launch(cfg, repo, engine="codex", access_mode="safe")
+    written = result.plan.runtime.agents_path.read_text()
+    assert "distinctive working rules content" in written
+    assert "token saver only content" not in written  # stripped: token_saver defaults False
+    assert "__REPO_NAME__" not in written  # not the repo template
+
+    if result.lock_handle is not None:
+        session.release_lock(result.lock_handle)
+
+
+def test_prepare_launch_token_saver_keeps_the_block(tmp_path):
+    from cdx_agent import context_docs, session
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    base_agents = cfg.tools_root / "base" / "AGENTS.md"
+    base_agents.parent.mkdir(parents=True, exist_ok=True)
+    base_agents.write_text(
+        f"{context_docs.TOKEN_SAVER_START_MARKER}\n"
+        "token saver only content\n"
+        f"{context_docs.TOKEN_SAVER_END_MARKER}\n"
+    )
+
+    result = launch.prepare_launch(cfg, repo, engine="codex", access_mode="safe", token_saver=True)
+    written = result.plan.runtime.agents_path.read_text()
+    assert "token saver only content" in written
+
+    if result.lock_handle is not None:
         session.release_lock(result.lock_handle)
 
 

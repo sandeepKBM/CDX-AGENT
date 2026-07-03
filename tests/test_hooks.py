@@ -101,3 +101,107 @@ def test_install_hooks_for_runtime_both_engines_isolated(tmp_path):
     assert codex_result.hooks_json_path != claude_result.hooks_json_path
     assert codex_result.hooks_json_path.is_file()
     assert claude_result.hooks_json_path.is_file()
+
+
+def test_install_hooks_for_runtime_claude_writes_settings_file(tmp_path):
+    cfg = _cfg(tmp_path)
+    claude_runtime = tmp_path / "runtime" / "claude" / "full" / "repo__abc"
+    result = hooks.install_hooks_for_runtime(cfg, claude_runtime, engine="claude")
+    assert result.claude_settings_path is not None
+    assert result.claude_settings_path.is_file()
+    payload = json.loads(result.claude_settings_path.read_text())
+    assert "hooks" in payload
+    assert hooks.referenced_scripts(payload["hooks"]) == set(hooks.HOOK_SCRIPTS)
+
+
+def test_install_hooks_for_runtime_codex_has_no_settings_file(tmp_path):
+    cfg = _cfg(tmp_path)
+    codex_runtime = tmp_path / "runtime" / "codex" / "full" / "repo__abc"
+    result = hooks.install_hooks_for_runtime(cfg, codex_runtime, engine="codex")
+    assert result.claude_settings_path is None
+
+
+def test_build_claude_settings_payload_wraps_hooks_under_hooks_key(tmp_path):
+    payload = hooks.build_claude_settings_payload(tmp_path / "hooks")
+    assert set(payload.keys()) == {"hooks"}
+    assert hooks.referenced_scripts(payload["hooks"]) == set(hooks.HOOK_SCRIPTS)
+
+
+def test_build_claude_settings_payload_merges_base_settings(tmp_path):
+    base = tmp_path / "claude_settings.json"
+    base.write_text(json.dumps({"theme": "dark", "model": "sonnet"}))
+    payload = hooks.build_claude_settings_payload(tmp_path / "hooks", base_settings_path=base)
+    assert payload["theme"] == "dark"
+    assert payload["model"] == "sonnet"
+    assert "hooks" in payload
+
+
+def test_build_claude_settings_payload_tolerates_missing_or_corrupt_base(tmp_path):
+    missing = tmp_path / "does-not-exist.json"
+    payload = hooks.build_claude_settings_payload(tmp_path / "hooks", base_settings_path=missing)
+    assert "hooks" in payload
+
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("not valid json{{{")
+    payload2 = hooks.build_claude_settings_payload(tmp_path / "hooks", base_settings_path=corrupt)
+    assert "hooks" in payload2
+
+
+def test_write_claude_settings_backs_up_existing(tmp_path):
+    output = tmp_path / "claude_hooks_settings.json"
+    output.write_text("{}")
+    hooks.write_claude_settings(tmp_path / "hooks", None, output)
+    assert json.loads(output.read_text())["hooks"]
+    backups = list(tmp_path.glob("claude_hooks_settings.json.bak.*"))
+    assert len(backups) == 1
+
+
+def test_claude_settings_path_for_runtime_differs_from_config_path(tmp_path):
+    # Must not collide with RuntimeContext.config_path's "claude_settings.json"
+    # (the synced copy of the user's real ~/.claude/settings.json).
+    path = hooks.claude_settings_path_for_runtime(tmp_path)
+    assert path.name != "claude_settings.json"
+    assert path == tmp_path / "claude_hooks_settings.json"
+
+
+def test_install_hook_scripts_relink_is_idempotent_no_bak_accumulation(tmp_path):
+    # Regression: every launch used to backup-and-relink even when the target
+    # already pointed at the right source, growing one .bak per launch forever.
+    cfg = _cfg(tmp_path)
+    dst = tmp_path / "dst" / "hooks"
+    hooks.install_hook_scripts(cfg.tools_root / "hooks", dst)
+    hooks.install_hook_scripts(cfg.tools_root / "hooks", dst)
+    hooks.install_hook_scripts(cfg.tools_root / "hooks", dst)
+    assert list(dst.glob("*.bak.*")) == []
+    for name in hooks.HOOK_SCRIPTS:
+        assert (dst / name).is_symlink()
+
+
+def test_install_hook_scripts_still_replaces_wrong_symlink(tmp_path):
+    cfg = _cfg(tmp_path)
+    dst = tmp_path / "dst" / "hooks"
+    dst.mkdir(parents=True)
+    wrong_src = tmp_path / "elsewhere.py"
+    wrong_src.write_text("wrong\n")
+    (dst / "stop_summary.py").symlink_to(wrong_src)
+
+    hooks.install_hook_scripts(cfg.tools_root / "hooks", dst)
+    target = dst / "stop_summary.py"
+    assert target.readlink() == cfg.tools_root / "hooks" / "stop_summary.py"
+    assert len(list(dst.glob("stop_summary.py.bak.*"))) == 1
+
+
+def test_write_hooks_json_unchanged_content_no_bak(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    hooks_json = tmp_path / "hooks.json"
+    hooks.write_hooks_json(hooks_dir, hooks_json)
+    hooks.write_hooks_json(hooks_dir, hooks_json)
+    hooks.write_hooks_json(hooks_dir, hooks_json)
+    assert list(tmp_path.glob("hooks.json.bak.*")) == []
+
+
+def test_write_claude_settings_unchanged_content_no_bak(tmp_path):
+    output = tmp_path / "claude_hooks_settings.json"
+    hooks.write_claude_settings(tmp_path / "hooks", None, output)
+    hooks.write_claude_settings(tmp_path / "hooks", None, output)
+    assert list(tmp_path.glob("claude_hooks_settings.json.bak.*")) == []

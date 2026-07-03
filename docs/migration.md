@@ -63,7 +63,7 @@ on — kept here as the durable in-repo record).
 | `cdx_print_active_session_diagnosis` | Y | session.py::diagnose_session | test_session.py::test_diagnose_session_verifies_live_holder | N |
 | `cdx_cancel_active_session` | Y | session.py::cancel_session — **fix A3**: PID-verified, TERM→verify→KILL, refuses to signal an unverified PID | test_session.py::test_cancel_kills_actual_lock_holder, test_cancel_refuses_to_signal_pid_that_no_longer_holds_the_lock | N |
 | `cdx_handle_active_session_conflict` | Y | session.py::handle_conflict — **diagnose-only by default**, live cancellation requires explicit `mode="cancel"` | test_session.py::test_handle_conflict_defaults_to_diagnose_only, test_handle_conflict_cancel_mode_signals | N |
-| `cdx_session_doctor` | Y | session.py::diagnose_session (doctor.py wraps this for CLI output, Phase 3+) | — | N |
+| `cdx_session_doctor` | Y | session.py::diagnose_session (doctor.py wraps this for CLI output, Phase 3+) | — | Y |
 | `launch_log_dir` | Y | session.py::launch_log_dir | test_session.py::test_launch_log_dir_uses_sanitized_repo_name | N |
 | `ensure_session_log_dir` | N | deferred to launch.py (Phase 4) — needs the per-launch session-state object | — | N |
 | `sanitize_file_stem` | Y | config.py::sanitize_name (reused, not duplicated) | — | N |
@@ -83,9 +83,9 @@ on — kept here as the durable in-repo record).
 | `cdx_collect_runtime_skill_roots` | Y | skills.py::collect_runtime_skill_roots (delegates to `config.repo_skill_roots`) | test_skills.py::test_collect_runtime_skill_roots_excludes_quarantine | N |
 | `cdx_link_skill_root` | Y | skills.py::link_skill_root — **fix A4**: enforced audit gate at link time (was link-only for every root but quarantine) | test_skills.py::test_link_skill_root_blocks_critical_by_default, test_link_skill_root_allowlist_override_permits_link | N |
 | `cdx_skill_root_status` | N | deferred to doctor.py (Phase 4+, presentation wrapper) | — | N |
-| `run_validate_skills` | Y (partial) | skills.py::discover_skills covers discovery; CLI-facing `--validate-skills`/`--skills-list`/`--skills-audit` reporting deferred to cli.py (Phase 4+) | test_skills.py::test_discover_skills_finds_across_roots_and_dedupes_root_kinds | N |
-| `run_skills_list` | N | cli.py (Phase 4+, wraps skills.py::discover_skills) | — | N |
-| `run_skills_audit` | Y (partial) | skills.py::audit_skill_cached / audit_skill_text; CLI reporting deferred to cli.py | test_skills.py::test_audit_cache_invalidates_on_content_change | N |
+| `run_validate_skills` | Y (partial) | skills.py::discover_skills covers discovery; CLI-facing `--validate-skills`/`--skills-list`/`--skills-audit` reporting deferred to cli.py (Phase 4+) | test_skills.py::test_discover_skills_finds_across_roots_and_dedupes_root_kinds | Y |
+| `run_skills_list` | N | cli.py (Phase 4+, wraps skills.py::discover_skills) | — | Y |
+| `run_skills_audit` | Y (partial) | skills.py::audit_skill_cached / audit_skill_text; CLI reporting deferred to cli.py | test_skills.py::test_audit_cache_invalidates_on_content_change | Y |
 | `skill_validation_summary` | N | deferred to doctor.py (Phase 4+) | — | N |
 
 ## Step 5 — hooks + AGENTS.md/CLAUDE.md generation → `hooks.py` + `context_docs.py` (A6, D2, D3)
@@ -104,7 +104,7 @@ on — kept here as the durable in-repo record).
 
 | Bash function | Ported | Target module | Parity test | Bash delegates |
 |---|---|---|---|---|
-| `launch_codex` | Y | launch.py::launch/prepare_launch — **fix D1**: engine-parameterized (`build_codex_command`), plus new `build_claude_command`/`launch_claude` sibling sharing the same runtime/session/skills/hooks pipeline | test_launch.py::test_launch_invokes_stub_codex_binary_with_expected_env_and_cwd, test_launch_invokes_stub_claude_binary | N |
+| `launch_codex` | Y | launch.py::launch/prepare_launch — **fix D1**: engine-parameterized (`build_codex_command`), plus new `build_claude_command`/`launch_claude` sibling sharing the same runtime/session/skills/hooks pipeline | test_launch.py::test_launch_invokes_stub_codex_binary_with_expected_env_and_cwd, test_launch_invokes_stub_claude_binary | Y |
 | `graph_preflight` | N | deferred — needs graph.py wired in directly (Phase 5 territory once graph.py's own interfaces are finalized) | — | N |
 | `run_repo_graph_build` | N | deferred to Phase 5 (calls graph.py directly, no more subprocess/PYTHONPATH shellout) | — | N |
 | `run_repo_graph_context` | N | deferred to Phase 5 | — | N |
@@ -119,7 +119,7 @@ on — kept here as the durable in-repo record).
 | `review_repo` | N | deferred to cli.py | — | N |
 | `run_init_repo` | N | deferred to cli.py | — | N |
 | `run_graph_only` | N | deferred to cli.py | — | N |
-| `run_install_hooks` | Y (equivalent) | hooks.py::install_hooks_for_repo (ported in Step 5, reused here) | test_hooks.py::test_install_hooks_for_repo_end_to_end | N |
+| `run_install_hooks` | Y (equivalent) | hooks.py::install_hooks_for_repo (ported in Step 5, reused here) | test_hooks.py::test_install_hooks_for_repo_end_to_end | Y |
 | `print_doctor` | N | deferred to doctor.py | — | N |
 | *(new)* `sync_docs_for_repo` | Y | launch.py::sync_docs_for_repo — **D2 standalone entry point**: `cdx-agent sync-docs --repo .` for plain sessions with no special launch mode | test_launch.py::test_sync_docs_for_repo_writes_correct_filename_per_engine | n/a |
 | `print_usage` | N | cli.py | — | N |
@@ -188,15 +188,13 @@ Python equivalents.
   `Config.directory_skeleton()` pre-creates every adoptable subdir empty before adoption
   runs, so adoption was silently never copying anything — fixed to check for actual
   directory content, not mere existence.
-- **Bash delegates**: 0 — the bash script has not yet been rewired to call into the new
-  Python modules. This is intentionally deferred: per the plan, wiring `current_codex_home`/
-  `ensure_runtime_config`/`copy_auth_if_needed`/`cdx_cancel_active_session`/
-  `write_repo_hooks_json`/`write_repo_agents` to delegate changes the daily driver's live
-  behavior (isolated safe/full runtimes, and — especially for session cancellation — a
-  fundamentally different, stricter kill policy) and needs an explicit dry-run-first
-  rollout, with `session.py` getting a parallel-run validation period before live
-  cancellation is ever wired to the real `bin/cdx-agent` — see "Bash integration status"
-  below.
+- **Bash delegates**: 6 command families — `launch` (the default, highest-traffic path),
+  `session-doctor`, `install-hooks`, `validate-skills`, `skills-list`, and `skills-audit`
+  now route through `cdx_agent_py()` (`python3 -m cdx_agent ...`), cut over on 2026-07-02
+  with user authorization — see "Bash integration status" below for the full account.
+  Everything else in the tables still runs bash's own implementation even where a Python
+  port exists (e.g. the dg-workspace family and token/usage helpers are fully ported with
+  parity tests but not yet delegated) — delegating those is backlog, not blocked.
 - Steps are sequenced 1→8 above; see the plan's Phase 0–7 breakdown for how these map to
   shippable phases (each phase covers one or two steps plus its paired safety-hardening
   item).
@@ -257,3 +255,32 @@ wiring all 4 hook scripts (confirming the A6 fix is live, not just tested); dry-
 the user's real `real_Cartpole` and `DeepReach` repos resolved correctly and — critically —
 created no runtime directories or touched no files (dry-run really is dry). All test
 artifacts created during this verification were cleaned up afterward.
+
+## Post-cutover fix: runtime doc used the wrong template (2026-07-02)
+
+Found while answering "do I get token savings launching through cdx-agent": `context_docs.py`
+conflated two genuinely different bash templates under one `load_canonical_template`/
+`DEFAULT_TEMPLATE` name -- `prepare_launch`'s runtime-dir doc sync was writing the condensed
+per-repo template (`templates/repo.AGENTS.md`, meant for the repo's own committed AGENTS.md
+via `sync-docs`) into the runtime directory instead of the fuller working-rules template
+(`base/AGENTS.md`, bash's `BASE_AGENTS_TEMPLATE`) that actually carries the `TOKEN_SAVER`
+block. Net effect: the session doc the agent actually reads at launch was the wrong,
+much-shorter document, and the token-saving instructions were never reachable through the
+new launch path at all, regardless of a `--token-saver` flag (which also didn't exist yet).
+
+Fixed by splitting `context_docs.py` into two clearly separate paths:
+- `load_working_rules_template`/`render_working_rules`/`sync_runtime_docs` -- the runtime-dir
+  doc, with the same `TOKEN_SAVER_START`/`END` strip-by-default toggle bash's
+  `render_runtime_agents` has (off by default, matching bash's `TOKEN_SAVER=0` default; no
+  hand-written-file protection, since this file is regenerated fresh every launch).
+- `load_repo_template`/`render`/`sync_repo_docs` -- unchanged behavior, renamed for clarity,
+  still used by `sync-docs`/`sync_docs_for_repo` for the repo's own AGENTS.md/CLAUDE.md.
+
+Added `--token-saver`/`--no-token-saver` to `cdx-agent launch` (Python and bash both --
+bash's existing `$TOKEN_SAVER` variable, set by its own pre-existing `--token-saver` flag,
+is now actually forwarded to the Python delegate instead of being a dead variable post-cutover).
+
+Verified end-to-end against the real system: default launch correctly loads the real
+`codex_tools/base/AGENTS.md` ("# Sandeep's Codex working rules...") with the token-saving
+block stripped; `--token-saver` includes it. 10 new tests (`test_context_docs.py`,
+`test_launch.py`, `test_cli_commands.py`).

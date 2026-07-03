@@ -8,13 +8,14 @@ import configparser
 import importlib.metadata as importlib_metadata
 import importlib.util as importlib_util
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -155,6 +156,7 @@ WORKSPACE_THIRD_PARTY_PATH_MARKERS = (
     "conda-meta",
 )
 WORKSPACE_THIRD_PARTY_PATH_SUFFIXES = (".whl", ".egg", ".dist-info", ".egg-info")
+SCAN_CACHE_BASENAME = ".scan_cache.json"
 
 
 @dataclass
@@ -166,6 +168,7 @@ class FileNode:
     functions: list[str]
     tags: list[str]
     path_refs: list[str]
+    import_edges: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _project_markers(repo: Path) -> list[Path]:
@@ -355,6 +358,136 @@ def _parse_python_ast(path: Path) -> tuple[ast.AST | None, list[dict[str, Any]],
         return None, [error], text
 
 
+def _package_roots(repo: Path) -> list[Path]:
+    """Candidate import roots to resolve absolute imports against: the repo
+    root itself, plus `src/` if it exists (the common src-layout convention
+    where `import mypackage` really means `src/mypackage`)."""
+    roots = [repo]
+    src = repo / "src"
+    if src.is_dir():
+        roots.append(src)
+    return roots
+
+
+def _resolve_module_to_file(root: Path, dotted: str) -> Path | None:
+    """Resolve a dotted module path like 'foo.bar' to a concrete file under
+    `root`, trying both the module-as-file and module-as-package forms."""
+    parts = [p for p in dotted.split(".") if p]
+    if not parts:
+        return None
+    candidate = root.joinpath(*parts)
+    py_file = candidate.with_suffix(".py")
+    if py_file.is_file():
+        return py_file
+    init_file = candidate / "__init__.py"
+    if init_file.is_file():
+        return init_file
+    return None
+
+
+def _resolve_absolute_import(repo: Path, module: str, imported_name: str | None) -> Path | None:
+    # For `from X import Y`, prefer treating Y as a submodule of X
+    # (`X/Y.py`) first -- that's the primary intent of `from pkg import
+    # submodule` -- and only fall back to X itself (Y is an attribute/name
+    # defined inside X's __init__.py, not a submodule) if that doesn't
+    # resolve. Trying X first would always "win" whenever X is a real
+    # package, even when Y is clearly meant as a submodule.
+    candidates = []
+    if imported_name:
+        candidates.append(f"{module}.{imported_name}" if module else imported_name)
+    if module:
+        candidates.append(module)
+    for root in _package_roots(repo):
+        for candidate in candidates:
+            resolved = _resolve_module_to_file(root, candidate)
+            if resolved is not None:
+                return resolved
+    return None
+
+
+def _resolve_relative_base(repo: Path, file_path: Path, level: int) -> Path | None:
+    """For `from . import x` (level=1), `from .. import x` (level=2), etc,
+    compute the package directory the leading dots refer to, relative to
+    `file_path`'s own location (approximates the file's own directory as its
+    package -- accurate for the common case of a non-package-root module)."""
+    base = file_path.parent
+    for _ in range(max(level - 1, 0)):
+        base = base.parent
+    resolved_repo = repo.resolve()
+    try:
+        base.resolve().relative_to(resolved_repo)
+    except ValueError:
+        return None
+    return base
+
+
+def _resolve_relative_import(
+    repo: Path, file_path: Path, module: str | None, level: int, imported_name: str | None
+) -> Path | None:
+    base = _resolve_relative_base(repo, file_path, level)
+    if base is None:
+        return None
+    # Same submodule-before-package-init preference as _resolve_absolute_import.
+    candidates = []
+    if module and imported_name:
+        candidates.append(f"{module}.{imported_name}")
+    elif imported_name:
+        candidates.append(imported_name)
+    if module:
+        candidates.append(module)
+    for candidate in candidates:
+        resolved = _resolve_module_to_file(base, candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _import_edge_record(repo: Path, raw: str, target: Path | None) -> dict[str, Any]:
+    resolved_repo = repo.resolve()
+    target_rel = None
+    if target is not None:
+        try:
+            target_rel = str(target.resolve().relative_to(resolved_repo))
+        except (OSError, ValueError):
+            target_rel = None
+    return {"raw": raw, "target": target_rel, "resolved": target_rel is not None}
+
+
+def _import_edges_from_ast(tree: ast.AST, repo: Path, file_path: Path) -> list[dict[str, Any]]:
+    """Real import resolution (E3 fix): previously the graph only recorded
+    bare import-name strings with no verification they resolve to a real
+    file, which was ambiguous for same-named modules in different packages.
+    This walks package roots / relative-import levels to resolve each import
+    to a concrete file within the repo where possible, marking it
+    unresolved (likely a third-party/external import) otherwise."""
+    edges: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                raw = alias.name
+                if raw in seen:
+                    continue
+                seen.add(raw)
+                target = _resolve_absolute_import(repo, raw, None)
+                edges.append(_import_edge_record(repo, raw, target))
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            level = node.level or 0
+            for alias in node.names:
+                imported_name = None if alias.name == "*" else alias.name
+                raw = ("." * level) + module + (f".{imported_name}" if imported_name else "")
+                if raw in seen:
+                    continue
+                seen.add(raw)
+                if level > 0:
+                    target = _resolve_relative_import(repo, file_path, module or None, level, imported_name)
+                else:
+                    target = _resolve_absolute_import(repo, module, imported_name)
+                edges.append(_import_edge_record(repo, raw, target))
+    return edges
+
+
 def _scan_python(path: Path, repo: Path, hints: Iterable[str] = TOPIC_HINTS) -> tuple[FileNode, list[dict[str, Any]]]:
     tree, parse_errors, text = _parse_python_ast(path)
     imports: list[str] = []
@@ -387,6 +520,7 @@ def _scan_python(path: Path, repo: Path, hints: Iterable[str] = TOPIC_HINTS) -> 
             functions.append(node.name)
         elif isinstance(node, ast.ClassDef):
             classes.append(node.name)
+    import_edges = _import_edges_from_ast(tree, repo, path)
     return (
         FileNode(
             path=str(path.relative_to(repo)),
@@ -396,6 +530,7 @@ def _scan_python(path: Path, repo: Path, hints: Iterable[str] = TOPIC_HINTS) -> 
             functions=sorted(set(functions)),
             tags=_tags_from_text(text, hints),
             path_refs=_path_refs_from_text(text),
+            import_edges=import_edges,
         ),
         parse_errors,
     )
@@ -414,6 +549,9 @@ def _scan_textual(path: Path, repo: Path, kind: str, hints: Iterable[str] = TOPI
     )
 
 
+_DOCKERFILE_NAME_RE = re.compile(r"^(dockerfile|.*\.dockerfile)$", re.IGNORECASE)
+
+
 def _classify_file(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix == ".py":
@@ -426,13 +564,122 @@ def _classify_file(path: Path) -> str | None:
         return "json"
     if suffix == ".toml":
         return "toml"
+    if _DOCKERFILE_NAME_RE.match(path.name):
+        # E4: cheap, high-signal for entrypoint detection (CMD/ENTRYPOINT
+        # usually names the real launcher). Reuses the existing generic
+        # textual scan (tags + path_refs), no dedicated parser needed.
+        return "dockerfile"
     return None
 
 
-def _likely_entrypoints(nodes: list[FileNode]) -> list[dict[str, Any]]:
+_PYTHON_INVOCATION_RE = re.compile(r"\bpython3?\s+(?:-m\s+)?([A-Za-z0-9_./-]+\.py)\b")
+_CONSOLE_SCRIPT_ENTRY_RE = re.compile(r"[\"']?([\w.-]+)[\"']?\s*=\s*([\w.]+):(\w+)")
+
+
+def _add_declared(declared: dict[str, str], target: Path | None, repo: Path, reason: str) -> None:
+    if target is None:
+        return
+    try:
+        rel = str(target.resolve().relative_to(repo.resolve()))
+    except (OSError, ValueError):
+        return
+    declared.setdefault(rel, reason)
+
+
+def _discover_pyproject_scripts(repo: Path, declared: dict[str, str]) -> None:
+    pyproject = repo / "pyproject.toml"
+    if not pyproject.is_file():
+        return
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError):
+        return
+    project = data.get("project", {}) if isinstance(data, dict) else {}
+    scripts = project.get("scripts", {}) if isinstance(project, dict) else {}
+    if not isinstance(scripts, dict):
+        return
+    for name, target_spec in scripts.items():
+        if not isinstance(target_spec, str) or ":" not in target_spec:
+            continue
+        module = target_spec.split(":", 1)[0].strip()
+        target = _resolve_absolute_import(repo, module, None)
+        _add_declared(declared, target, repo, f"pyproject.toml [project.scripts] '{name}'")
+
+
+def _discover_setup_py_console_scripts(repo: Path, declared: dict[str, str]) -> None:
+    setup_py = repo / "setup.py"
+    if not setup_py.is_file():
+        return
+    try:
+        text = setup_py.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return
+    if "console_scripts" not in text:
+        return
+    # Best-effort: regex over the whole file rather than executing/AST-parsing
+    # setup.py (which can run arbitrary code) -- good enough for the common
+    # `"name = module:func"` entry_points string format.
+    idx = text.find("console_scripts")
+    window = text[idx : idx + 2000]
+    for match in _CONSOLE_SCRIPT_ENTRY_RE.finditer(window):
+        name, module, _func = match.groups()
+        target = _resolve_absolute_import(repo, module, None)
+        _add_declared(declared, target, repo, f"setup.py console_scripts '{name}'")
+
+
+def _discover_python_invocations_in_file(repo: Path, path: Path, reason_prefix: str, declared: dict[str, str]) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return
+    for match in _PYTHON_INVOCATION_RE.finditer(text):
+        ref = match.group(1)
+        candidate = repo / ref
+        if candidate.is_file():
+            _add_declared(declared, candidate, repo, f"{reason_prefix} ({path.name})")
+
+
+def _discover_makefile_targets(repo: Path, declared: dict[str, str]) -> None:
+    for name in ("Makefile", "makefile", "GNUmakefile"):
+        makefile = repo / name
+        if makefile.is_file():
+            _discover_python_invocations_in_file(repo, makefile, "Makefile target", declared)
+
+
+def _discover_ci_run_steps(repo: Path, declared: dict[str, str]) -> None:
+    ci_paths: list[Path] = []
+    workflows_dir = repo / ".github" / "workflows"
+    if workflows_dir.is_dir():
+        ci_paths.extend(sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")))
+    for name in (".gitlab-ci.yml", ".gitlab-ci.yaml"):
+        candidate = repo / name
+        if candidate.is_file():
+            ci_paths.append(candidate)
+    for ci_path in ci_paths:
+        _discover_python_invocations_in_file(repo, ci_path, "CI run step", declared)
+
+
+def _discover_declared_entrypoints(repo: Path) -> dict[str, str]:
+    """E6 fix: previously entrypoint detection was purely filename-keyword
+    regex matching. This gives real project-declared entrypoints -- what
+    pyproject.toml/setup.py actually ship as a command, what the Makefile
+    and CI actually invoke -- much stronger signal than a name pattern."""
+    declared: dict[str, str] = {}
+    _discover_pyproject_scripts(repo, declared)
+    _discover_setup_py_console_scripts(repo, declared)
+    _discover_makefile_targets(repo, declared)
+    _discover_ci_run_steps(repo, declared)
+    return declared
+
+
+def _likely_entrypoints(nodes: list[FileNode], repo: Path | None = None) -> list[dict[str, Any]]:
+    declared = _discover_declared_entrypoints(repo) if repo is not None else {}
     out: list[dict[str, Any]] = []
     for node in nodes:
         score = 0
+        declared_reason = declared.get(node.path)
+        if declared_reason is not None:
+            score += 6  # outweighs filename heuristics -- this is a real, tooling-declared entrypoint
         if ENTRYPOINT_RE.search(Path(node.path).name):
             score += 3
         if node.kind == "python" and "main" in node.functions:
@@ -440,20 +687,57 @@ def _likely_entrypoints(nodes: list[FileNode]) -> list[dict[str, Any]]:
         if "openpi" in node.tags or "openvla" in node.tags:
             score += 1
         if score > 0:
-            out.append({"path": node.path, "kind": node.kind, "score": score, "tags": node.tags})
+            entry: dict[str, Any] = {"path": node.path, "kind": node.kind, "score": score, "tags": node.tags}
+            if declared_reason is not None:
+                entry["declared_by"] = declared_reason
+            out.append(entry)
     return sorted(out, key=lambda item: (-int(item["score"]), item["path"]))[:30]
 
 
-def _config_edges(nodes: list[FileNode]) -> list[dict[str, Any]]:
+def _resolve_path_ref(repo: Path, source_dir: Path, ref: str) -> str | None:
+    """Resolve a regex-detected path-looking string to a real file, relative
+    to the repo root or to the referencing file's own directory. Returns None
+    (drop the edge) if it doesn't resolve to anything on disk -- fix for E3's
+    `_config_edges` half: previously every regex match was kept regardless of
+    whether it pointed at a real file."""
+    ref_path = Path(ref)
+    resolved_repo = repo.resolve()
+    candidates = [ref_path] if ref_path.is_absolute() else [repo / ref_path, source_dir / ref_path]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            return str(candidate.resolve().relative_to(resolved_repo))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _config_edges(nodes: list[FileNode], repo: Path) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
     for node in nodes:
+        source_dir = (repo / node.path).parent
         for ref in node.path_refs:
-            if ref.endswith((".yaml", ".yml", ".json", ".toml")):
-                edges.append({"source": node.path, "target": ref})
+            if not ref.endswith((".yaml", ".yml", ".json", ".toml")):
+                continue
+            target = _resolve_path_ref(repo, source_dir, ref)
+            if target is None:
+                continue
+            key = (node.path, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append({"source": node.path, "target": target})
     return edges
 
 
 def _reverse_import_index(nodes: list[FileNode]) -> dict[str, list[str]]:
+    """Bare-module-name-keyed index, kept only for backward compatibility
+    with existing consumers of this exact key in repo_graph.json. Ambiguous
+    for same-named modules in different packages -- prefer
+    `_file_reverse_import_index` (file-path-keyed, only resolved edges) for
+    anything new, notably `--impact`."""
     reverse: dict[str, list[str]] = defaultdict(list)
     for node in nodes:
         module_key = node.path.removesuffix(".py").replace("/", ".")
@@ -464,19 +748,65 @@ def _reverse_import_index(nodes: list[FileNode]) -> dict[str, list[str]]:
     return {key: sorted(set(value)) for key, value in reverse.items()}
 
 
+def _file_reverse_import_index(nodes: list[FileNode]) -> dict[str, list[str]]:
+    """Maps a repo-relative FILE PATH (not a bare module name) to the files
+    that resolvably import it (E3 fix). Only edges that resolved to a real
+    file in the repo are included, so this never conflates two same-named
+    modules living in different packages the way the bare-name index could."""
+    reverse: dict[str, list[str]] = defaultdict(list)
+    for node in nodes:
+        for edge in node.import_edges:
+            target = edge.get("target")
+            if target:
+                reverse[target].append(node.path)
+    return {key: sorted(set(value)) for key, value in reverse.items()}
+
+
 def _task_tokens(task: str) -> list[str]:
     return [token.lower() for token in TASK_TOKEN_RE.findall(task)]
 
 
-def _score_node_for_task(node: FileNode, task_tokens: list[str]) -> int:
+def _node_haystack(node: FileNode) -> str:
+    return f"{node.path} {' '.join(node.tags)} {' '.join(node.imports)}".lower()
+
+
+def _document_frequencies(nodes: list[FileNode], task_tokens: list[str]) -> dict[str, int]:
+    """How many nodes each task token appears in at least once -- the "DF"
+    half of a TF-IDF-style weighting (E7 fix). A token that shows up in
+    nearly every file in the repo (e.g. "train" in a training-heavy repo)
+    is a weak discriminator and should count for much less than a token
+    that appears in only a handful of files."""
+    token_set = set(task_tokens)
+    freqs = dict.fromkeys(token_set, 0)
+    for node in nodes:
+        haystack = _node_haystack(node)
+        for token in token_set:
+            if token in haystack:
+                freqs[token] += 1
+    return freqs
+
+
+def _score_node_for_task(
+    node: FileNode,
+    task_tokens: list[str],
+    doc_freqs: dict[str, int] | None = None,
+    total_nodes: int = 0,
+) -> float:
     haystacks = [node.path.lower(), " ".join(node.tags).lower(), " ".join(node.imports).lower()]
-    score = 0
+    name = Path(node.path).name.lower()
+    score = 0.0
     for token in task_tokens:
+        # Smoothed idf: always >= ~1.0 so behavior degrades gracefully to the
+        # original flat weighting when doc_freqs isn't supplied (df=0 case).
+        idf = 1.0
+        if doc_freqs is not None and total_nodes > 0:
+            df = doc_freqs.get(token, 0)
+            idf = math.log((total_nodes + 1) / (df + 1)) + 1.0
         for haystack in haystacks:
             if token in haystack:
-                score += 2
-        if token in Path(node.path).name.lower():
-            score += 3
+                score += 2 * idf
+        if token in name:
+            score += 3 * idf
     if ENTRYPOINT_RE.search(node.path):
         score += 1
     return score
@@ -515,15 +845,20 @@ def _possible_call_chain(nodes: list[FileNode], entrypoints: list[dict[str, Any]
 
 def _build_context_pack(repo: Path, nodes: list[FileNode], task: str) -> str:
     task_tokens = _task_tokens(task)
-    entrypoints = _likely_entrypoints(nodes)
+    entrypoints = _likely_entrypoints(nodes, repo)
+    doc_freqs = _document_frequencies(nodes, task_tokens)
     scored = sorted(
         (
-            {"path": node.path, "score": _score_node_for_task(node, task_tokens), "tags": node.tags}
+            {
+                "path": node.path,
+                "score": _score_node_for_task(node, task_tokens, doc_freqs, len(nodes)),
+                "tags": node.tags,
+            }
             for node in nodes
         ),
-        key=lambda item: (-int(item["score"]), item["path"]),
+        key=lambda item: (-item["score"], item["path"]),
     )
-    relevant = [item for item in scored if int(item["score"]) > 0][:20]
+    relevant = [item for item in scored if item["score"] > 0][:20]
     configs = [node.path for node in nodes if node.kind in {"yaml", "json", "toml"}][:30]
     risky = [part for part in RISKY_FOLDERS if (repo / part).exists()]
     lines = [
@@ -566,29 +901,100 @@ def _build_context_pack(repo: Path, nodes: list[FileNode], task: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _scan_cache_path(repo: Path) -> Path:
+    return repo / WORKSPACE_GRAPH_DIRNAME / SCAN_CACHE_BASENAME
+
+
+def _load_scan_cache(repo: Path, hints: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    cache_path = _scan_cache_path(repo)
+    if not cache_path.is_file():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    # Tags depend on topic_hints; a hints change invalidates every cached
+    # entry at once rather than risking stale tags on a cache hit.
+    if list(payload.get("hints", [])) != list(hints):
+        return {}
+    entries = payload.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _save_scan_cache(repo: Path, hints: tuple[str, ...], entries: dict[str, dict[str, Any]]) -> None:
+    cache_path = _scan_cache_path(repo)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"hints": list(hints), "entries": entries}), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _scan_repository(
     repo: Path,
     max_files: int,
     skip_dirs: set[str] | None = None,
     topic_hints: Iterable[str] | None = None,
+    use_cache: bool = True,
 ) -> tuple[list[FileNode], list[dict[str, Any]], list[Path], bool, list[Path]]:
+    """E5 fix: previously every call re-parsed every file from scratch. Now
+    keyed by (path, mtime, size) -- an unchanged file's previously-computed
+    FileNode/parse-errors are reused instead of re-scanned. Known limitation
+    inherent to mtime+size keying: a same-second, same-size content edit
+    could theoretically be missed; not a concern for the cadence this tool
+    is used at (interactive `--graph`/`--context` invocations, not a
+    file-watcher)."""
     nodes: list[FileNode] = []
     parse_errors: list[dict[str, Any]] = []
     hints = tuple(topic_hints) if topic_hints is not None else resolve_topic_hints(repo)
     files, truncated, dropped = _iter_files(repo, max_files=max_files, skip_dirs=skip_dirs)
+
+    cache_entries = _load_scan_cache(repo, hints) if use_cache else {}
+    new_cache_entries: dict[str, dict[str, Any]] = {}
+
     for path in files:
         kind = _classify_file(path)
         if kind is None:
             continue
         try:
+            rel = str(path.relative_to(repo))
+            stat = path.stat()
+            cached = cache_entries.get(rel)
+            if (
+                cached is not None
+                and cached.get("kind") == kind
+                and cached.get("mtime") == stat.st_mtime
+                and cached.get("size") == stat.st_size
+            ):
+                nodes.append(FileNode(**cached["node"]))
+                node_errors = cached.get("parse_errors", [])
+                parse_errors.extend(node_errors)
+                if use_cache:
+                    new_cache_entries[rel] = cached
+                continue
+
             if kind == "python":
                 node, node_errors = _scan_python(path, repo, hints)
-                nodes.append(node)
-                parse_errors.extend(node_errors)
             else:
-                nodes.append(_scan_textual(path, repo, kind, hints))
+                node, node_errors = _scan_textual(path, repo, kind, hints), []
+            nodes.append(node)
+            parse_errors.extend(node_errors)
+            if use_cache:
+                new_cache_entries[rel] = {
+                    "kind": kind,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "node": node.__dict__,
+                    "parse_errors": node_errors,
+                }
         except OSError:
             continue
+
+    if use_cache:
+        _save_scan_cache(repo, hints, new_cache_entries)
+
     return nodes, parse_errors, files, truncated, dropped
 
 
@@ -629,16 +1035,17 @@ def build_graph(
     max_files: int = 20000,
     skip_dirs: set[str] | None = None,
     topic_hints: Iterable[str] | None = None,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     repo = _repo_root(Path(repo_arg))
     graph_dir = repo / ".codex_graph"
     graph_dir.mkdir(parents=True, exist_ok=True)
     effective_hints = tuple(topic_hints) if topic_hints is not None else resolve_topic_hints(repo)
     nodes, parse_errors, files, truncated, dropped = _scan_repository(
-        repo, max_files=max_files, skip_dirs=skip_dirs, topic_hints=effective_hints
+        repo, max_files=max_files, skip_dirs=skip_dirs, topic_hints=effective_hints, use_cache=use_cache
     )
-    entrypoints = _likely_entrypoints(nodes)
-    edges = _config_edges(nodes)
+    entrypoints = _likely_entrypoints(nodes, repo)
+    edges = _config_edges(nodes, repo)
     dropped_sample = [_relative_or_self(path, repo) for path in dropped]
     graph = {
         "repo": str(repo),
@@ -652,6 +1059,7 @@ def build_graph(
         "entrypoints": entrypoints,
         "config_edges": edges,
         "reverse_import_index": _reverse_import_index(nodes),
+        "file_reverse_import_index": _file_reverse_import_index(nodes),
         "parse_error_count": len(parse_errors),
         "parse_errors": parse_errors,
     }
@@ -1277,8 +1685,8 @@ def _workspace_summary_lines(
     editable: bool = False,
     import_origin: str | None = None,
 ) -> dict[str, Any]:
-    entrypoints = _likely_entrypoints(nodes)
-    configs = _config_edges(nodes)
+    entrypoints = _likely_entrypoints(nodes, repo)
+    configs = _config_edges(nodes, repo)
     path_refs = sorted({ref for node in nodes for ref in node.path_refs})
     relevant = sorted(
         (
@@ -1984,14 +2392,15 @@ def command_relevant(args: argparse.Namespace) -> int:
     payload = json.loads(graph_path.read_text(encoding="utf-8"))
     nodes = [FileNode(**node) for node in payload["nodes"]]
     tokens = _task_tokens(args.task)
+    doc_freqs = _document_frequencies(nodes, tokens)
     scored = sorted(
         (
-            {"path": node.path, "score": _score_node_for_task(node, tokens), "tags": node.tags}
+            {"path": node.path, "score": _score_node_for_task(node, tokens, doc_freqs, len(nodes)), "tags": node.tags}
             for node in nodes
         ),
-        key=lambda item: (-int(item["score"]), item["path"]),
+        key=lambda item: (-item["score"], item["path"]),
     )
-    print(json.dumps([item for item in scored if int(item["score"]) > 0][:20], indent=2))
+    print(json.dumps([item for item in scored if item["score"] > 0][:20], indent=2))
     return 0
 
 
@@ -2001,17 +2410,22 @@ def command_impact(args: argparse.Namespace) -> int:
     if not graph_path.exists():
         build_graph(str(repo))
     payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    # E3 fix: the file-path-keyed index (only resolved, real-file edges) is
+    # the precise answer and is tried first; the bare-module-name index is
+    # kept only as a fallback for anything the resolver couldn't place (e.g.
+    # dynamic imports), so a genuine hit doesn't quietly disappear.
+    file_reverse = payload.get("file_reverse_import_index", {})
     reverse = payload.get("reverse_import_index", {})
     out: dict[str, Any] = {}
     for file_name in args.files:
         rel = str(Path(file_name))
-        impacted: list[str] = []
-        for module in _module_candidates_from_path(rel):
-            impacted.extend(reverse.get(module, []))
-            if "." in module:
-                impacted.extend(reverse.get(module.rsplit(".", 1)[0], []))
-        impacted = sorted(set(impacted))
-        out[rel] = impacted
+        impacted: list[str] = list(file_reverse.get(rel, []))
+        if not impacted:
+            for module in _module_candidates_from_path(rel):
+                impacted.extend(reverse.get(module, []))
+                if "." in module:
+                    impacted.extend(reverse.get(module.rsplit(".", 1)[0], []))
+        out[rel] = sorted(set(impacted))
     print(json.dumps(out, indent=2))
     return 0
 
