@@ -194,9 +194,17 @@ class MirrorResult:
 
 
 def _unique_link_name(base: str, seen: dict[str, int]) -> str:
+    # `seen` tracks every ISSUED name (not just per-base counters): two
+    # entries sanitizing to "foo" alongside a real entry literally named
+    # "foo-2" must not collide -- the counter alone would issue "foo-2" twice
+    # and the second symlink_to would raise FileExistsError mid-build.
     count = seen.get(base, 0)
     name = base if count == 0 else f"{base}-{count + 1}"
+    while name != base and name in seen:
+        count += 1
+        name = f"{base}-{count + 1}"
     seen[base] = count + 1
+    seen[name] = seen.get(name, 0) or 1
     return name
 
 

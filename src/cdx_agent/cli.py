@@ -138,6 +138,7 @@ def _task_graph_parser(mode: str) -> argparse.ArgumentParser:
 def _impact_parser(mode: str) -> argparse.ArgumentParser:
     parser = _graph_parser(mode)
     parser.add_argument("--files", nargs="+", required=True, help="Files to inspect for reverse impact.")
+    parser.add_argument("--depth", type=int, default=3, help="Transitive reverse-import depth (default 3).")
     return parser
 
 

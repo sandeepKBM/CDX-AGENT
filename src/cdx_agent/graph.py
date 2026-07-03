@@ -16,6 +16,7 @@ import sys
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -64,6 +65,11 @@ SKIP_DIRS = {
     "node_modules",
     ".codex",
     ".codex_graph",
+    # Generated report/analysis artifacts: their JSON legitimately lists
+    # hundreds of data paths, which floods config_edges with data lineage
+    # that isn't config->code structure (observed: 1.1MB config_edges.json,
+    # ~65% sourced from reports/).
+    "reports",
 }
 
 RISKY_FOLDERS = (
@@ -157,6 +163,11 @@ WORKSPACE_THIRD_PARTY_PATH_MARKERS = (
 )
 WORKSPACE_THIRD_PARTY_PATH_SUFFIXES = (".whl", ".egg", ".dist-info", ".egg-info")
 SCAN_CACHE_BASENAME = ".scan_cache.json"
+# Bump whenever FileNode's shape or the per-file analysis changes (e.g. E3
+# added import_edges): the cache key is (mtime, size, kind), so an unchanged
+# file's node from an OLDER analysis would otherwise be reused forever --
+# observed live as a repo whose nodes permanently lacked import_edges.
+SCAN_CACHE_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -262,8 +273,14 @@ def _iter_files(
         blocked_dirs.update(skip_dirs)
     hit_hard_ceiling = False
     for root, dirs, filenames in os.walk(repo):
-        dirs[:] = [d for d in dirs if d not in blocked_dirs]
         root_path = Path(root)
+        # A subdirectory carrying its own .git is a nested/vendored repo
+        # (mujoco_menagerie, coppelia runtimes, ...) -- its internals belong
+        # to that repo's own graph, and scanning it here only produces the
+        # vendored-noise configs/parse-errors observed in real packs.
+        dirs[:] = [
+            d for d in dirs if d not in blocked_dirs and not (root_path / d / ".git").exists()
+        ]
         for filename in filenames:
             all_files.append(root_path / filename)
             if len(all_files) >= SCAN_HARD_CEILING:
@@ -713,10 +730,20 @@ def _resolve_path_ref(repo: Path, source_dir: Path, ref: str) -> str | None:
     return None
 
 
+MAX_CONFIG_EDGES_PER_SOURCE = 10
+CONFIG_EDGES_ARTIFACT_CAP = 2000
+
+_CONFIG_NOISE_NAME_RE = re.compile(r"(report|manifest|summary|matrix|lock)", re.IGNORECASE)
+
+
 def _config_edges(nodes: list[FileNode], repo: Path) -> list[dict[str, Any]]:
-    edges: list[dict[str, Any]] = []
+    per_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen: set[tuple[str, str]] = set()
     for node in nodes:
+        # A .json whose NAME already says report/manifest/lockfile is a data
+        # artifact; the paths it lists are lineage, not config->code wiring.
+        if node.kind == "json" and _CONFIG_NOISE_NAME_RE.search(Path(node.path).name):
+            continue
         source_dir = (repo / node.path).parent
         for ref in node.path_refs:
             if not ref.endswith((".yaml", ".yml", ".json", ".toml")):
@@ -728,7 +755,15 @@ def _config_edges(nodes: list[FileNode], repo: Path) -> list[dict[str, Any]]:
             if key in seen:
                 continue
             seen.add(key)
-            edges.append({"source": node.path, "target": target})
+            per_source[node.path].append({"source": node.path, "target": target})
+    edges: list[dict[str, Any]] = []
+    for source in sorted(per_source):
+        items = per_source[source]
+        if len(items) > MAX_CONFIG_EDGES_PER_SOURCE:
+            # A single "config" emitting dozens of edges is a data manifest
+            # enumerating datasets/results, not configuration structure.
+            continue
+        edges.extend(items)
     return edges
 
 
@@ -826,7 +861,63 @@ def _suggested_checks(nodes: list[FileNode]) -> list[str]:
     return checks
 
 
+def _import_call_chains(
+    nodes: list[FileNode],
+    entrypoints: list[dict[str, Any]],
+    max_depth: int = 3,
+    max_chains: int = 12,
+) -> list[str]:
+    """Real call-chain candidates: walk the E3-resolved `import_edges` from
+    the top entrypoints (depth-bounded DFS) and render `entry -> module ->
+    module` chains. Replaces the old path-substring bucketing, which never
+    consulted a single edge and was decoration rather than structure."""
+    by_path = {node.path: node for node in nodes}
+    chains: list[str] = []
+    productive_entries = 0
+    for item in entrypoints:
+        if productive_entries >= 5 or len(chains) >= max_chains:
+            break
+        start = item["path"]
+        node = by_path.get(start)
+        if node is None:
+            continue
+        # Launcher-style scripts (stdlib + runpy/subprocess only) have no
+        # resolved local imports; skip them instead of burning the entrypoint
+        # budget on entries that can't produce a chain.
+        if not any(edge.get("target") for edge in node.import_edges):
+            continue
+        productive_entries += 1
+        emitted_for_entry = 0
+        stack: list[list[str]] = [[start]]
+        while stack and emitted_for_entry < 4 and len(chains) < max_chains:
+            path_so_far = stack.pop()
+            current = by_path.get(path_so_far[-1])
+            targets: list[str] = []
+            if current is not None and len(path_so_far) <= max_depth:
+                # dict.fromkeys: several import statements can resolve to the
+                # same target file; without dedupe every duplicate edge spawns
+                # an identical chain.
+                targets = list(
+                    dict.fromkeys(
+                        edge.get("target")
+                        for edge in current.import_edges
+                        if edge.get("target") and edge.get("target") not in path_so_far
+                    )
+                )
+            if targets:
+                for target in targets[:4]:
+                    stack.append(path_so_far + [target])
+            elif len(path_so_far) > 1:
+                rendered = " -> ".join(f"`{p}`" for p in path_so_far)
+                if rendered not in chains:
+                    chains.append(rendered)
+                    emitted_for_entry += 1
+    return chains
+
+
 def _possible_call_chain(nodes: list[FileNode], entrypoints: list[dict[str, Any]]) -> list[str]:
+    """Fallback grouping for repos where no entrypoint has resolved import
+    edges (e.g. pure-script repos) -- prefer `_import_call_chains`."""
     chain: list[str] = []
     entry_paths = [item["path"] for item in entrypoints[:8]]
     policy_paths = [node.path for node in nodes if "/policies/" in f"/{node.path}" or "policy" in node.path.lower()]
@@ -843,23 +934,83 @@ def _possible_call_chain(nodes: list[FileNode], entrypoints: list[dict[str, Any]
     return chain
 
 
-def _build_context_pack(repo: Path, nodes: list[FileNode], task: str) -> str:
+_CONFIG_NOISE_DIRS = {"third_party", "external", "vendor", "vendors", "reports", "docs"}
+
+
+def _ranked_configs(nodes: list[FileNode], config_edges: list[dict[str, Any]]) -> list[str]:
+    """Rank config files by how likely an agent actually needs them, instead
+    of the old first-30-in-walk-order slice that led with vendored manual
+    indexes and generated report JSON while burying `configs/*.yaml`."""
+    inbound: dict[str, int] = defaultdict(int)
+    for edge in config_edges:
+        inbound[edge["target"]] += 1
+    scored: list[tuple[float, str]] = []
+    for node in nodes:
+        if node.kind not in {"yaml", "json", "toml"}:
+            continue
+        parts = Path(node.path).parts
+        name = parts[-1]
+        score = 0.0
+        if any(part in _CONFIG_NOISE_DIRS for part in parts[:-1]):
+            score -= 10
+        if parts[0] in {"config", "configs"} or (len(parts) > 1 and parts[-2] in {"config", "configs"}):
+            score += 5
+        if len(parts) == 1 and node.kind in {"yaml", "toml"}:
+            score += 4  # repo-root yaml/toml is almost always real config
+        if name == "pyproject.toml":
+            score += 5
+        if _CONFIG_NOISE_NAME_RE.search(name):
+            score -= 6
+        score += min(inbound.get(node.path, 0), 5)  # referenced by code = real
+        scored.append((score, node.path))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    positive = [path for score, path in scored if score > 0]
+    if positive:
+        return positive[:15]
+    return [path for _, path in scored[:8]]
+
+
+def _build_context_pack(
+    repo: Path, nodes: list[FileNode], task: str, config_edges: list[dict[str, Any]] | None = None
+) -> str:
     task_tokens = _task_tokens(task)
     entrypoints = _likely_entrypoints(nodes, repo)
-    doc_freqs = _document_frequencies(nodes, task_tokens)
-    scored = sorted(
-        (
-            {
-                "path": node.path,
-                "score": _score_node_for_task(node, task_tokens, doc_freqs, len(nodes)),
-                "tags": node.tags,
-            }
-            for node in nodes
-        ),
-        key=lambda item: (-item["score"], item["path"]),
-    )
-    relevant = [item for item in scored if item["score"] > 0][:20]
-    configs = [node.path for node in nodes if node.kind in {"yaml", "json", "toml"}][:30]
+    if config_edges is None:
+        config_edges = _config_edges(nodes, repo)
+    relevance_note = ""
+    if task_tokens:
+        doc_freqs = _document_frequencies(nodes, task_tokens)
+        scored = sorted(
+            (
+                {
+                    "path": node.path,
+                    "score": _score_node_for_task(node, task_tokens, doc_freqs, len(nodes)),
+                    "tags": node.tags,
+                }
+                for node in nodes
+            ),
+            key=lambda item: (-item["score"], item["path"]),
+        )
+        relevant = [item for item in scored if item["score"] > 0][:20]
+    else:
+        # Without a task, token scoring degenerates to a +1 for
+        # entrypoint-looking filenames -- a noisy duplicate of the
+        # entrypoints section. Rank by structural signal instead.
+        reverse = _file_reverse_import_index(nodes)
+        scored = sorted(
+            (
+                {
+                    "path": node.path,
+                    "score": 2 * len(node.tags) + min(len(reverse.get(node.path, [])), 5),
+                    "tags": node.tags,
+                }
+                for node in nodes
+            ),
+            key=lambda item: (-item["score"], item["path"]),
+        )
+        relevant = [item for item in scored if item["score"] > 0][:15]
+        relevance_note = "(no task hint: ranked by topic tags + inbound imports; pass --task for task relevance)"
+    configs = _ranked_configs(nodes, config_edges)
     risky = [part for part in RISKY_FOLDERS if (repo / part).exists()]
     lines = [
         f"# Context Pack for {repo.name}",
@@ -868,24 +1019,30 @@ def _build_context_pack(repo: Path, nodes: list[FileNode], task: str) -> str:
         f"- Root: `{repo}`",
         f"- Python/config/script files indexed: `{len(nodes)}`",
         f"- Task hint: `{task or 'none'}`",
+        f"- Generated: `{datetime.now().isoformat(timespec='seconds')}` (pack format v2; regenerate with `cdx-agent --graph` when stale)",
         "",
         "## Likely entrypoints",
     ]
     lines.extend(f"- `{item['path']}` score={item['score']} tags={','.join(item['tags'])}" for item in entrypoints[:12])
     lines.extend(["", "## Important configs"])
-    lines.extend(f"- `{path}`" for path in configs[:20])
+    lines.extend(f"- `{path}`" for path in configs)
     lines.extend(["", "## Risky folders not to edit"])
     if risky:
         lines.extend(f"- `{name}`" for name in risky)
     else:
         lines.append("- `.git`, checkpoints, datasets, outputs, logs, and other generated artifacts")
     lines.extend(["", "## Task-relevant files"])
+    if relevance_note:
+        lines.append(f"- {relevance_note}")
     if relevant:
         lines.extend(f"- `{item['path']}` score={item['score']} tags={','.join(item['tags'])}" for item in relevant)
     else:
         lines.append("- No strong task matches yet; refine the task string or inspect entrypoints first.")
     lines.extend(["", "## Possible call chain"])
-    lines.extend(f"- {item}" for item in _possible_call_chain(nodes, entrypoints))
+    chains = _import_call_chains(nodes, entrypoints)
+    if not chains:
+        chains = _possible_call_chain(nodes, entrypoints)
+    lines.extend(f"- {item}" for item in chains)
     lines.extend(["", "## Suggested tests or smoke checks"])
     lines.extend(f"- {item}" for item in _suggested_checks(nodes))
     lines.extend(["", "## Questions Codex must answer before editing"])
@@ -905,6 +1062,48 @@ def _scan_cache_path(repo: Path) -> Path:
     return repo / WORKSPACE_GRAPH_DIRNAME / SCAN_CACHE_BASENAME
 
 
+def pack_staleness(repo: Path) -> str | None:
+    """None if the repo's context_pack.md is absent or up to date; otherwise
+    a human-readable reason it looks stale. Cheap: stats the files the last
+    scan already indexed (no fresh walk) plus one `git log -1`."""
+    pack = repo / WORKSPACE_GRAPH_DIRNAME / "context_pack.md"
+    if not pack.is_file():
+        return None
+    pack_mtime = pack.stat().st_mtime
+    reasons: list[str] = []
+    cache_path = _scan_cache_path(repo)
+    if cache_path.is_file():
+        try:
+            entries = json.loads(cache_path.read_text(encoding="utf-8")).get("entries", {})
+        except (json.JSONDecodeError, OSError):
+            entries = {}
+        newer = 0
+        for rel in list(entries)[:5000]:
+            try:
+                if (repo / rel).stat().st_mtime > pack_mtime:
+                    newer += 1
+            except OSError:
+                continue
+        if newer:
+            reasons.append(f"{newer} indexed source file(s) modified since the pack was generated")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "log", "-1", "--format=%ct"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip() and int(result.stdout.strip()) > pack_mtime:
+            reasons.append("commits landed after the pack was generated")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    if not reasons:
+        return None
+    return "context_pack.md looks STALE (" + "; ".join(reasons) + ") -- rerun `cdx-agent --graph`"
+
+
 def _load_scan_cache(repo: Path, hints: tuple[str, ...]) -> dict[str, dict[str, Any]]:
     cache_path = _scan_cache_path(repo)
     if not cache_path.is_file():
@@ -916,7 +1115,11 @@ def _load_scan_cache(repo: Path, hints: tuple[str, ...]) -> dict[str, dict[str, 
     if not isinstance(payload, dict):
         return {}
     # Tags depend on topic_hints; a hints change invalidates every cached
-    # entry at once rather than risking stale tags on a cache hit.
+    # entry at once rather than risking stale tags on a cache hit. Same for
+    # the schema version -- an entry produced by older analysis code is
+    # wrong even though the file itself hasn't changed.
+    if payload.get("schema_version") != SCAN_CACHE_SCHEMA_VERSION:
+        return {}
     if list(payload.get("hints", [])) != list(hints):
         return {}
     entries = payload.get("entries")
@@ -927,7 +1130,12 @@ def _save_scan_cache(repo: Path, hints: tuple[str, ...], entries: dict[str, dict
     cache_path = _scan_cache_path(repo)
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"hints": list(hints), "entries": entries}), encoding="utf-8")
+        cache_path.write_text(
+            json.dumps(
+                {"schema_version": SCAN_CACHE_SCHEMA_VERSION, "hints": list(hints), "entries": entries}
+            ),
+            encoding="utf-8",
+        )
     except OSError:
         pass
 
@@ -1046,6 +1254,7 @@ def build_graph(
     )
     entrypoints = _likely_entrypoints(nodes, repo)
     edges = _config_edges(nodes, repo)
+    call_chain = _import_call_chains(nodes, entrypoints) or _possible_call_chain(nodes, entrypoints)
     dropped_sample = [_relative_or_self(path, repo) for path in dropped]
     graph = {
         "repo": str(repo),
@@ -1058,6 +1267,9 @@ def build_graph(
         "nodes": [node.__dict__ for node in nodes],
         "entrypoints": entrypoints,
         "config_edges": edges,
+        # The workspace pack has always read this key; it was never written
+        # before, so its "Call chain" line was permanently "none".
+        "call_chain": call_chain,
         "reverse_import_index": _reverse_import_index(nodes),
         "file_reverse_import_index": _file_reverse_import_index(nodes),
         "parse_error_count": len(parse_errors),
@@ -1065,8 +1277,12 @@ def build_graph(
     }
     (graph_dir / "repo_graph.json").write_text(json.dumps(graph, indent=2), encoding="utf-8")
     (graph_dir / "entrypoints.json").write_text(json.dumps(entrypoints, indent=2), encoding="utf-8")
-    (graph_dir / "config_edges.json").write_text(json.dumps(edges, indent=2), encoding="utf-8")
-    context_pack = _build_context_pack(repo, nodes, task)
+    # Hard cap: this artifact is read by agents; it must never be able to
+    # blow a context window no matter how pathological the repo is.
+    (graph_dir / "config_edges.json").write_text(
+        json.dumps(edges[:CONFIG_EDGES_ARTIFACT_CAP], indent=2), encoding="utf-8"
+    )
+    context_pack = _build_context_pack(repo, nodes, task, config_edges=edges)
     if truncated or parse_errors:
         extra: list[str] = ["", "## Graph notes"]
         if truncated:
@@ -2031,7 +2247,7 @@ def _workspace_context_pack_text(
         f"- Nodes scanned: `{primary_graph.get('node_count', len(primary_nodes))}`",
         f"- Parse issues: `{primary_graph.get('parse_error_count', 0)}`",
         f"- Entry points: {_workspace_path_summary_items([item['path'] for item in primary_entrypoints])}",
-        f"- Config refs: {_workspace_path_summary_items([edge['source'] for edge in primary_configs])}",
+        f"- Config refs: {_workspace_path_summary_items(list(dict.fromkeys(edge['source'] for edge in primary_configs)))}",
         f"- Relevant files: {_workspace_path_summary_items([item['path'] for item in primary_relevant])}",
         f"- Call chain: {' | '.join(primary_graph.get('call_chain', [])) or 'none'}",
         f"- Single-repo context pack: `{_workspace_dir(repo) / 'context_pack.md'}`",
@@ -2362,6 +2578,9 @@ def command_workspace_doctor(args: argparse.Namespace) -> int:
 
 def command_build(args: argparse.Namespace) -> int:
     repo = resolve_repo_root(args.repo, force_home_scan=bool(getattr(args, "force_home_scan", False)))
+    stale = pack_staleness(repo)
+    if stale:
+        print(f"note: previous {stale}", file=sys.stderr)
     graph = build_graph(str(repo), task=args.task or "", max_files=args.max_files)
     payload = {
         "repo": graph["repo"],
@@ -2416,16 +2635,44 @@ def command_impact(args: argparse.Namespace) -> int:
     # dynamic imports), so a genuine hit doesn't quietly disappear.
     file_reverse = payload.get("file_reverse_import_index", {})
     reverse = payload.get("reverse_import_index", {})
+    config_edges = payload.get("config_edges", [])
+    entry_paths = {item["path"] for item in payload.get("entrypoints", [])}
+    max_depth = int(getattr(args, "depth", 3) or 3)
     out: dict[str, Any] = {}
     for file_name in args.files:
         rel = str(Path(file_name))
-        impacted: list[str] = list(file_reverse.get(rel, []))
-        if not impacted:
+        direct: list[str] = list(file_reverse.get(rel, []))
+        if not direct:
             for module in _module_candidates_from_path(rel):
-                impacted.extend(reverse.get(module, []))
+                direct.extend(reverse.get(module, []))
                 if "." in module:
-                    impacted.extend(reverse.get(module.rsplit(".", 1)[0], []))
-        out[rel] = sorted(set(impacted))
+                    direct.extend(reverse.get(module.rsplit(".", 1)[0], []))
+        direct = sorted(set(direct))
+        # Transitive reverse-import closure: the blast radius of an edit is
+        # everything that (indirectly) imports the changed file, not just
+        # the first ring.
+        depths: dict[str, int] = {path: 1 for path in direct}
+        frontier = list(direct)
+        depth = 1
+        while frontier and depth < max_depth:
+            depth += 1
+            next_frontier: list[str] = []
+            for current in frontier:
+                for importer in file_reverse.get(current, []):
+                    if importer != rel and importer not in depths:
+                        depths[importer] = depth
+                        next_frontier.append(importer)
+            frontier = next_frontier
+        transitive = [
+            {"path": path, "depth": d, "entrypoint": path in entry_paths}
+            for path, d in sorted(depths.items(), key=lambda kv: (kv[1], kv[0] not in entry_paths, kv[0]))
+        ]
+        config_refs = sorted({edge["source"] for edge in config_edges if edge.get("target") == rel})
+        out[rel] = {
+            "direct": direct,
+            "transitive": transitive,
+            "config_references": config_refs,
+        }
     print(json.dumps(out, indent=2))
     return 0
 
@@ -2454,6 +2701,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser_impact = subparsers.add_parser("impact")
     parser_impact.add_argument("--repo", required=True)
     parser_impact.add_argument("--files", nargs="+", required=True)
+    parser_impact.add_argument("--depth", type=int, default=3)
     parser_impact.set_defaults(func=command_impact)
 
     parser_detect_deps = subparsers.add_parser("detect-deps")

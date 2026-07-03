@@ -246,3 +246,40 @@ def test_provision_claude_dry_run_does_not_prune(tmp_path):
 
     runtime_mod.provision_runtime(cfg, repo, access_mode="safe", engine="claude", dry_run=True)
     assert legacy.is_dir()
+
+
+def test_reap_dry_run_mutates_nothing_including_permissions(tmp_path):
+    # Regression: report-only mode used to chmod credential files inside
+    # stale runtimes -- a filesystem mutation from a documented read-only op.
+    cfg = _make_config(tmp_path)
+    stale = cfg.runtime_root / "host" / "codex" / "full" / "repo__x.stale.20260101"
+    stale.mkdir(parents=True)
+    cred = stale / "auth.json"
+    cred.write_text("{}")
+    cred.chmod(0o644)
+
+    runtime_mod.reap_stale_runtimes(cfg, max_age_days=99999, dry_run=True)
+    assert (cred.stat().st_mode & 0o777) == 0o644  # untouched in dry-run
+
+    runtime_mod.reap_stale_runtimes(cfg, max_age_days=99999, dry_run=False)
+    assert (cred.stat().st_mode & 0o777) == 0o600  # hardened only in --apply
+
+
+def test_extract_toml_key_handles_spacing_variants(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('model="gpt-6.0"\nmodel_reasoning_effort  =  "high"\n')
+    assert runtime_mod._extract_toml_key(path, "model") == 'model = "gpt-6.0"'
+    assert runtime_mod._extract_toml_key(path, "model_reasoning_effort") == 'model_reasoning_effort = "high"'
+
+
+def test_extract_toml_key_ignores_keys_inside_tables(tmp_path):
+    # A `model = ...` inside [profiles.x] must NOT be promoted to top level.
+    path = tmp_path / "config.toml"
+    path.write_text('[profiles.fast]\nmodel = "table-model"\n')
+    assert runtime_mod._extract_toml_key(path, "model") is None
+
+
+def test_extract_toml_key_top_level_wins_over_table(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('model = "top"\n[profiles.fast]\nmodel = "nested"\n')
+    assert runtime_mod._extract_toml_key(path, "model") == 'model = "top"'

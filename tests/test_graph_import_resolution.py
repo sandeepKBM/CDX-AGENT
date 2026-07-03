@@ -122,12 +122,12 @@ def test_impact_command_uses_file_keyed_index(tmp_path, monkeypatch, capsys):
 
     from types import SimpleNamespace
 
-    graph.command_impact(SimpleNamespace(repo=str(repo), files=["alpha/utils.py"], force_home_scan=False))
+    graph.command_impact(SimpleNamespace(repo=str(repo), files=["alpha/utils.py"], force_home_scan=False, depth=3))
     out = capsys.readouterr().out
     import json as json_mod
 
     payload = json_mod.loads(out)
-    assert payload["alpha/utils.py"] == ["alpha/consumer.py"]
+    assert payload["alpha/utils.py"]["direct"] == ["alpha/consumer.py"]
 
 
 def test_import_edges_mark_unresolved_external_imports(tmp_path, monkeypatch):

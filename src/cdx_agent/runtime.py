@@ -26,6 +26,7 @@ import hashlib
 import json
 import shutil
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -199,13 +200,32 @@ def sync_rendered_text(runtime_dir: Path, key: str, content: str, dest: Path, dr
 
 
 def _extract_toml_key(path: Path, key: str) -> str | None:
+    """Return a canonical `key = <value>` line for a TOP-LEVEL key in the
+    given TOML file, or None. Parses with tomllib so spacing variants
+    (`model="x"`, `model  =  "x"`) work and keys inside tables
+    (`[profiles.x] model = ...`) are correctly NOT promoted to top level --
+    the previous line-prefix match failed both ways. Falls back to the old
+    prefix scan only if the file isn't valid TOML."""
     if not path.is_file():
         return None
-    prefix = f"{key} = "
-    for line in path.read_text().splitlines():
-        if line.startswith(prefix):
-            return line
-    return None
+    try:
+        data = tomllib.loads(path.read_text())
+    except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+        prefix = f"{key} = "
+        for line in path.read_text(errors="ignore").splitlines():
+            if line.startswith(prefix):
+                return line
+        return None
+    if key not in data:
+        return None
+    value = data[key]
+    if isinstance(value, str):
+        return f'{key} = "{value}"'
+    if isinstance(value, bool):
+        return f"{key} = {str(value).lower()}"
+    if isinstance(value, (int, float)):
+        return f"{key} = {value}"
+    return None  # tables/arrays aren't representable as a single config line
 
 
 def render_codex_config(config: Config, repo: Path) -> str:
@@ -335,9 +355,13 @@ def reap_stale_runtimes(config: Config, max_age_days: int | None = None, dry_run
     now = time.time()
     reports = []
     for path in find_stale_runtimes(config):
-        _harden_credential_permissions(path)
         age_days = (now - path.stat().st_mtime) / 86400
         if age_days < threshold:
+            if not dry_run:
+                # Hardening chmods credential files, so it only belongs in
+                # --apply mode -- the report-only default must not mutate
+                # anything (it's documented as read-only).
+                _harden_credential_permissions(path)
             reports.append(ReapReport(path, age_days, "kept"))
             continue
         if dry_run:

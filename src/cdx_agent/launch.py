@@ -71,8 +71,8 @@ def translate_passthrough_for_engine(engine: Engine, passthrough: list[str]) -> 
     rest = passthrough[1:]
     if "--last" in rest:
         return ["--continue", *(tok for tok in rest if tok != "--last")]
-    if rest and not rest[0].startswith("-"):
-        return ["--resume", *rest]  # first token is a session id/name
+    # A bare session id/name after `resume` rides along as --resume's value;
+    # to send the literal word "resume" as a prompt instead, use `-p resume`.
     return ["--resume", *rest]
 
 
@@ -219,7 +219,9 @@ def prepare_launch(
     hook_install: hooks.HookInstallResult | None = None
     if not dry_run and not secondary and plan_allowed:
         link_decisions = tuple(
-            skills.link_all_skill_roots(config, resolved_repo, rctx.skills_dir, allowlist=skill_allowlist)
+            skills.link_all_skill_roots(
+                config, resolved_repo, rctx.skills_dir, allowlist=skill_allowlist, engine=engine
+            )
         )
         working_rules = context_docs.load_working_rules_template(config)
         rendered_rules = context_docs.render_working_rules(working_rules, token_saver=token_saver)
@@ -313,7 +315,11 @@ def command_launch(args) -> int:
     cfg = load_config(getattr(args, "config", None))
     repo = Path(args.repo)
     access_mode: AccessMode = "full" if args.full else "safe" if args.safe else cfg.default_access_mode
-    passthrough = [tok for tok in (args.passthrough or []) if tok != "--"]
+    passthrough = list(args.passthrough or [])
+    if "--" in passthrough:
+        # Drop only the first separator; later "--" tokens are payload meant
+        # for the engine binary (e.g. to end ITS option parsing).
+        passthrough.remove("--")
     passthrough = translate_passthrough_for_engine(args.engine, passthrough)
     secondary = getattr(args, "secondary", False)
     token_saver = getattr(args, "token_saver", False)
@@ -354,7 +360,14 @@ def command_launch(args) -> int:
             return 1
 
         outcome = launch(
-            cfg, repo, engine=args.engine, access_mode=access_mode, passthrough=passthrough, dry_run=args.dry_run
+            cfg,
+            repo,
+            engine=args.engine,
+            access_mode=access_mode,
+            passthrough=passthrough,
+            dry_run=args.dry_run,
+            secondary=secondary,
+            token_saver=token_saver,
         )
         if outcome.prepare.plan is None:
             print("Still could not acquire the session lock after cancellation.", file=sys.stderr)

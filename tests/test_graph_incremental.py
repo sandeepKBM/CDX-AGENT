@@ -1,3 +1,5 @@
+import json
+
 from cdx_agent import graph
 
 
@@ -143,3 +145,31 @@ def test_scan_cache_ignores_stale_entries_for_deleted_files_on_next_save(tmp_pat
     payload = json.loads(cache_path.read_text())
     assert "a.py" not in payload["entries"]
     assert "b.py" in payload["entries"]
+
+
+def test_cache_invalidated_on_schema_version_change(tmp_path, monkeypatch):
+    # Regression (found live): a cache written by pre-E3 code held nodes with
+    # no import_edges; since the key is (mtime, size, kind), the stale-schema
+    # node was reused forever. A schema version bump must invalidate it.
+    monkeypatch.setattr(graph, "HOME_ROOT", tmp_path / "unrelated-home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "mod.py").write_text("x = 1\n")
+    (repo / "main.py").write_text("from pkg import mod\n")
+
+    graph.build_graph(str(repo))
+    cache_path = repo / ".codex_graph" / ".scan_cache.json"
+    payload = json.loads(cache_path.read_text())
+    assert payload["schema_version"] == graph.SCAN_CACHE_SCHEMA_VERSION
+
+    # Simulate an old-schema cache: strip import_edges + downgrade version.
+    for entry in payload["entries"].values():
+        entry["node"].pop("import_edges", None)
+    payload["schema_version"] = 1
+    cache_path.write_text(json.dumps(payload))
+
+    result = graph.build_graph(str(repo))
+    node = next(n for n in result["nodes"] if n["path"] == "main.py")
+    assert any(e.get("resolved") for e in node["import_edges"])  # re-analyzed, not stale-reused

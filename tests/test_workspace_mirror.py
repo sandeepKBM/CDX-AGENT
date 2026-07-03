@@ -232,3 +232,19 @@ def test_need_dg_returns_none_when_absent(monkeypatch):
 def test_build_dg_command_shape(tmp_path):
     cmd = wm.build_dg_command("/usr/bin/dg", tmp_path, ["--flag"])
     assert cmd == ["/usr/bin/dg", str(tmp_path), "--flag"]
+
+
+def test_unique_link_name_survives_literal_dash_n_entry():
+    # Regression: entries sanitizing to ["foo-2", "foo", "foo"] used to issue
+    # "foo-2" twice (counter ignored already-issued literal names), raising
+    # FileExistsError mid-build.
+    from cdx_agent.workspace_mirror import _unique_link_name
+
+    seen: dict[str, int] = {}
+    issued = [
+        _unique_link_name("foo-2", seen),
+        _unique_link_name("foo", seen),
+        _unique_link_name("foo", seen),
+        _unique_link_name("foo", seen),
+    ]
+    assert len(issued) == len(set(issued)), issued

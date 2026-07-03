@@ -41,7 +41,18 @@ AUDIT_RULES: tuple[tuple[str, str, str, re.Pattern], ...] = (
         "skill text contains global npm install",
         re.compile(r"\bnpm\s+install\s+-g\b", re.IGNORECASE),
     ),
-    ("critical", "pip install", "skill text contains pip install", re.compile(r"\bpip\s+install\b", re.IGNORECASE)),
+    (
+        "critical",
+        "pip install",
+        "skill text contains a pip install variant",
+        re.compile(r"\b(?:pip3?|python3?\s+-m\s+pip)\s+install\b", re.IGNORECASE),
+    ),
+    (
+        "critical",
+        "apt install",
+        "skill text contains a system package install",
+        re.compile(r"\bapt(?:-get)?\s+(?:-y\s+)?install\b", re.IGNORECASE),
+    ),
     ("critical", "bash -c", "skill text contains bash -c", re.compile(r"\bbash\s+-c\b", re.IGNORECASE)),
     ("critical", "sh -c", "skill text contains sh -c", re.compile(r"\bsh\s+-c\b", re.IGNORECASE)),
     ("critical", "chmod 777", "skill text contains chmod 777", re.compile(r"\bchmod\s+777\b", re.IGNORECASE)),
@@ -74,6 +85,7 @@ class AuditFinding:
     message: str
     line_no: int
     line_text: str
+    file: str = ""  # relative companion-file path; "" for SKILL.md itself
 
 
 @dataclass(frozen=True)
@@ -90,12 +102,23 @@ class AuditResult:
         return "clean"
 
 
+_NEGATION_RE = re.compile(r"\b(?:do\s+not|don'?t|never|avoid|not)\b[^.]*$", re.IGNORECASE)
+
+
 def audit_skill_text(path: Path, text: str) -> AuditResult:
     findings = []
     for line_no, line in enumerate(text.splitlines(), start=1):
         for severity, rule_name, message, pattern in AUDIT_RULES:
-            if pattern.search(line):
-                findings.append(AuditFinding(severity, rule_name, message, line_no, line.strip()))
+            match = pattern.search(line)
+            if not match:
+                continue
+            effective = severity
+            if severity == "critical" and _NEGATION_RE.search(line[: match.start()]):
+                # Cautionary prose ("do NOT run pip install") is guidance, not
+                # an instruction to execute -- hard-blocking it would punish
+                # exactly the skills that warn against the dangerous pattern.
+                effective = "warning"
+            findings.append(AuditFinding(effective, rule_name, message, line_no, line.strip()))
     return AuditResult(path=path, findings=tuple(findings))
 
 
@@ -158,6 +181,7 @@ def audit_skill_cached(config: Config, path: Path) -> AuditResult:
                 "message": f.message,
                 "line_no": f.line_no,
                 "line_text": f.line_text,
+                "file": f.file,
             }
             for f in result.findings
         ],
@@ -165,6 +189,72 @@ def audit_skill_cached(config: Config, path: Path) -> AuditResult:
     }
     _save_cache(config, cache)
     return result
+
+
+AUDITABLE_COMPANION_SUFFIXES = {".md", ".sh", ".py", ".yaml", ".yml", ".json", ".toml", ".bash", ".zsh"}
+MAX_AUDITED_COMPANION_FILES = 50
+
+
+def audit_skill_dir(config: Config, skill_dir: Path) -> AuditResult:
+    """Audit the WHOLE skill directory, not just SKILL.md. The link gate
+    symlinks the entire folder into the runtime, so a companion script
+    (`helper.sh`, `agents/*.yaml`, stray `.bak` text) that never got scanned
+    was a silent bypass of the A4 gate this module exists to enforce."""
+    findings: list[AuditFinding] = []
+    candidates = [skill_dir / "SKILL.md"]
+    extras = sorted(
+        p
+        for p in skill_dir.rglob("*")
+        if p.is_file() and p.name != "SKILL.md" and (p.suffix.lower() in AUDITABLE_COMPANION_SUFFIXES or ".bak" in p.name)
+    )
+    candidates.extend(extras[:MAX_AUDITED_COMPANION_FILES])
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        result = audit_skill_cached(config, candidate)
+        rel = str(candidate.relative_to(skill_dir))
+        for finding in result.findings:
+            findings.append(
+                AuditFinding(
+                    finding.severity,
+                    finding.rule_name,
+                    finding.message,
+                    finding.line_no,
+                    finding.line_text,
+                    file=rel if rel != "SKILL.md" else "",
+                )
+            )
+    return AuditResult(path=skill_dir, findings=tuple(findings))
+
+
+# --- per-engine scoping ------------------------------------------------------------
+
+
+_ENGINE_BY_AGENT_STEM = {
+    "openai": "codex",
+    "codex": "codex",
+    "claude": "claude",
+    "anthropic": "claude",
+}
+ALL_ENGINES: tuple[str, ...] = ("claude", "codex")
+
+
+def skill_engines(skill_dir: Path) -> tuple[str, ...]:
+    """Which engines a skill is scoped to. A skill dir may carry
+    `agents/<vendor>.yaml` files (e.g. `agents/openai.yaml`) declaring who it
+    is meant for; previously that intent was silently ignored. No agents/
+    dir, or no recognized vendor stems -> visible to all engines."""
+    agents_dir = skill_dir / "agents"
+    if not agents_dir.is_dir():
+        return ALL_ENGINES
+    engines: set[str] = set()
+    for candidate in agents_dir.iterdir():
+        if candidate.suffix.lower() not in {".yaml", ".yml"}:
+            continue
+        engine = _ENGINE_BY_AGENT_STEM.get(candidate.stem.lower())
+        if engine:
+            engines.add(engine)
+    return tuple(sorted(engines)) if engines else ALL_ENGINES
 
 
 # --- SKILL.md frontmatter parsing ------------------------------------------------------
@@ -222,6 +312,10 @@ def parse_skill_frontmatter(path: Path) -> SkillMeta:
         reasons.append("missing name")
     else:
         name = metadata["name"]
+        if name != path.parent.name:
+            reasons.append(
+                f"frontmatter name '{name}' does not match directory name '{path.parent.name}'"
+            )
     if not metadata.get("description"):
         reasons.append("missing description")
     else:
@@ -246,7 +340,7 @@ def collect_runtime_skill_roots(config: Config, repo: Path) -> list[Path]:
     return list(config.repo_skill_roots(repo))
 
 
-LinkAction = Literal["linked", "unchanged", "blocked", "linked_with_warning"]
+LinkAction = Literal["linked", "unchanged", "blocked", "linked_with_warning", "skipped_engine"]
 
 
 @dataclass(frozen=True)
@@ -263,6 +357,7 @@ def link_skill_root(
     src_root: Path,
     dst_root: Path,
     allowlist: frozenset[str] = frozenset(),
+    engine: str | None = None,
 ) -> list[LinkDecision]:
     decisions: list[LinkDecision] = []
     if not src_root.is_dir():
@@ -271,7 +366,21 @@ def link_skill_root(
         skill_name = skill_dir.name
         skill_md = skill_dir / "SKILL.md"
         target = dst_root / skill_name
-        audit = audit_skill_cached(config, skill_md) if skill_md.is_file() else None
+
+        if engine is not None and engine not in skill_engines(skill_dir):
+            decisions.append(
+                LinkDecision(
+                    skill_name,
+                    skill_dir,
+                    "skipped_engine",
+                    detail=f"scoped to {','.join(skill_engines(skill_dir))} via agents/*.yaml; engine is {engine}",
+                )
+            )
+            continue
+
+        # Whole-dir audit: the symlink exposes the entire folder, so every
+        # companion file is part of the gate decision, not just SKILL.md.
+        audit = audit_skill_dir(config, skill_dir) if skill_md.is_file() else None
 
         if audit is not None and audit.severity == "critical" and skill_name not in allowlist:
             decisions.append(
@@ -308,11 +417,15 @@ def link_skill_root(
 
 
 def link_all_skill_roots(
-    config: Config, repo: Path, dst_root: Path, allowlist: frozenset[str] = frozenset()
+    config: Config,
+    repo: Path,
+    dst_root: Path,
+    allowlist: frozenset[str] = frozenset(),
+    engine: str | None = None,
 ) -> list[LinkDecision]:
     decisions: list[LinkDecision] = []
     for src_root in collect_runtime_skill_roots(config, repo):
-        decisions.extend(link_skill_root(config, src_root, dst_root, allowlist=allowlist))
+        decisions.extend(link_skill_root(config, src_root, dst_root, allowlist=allowlist, engine=engine))
     return decisions
 
 
@@ -327,6 +440,7 @@ class DiscoveredSkill:
     root_kinds: tuple[str, ...]
     meta: SkillMeta
     audit: AuditResult
+    engines: tuple[str, ...] = ALL_ENGINES
 
 
 def discover_skills(config: Config, repo: Path | None = None) -> list[DiscoveredSkill]:
@@ -365,6 +479,7 @@ def discover_skills(config: Config, repo: Path | None = None) -> list[Discovered
             root_kinds=tuple(sorted(root_kinds_by_path[key])),
             meta=meta,
             audit=audit,
+            engines=skill_engines(canonical.parent),
         )
         for key, (meta, audit, canonical) in meta_by_path.items()
     ]
@@ -379,7 +494,11 @@ def command_skills_list(args) -> int:
     repo = repo_root(Path(args.repo)) if getattr(args, "repo", None) else None
     for skill in discover_skills(cfg, repo=repo):
         roots = ",".join(skill.root_kinds) or "unknown"
-        print(f"{skill.name} :: {skill.description} :: {skill.canonical_path} :: roots={roots} :: audit={skill.audit.severity}")
+        engines = ",".join(skill.engines)
+        print(
+            f"{skill.name} :: {skill.description} :: {skill.canonical_path} :: roots={roots}"
+            f" :: engines={engines} :: audit={skill.audit.severity}"
+        )
     return 0
 
 
@@ -410,6 +529,7 @@ def command_validate_skills(args) -> int:
 
 
 __all__ = [
+    "ALL_ENGINES",
     "AUDIT_RULES",
     "AuditFinding",
     "AuditResult",
@@ -419,7 +539,9 @@ __all__ = [
     "SkillMeta",
     "audit_skill",
     "audit_skill_cached",
+    "audit_skill_dir",
     "audit_skill_text",
+    "skill_engines",
     "collect_runtime_skill_roots",
     "command_skills_audit",
     "command_skills_list",

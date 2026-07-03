@@ -458,3 +458,79 @@ def test_sync_docs_for_repo_writes_correct_filename_per_engine(tmp_path):
     claude_result = launch.sync_docs_for_repo(cfg, repo, engine="claude")
     assert claude_result.path.name == "CLAUDE.md"
     assert claude_result.path.is_file()
+
+
+def test_command_launch_keeps_second_double_dash_in_passthrough(tmp_path, monkeypatch, capsys):
+    # Only the FIRST "--" is the cdx-agent/engine separator; later "--"
+    # tokens are payload for the engine binary and must survive.
+    from types import SimpleNamespace
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    args = SimpleNamespace(
+        config=None,
+        repo=str(repo),
+        full=False,
+        safe=True,
+        engine="claude",
+        passthrough=["--", "-p", "hello", "--", "world"],
+        dry_run=True,
+        secondary=False,
+        token_saver=False,
+        cancel_active=False,
+    )
+    monkeypatch.setattr(launch, "load_config", lambda _config: cfg)
+    launch.command_launch(args)
+    out = capsys.readouterr().out
+    command_line = next(line for line in out.splitlines() if line.startswith("DRY_RUN_COMMAND="))
+    tokens = command_line.removeprefix("DRY_RUN_COMMAND=").split(" ")
+    assert tokens.count("--") == 1  # exactly the payload one survives
+
+
+def test_cancel_relaunch_forwards_token_saver(tmp_path, monkeypatch):
+    # Regression: the post-cancellation launch() call used to omit
+    # token_saver (and secondary), silently stripping the TOKEN_SAVER
+    # rules from the relaunched session's working-rules doc.
+    calls = []
+    original_launch = launch.launch
+
+    def spy(cfg, repo, **kwargs):
+        calls.append(kwargs)
+        return original_launch(cfg, repo, **kwargs)
+
+    from types import SimpleNamespace
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(launch, "load_config", lambda _config: cfg)
+    monkeypatch.setattr(launch, "launch", spy)
+    # Force the conflict path: first launch returns no plan, cancel succeeds.
+    monkeypatch.setattr(
+        launch,
+        "prepare_launch",
+        lambda *a, **k: launch.PrepareResult(
+            plan=None, lock_acquired=False, lock_handle=None, diagnosis=None,
+            link_decisions=(), doc_sync=None, hook_install=None,
+        ),
+    )
+    monkeypatch.setattr(
+        launch.session,
+        "cancel_session",
+        lambda *a, **k: SimpleNamespace(action="cancelled", detail=""),
+    )
+    args = SimpleNamespace(
+        config=None,
+        repo=str(repo),
+        full=False,
+        safe=True,
+        engine="claude",
+        passthrough=[],
+        dry_run=False,
+        secondary=False,
+        token_saver=True,
+        cancel_active=True,
+    )
+    launch.command_launch(args)
+    assert len(calls) == 2
+    assert calls[0]["token_saver"] is True
+    assert calls[1]["token_saver"] is True  # was silently False before the fix

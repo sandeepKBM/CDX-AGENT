@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import re
 
-from .graph import resolve_repo_root
+from .graph import RISKY_FOLDERS, pack_staleness, resolve_repo_root
 
 
 __all__ = [
@@ -22,20 +22,9 @@ __all__ = [
 ]
 
 
-CONTEXT_RISKY_DIRS = {
-    "logs",
-    "outputs",
-    "checkpoints",
-    "ckpts",
-    "wandb",
-    "runs",
-    "data",
-    "datasets",
-    "videos",
-    "media",
-    "__pycache__",
-    ".git",
-}
+# Derived from graph.RISKY_FOLDERS (single source of truth) -- these lists
+# used to be maintained separately here and in graph.py and had drifted.
+CONTEXT_RISKY_DIRS = set(RISKY_FOLDERS) | {"__pycache__"}
 
 CONTEXT_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
 
@@ -64,7 +53,18 @@ DIFF_IGNORE_GLOBS = (
 
 
 def _read_lines(path: Path) -> list[str]:
+    if not path.is_file():
+        # Degrade to an empty summary (Bytes: 0) instead of a traceback --
+        # summarize-output is often fed a capture file that may not exist.
+        return []
     return path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+
+def _tail(lines: list[str], n: int) -> list[str]:
+    # lines[-0:] is the WHOLE list -- a --tail-lines 0 request must mean
+    # "no tail", not "dump the entire file" (the exact token blowup these
+    # summarizers exist to prevent).
+    return lines[-n:] if n > 0 else []
 
 
 def _compress_runs(lines: list[str]) -> list[str]:
@@ -214,6 +214,20 @@ def command_context_budget(args: argparse.Namespace) -> int:
     for pattern in (".git/", "logs/", "outputs/", "checkpoints/", "ckpts/", "wandb/", "runs/", "data/", "datasets/", "videos/", "media/", "__pycache__/"):
         print(f"- {pattern}")
     print()
+    graph_dir = repo / ".codex_graph"
+    if graph_dir.is_dir():
+        print("Graph artifacts (estimated tokens at ~4 bytes/token):")
+        for name in ("context_pack.md", "workspace_context_pack.md", "repo_graph.json", "config_edges.json"):
+            artifact = graph_dir / name
+            if not artifact.is_file():
+                continue
+            size = artifact.stat().st_size
+            warning = "  <- too large to read whole; query it instead" if size > 200_000 else ""
+            print(f"- {name}: {_format_bytes(size)} (~{size // 4:,} tokens){warning}")
+        stale = pack_staleness(repo)
+        if stale:
+            print(f"- {stale}")
+        print()
     print("Recommendation: run cdx-agent --graph before broad exploration.")
     return 0
 
@@ -268,7 +282,7 @@ def command_summarize_output(args: argparse.Namespace) -> int:
     print()
     print(f"Tail ({min(args.tail_lines, len(compact))} lines):")
     print("```text")
-    for line in compact[-args.tail_lines :]:
+    for line in _tail(compact, args.tail_lines):
         print(line)
     print("```")
     return 0
@@ -307,7 +321,7 @@ def command_summarize_log(args: argparse.Namespace) -> int:
     print()
     print(f"Tail ({min(args.tail_lines, len(lines))} lines):")
     print("```text")
-    for line in lines[-args.tail_lines :]:
+    for line in _tail(lines, args.tail_lines):
         print(line)
     print("```")
     return 0
@@ -372,6 +386,12 @@ def command_safe_rg(args: argparse.Namespace) -> int:
         print(line)
     if len(lines) > args.max_lines:
         print(f"[safe_rg] truncated {len(lines) - args.max_lines} additional lines; narrow the query or paths.", file=sys.stderr)
+    if result.returncode == 1:
+        # rg exits 1 for "no matches" -- that's a successful search with an
+        # empty result, not a tool failure an orchestrating agent should
+        # treat as an error. Real errors (bad pattern, unreadable path) are 2.
+        print("[safe_rg] 0 matches.")
+        return 0
     return result.returncode
 
 
