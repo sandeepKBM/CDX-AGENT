@@ -70,6 +70,16 @@ Summarize a log:
 cdx-agent --summarize-log logs/run.log
 ```
 
+Helpers (see `cdx-agent --help`, section Helpers):
+
+```bash
+cdx-agent --offload "<self-contained prompt>"            # Codex reasoning offload, pinned model, read-only, stdin closed
+cdx-agent --notify events.jsonl --routine routine.txt --then "<summary cmd>"   # one-shot wake: 0 settled, 2 anomaly, 3 logger down, 4 timeout
+cdx-agent --move-verify SRC DST                          # copy + checksum/size verify; prints the user's delete+symlink line, never deletes
+cdx-agent --gpu-lock HOLD_JOBID --n 1 -- <cmd>           # run inside a shared Slurm GPU hold with flock'd GPUs; --gpu-lock --status lists holders
+```
+`--doctor` also checks the Codex install (binary link, CLI version, configured model available).
+
 ## Project layout
 
 - `src/cdx_agent/` contains the packaged Python modules
