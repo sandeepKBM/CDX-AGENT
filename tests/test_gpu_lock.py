@@ -241,6 +241,17 @@ def test_dry_run_prints_srun_inside_hold_and_never_execs(tmp_path, monkeypatch, 
     assert opts[opts.index("--lock-dir") + 1] == gl.DEFAULT_LOCK_DIR
 
 
+def test_dry_run_specific_gpus(monkeypatch, capsys):
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("dry-run must not exec"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no ssh/squeue when --gres is given"))
+    assert gl.main(["526576", "--gpu", "3,1", "--gres", "gpu:a100:4", "--who", "t", "--dry-run", "--", "true"]) == 0
+    remote = shlex.split(shlex.split(capsys.readouterr().out.splitlines()[0])[4])
+    opts = remote[remote.index("node-run") + 1:remote.index("--")]
+    assert opts[opts.index("--gpus") + 1] == "1,3" and opts[opts.index("--n") + 1] == "2"
+    for bad in (["--gpu", "4"], ["--gpu", "1,1"], ["--gpu", "x"], ["--gpu", "1,2", "--n", "3"]):
+        assert gl.main(["526576", *bad, "--gres", "gpu:a100:4", "--who", "t", "--dry-run", "--", "true"]) == gl.EXIT_USAGE
+
+
 def test_submit_usage_errors(capsys):
     assert gl.main(["526576", "--gres", "gpu:a100:4", "--dry-run"]) == gl.EXIT_USAGE      # no CMD
     assert gl.main(["abc", "--gres", "gpu:4", "--dry-run", "--", "true"]) == gl.EXIT_USAGE  # bad job id

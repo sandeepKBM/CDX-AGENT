@@ -1,6 +1,6 @@
 """Run a command inside another session's shared Slurm GPU hold, under the node-local GPU lock protocol.
 
-    cdx-agent --gpu-lock HOLD_JOBID [--n K] [--eta MIN] [--host rlab1] [--gres gpu:a100:4] [--mem 16G]
+    cdx-agent --gpu-lock HOLD_JOBID [--n K | --gpu G[,G2]] [--eta MIN] [--host rlab1] [--gres gpu:a100:4] [--mem 16G]
                          [--time MIN] [--who NAME] [--no-snapshot] [--dry-run] -- CMD...
     cdx-agent --gpu-lock --status [--node NODE]          (NODE default $CDX_GPU_LOCK_NODE or rlab2; 'local' = here)
 
@@ -481,10 +481,10 @@ def default_who() -> str:
 
 def build_ssh_command(hold: str, host: str, gres: str, mem: str, time_min: Optional[int], n: int,
                       eta: Optional[float], who: str, lock_dir: str, python: str, cmd: Sequence[str],
-                      no_snapshot: bool = False, force_busy: bool = False, wrapper: Optional[str] = None
-                      ) -> List[str]:
+                      no_snapshot: bool = False, force_busy: bool = False, wrapper: Optional[str] = None,
+                      gpus: Optional[str] = None) -> List[str]:
     node = [python, wrapper or os.path.abspath(__file__), "node-run", "--n", str(n),
-            "--gpus", f"0-{gres_count(gres) - 1}", "--who", who, "--lock-dir", lock_dir]
+            "--gpus", gpus or f"0-{gres_count(gres) - 1}", "--who", who, "--lock-dir", lock_dir]
     if eta:
         node += ["--eta", f"{eta:g}"]
     if no_snapshot:
@@ -503,6 +503,8 @@ def submit_main(argv: Sequence[str], cmd: List[str]) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("hold", help="job id of the shared GPU hold (owned by another session; never scancel it)")
     p.add_argument("--n", type=int, default=1, help="GPUs (locks) to take (default 1)")
+    p.add_argument("--gpu", help="lock exactly these GPU indices of the hold (e.g. 2 or 1,3), all or nothing; "
+                                 "use when peers agreed on indices (default: the lowest K free)")
     p.add_argument("--eta", type=float, help="expected minutes, written into the owner file")
     p.add_argument("--host", default=DEFAULT_HOST, help="Slurm login host for ssh (default rlab1)")
     p.add_argument("--gres", help="the hold's gres, e.g. gpu:a100:4 (default: read from squeue)")
@@ -537,10 +539,24 @@ def submit_main(argv: Sequence[str], cmd: List[str]) -> int:
     if args.n < 1 or args.n > gres_count(gres):
         print(f"gpu-lock: --n {args.n} outside 1..{gres_count(gres)} ({gres})", file=sys.stderr)
         return EXIT_USAGE
+    n, gpus = args.n, None
+    if args.gpu:
+        try:
+            idx = parse_gpus(args.gpu)
+        except ValueError:
+            idx = []
+        if not idx or len(set(idx)) != len(idx) or any(g < 0 or g >= gres_count(gres) for g in idx):
+            print(f"gpu-lock: --gpu {args.gpu!r}: want distinct indices in 0..{gres_count(gres) - 1} ({gres})",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        if args.n not in (1, len(idx)):
+            print(f"gpu-lock: --gpu {args.gpu!r} names {len(idx)} GPU(s) but --n is {args.n}", file=sys.stderr)
+            return EXIT_USAGE
+        n, gpus = len(idx), ",".join(str(g) for g in sorted(idx))
     time_min = args.time or (int(max(10, round(2 * args.eta))) if args.eta else None)
-    ssh_cmd = build_ssh_command(args.hold, args.host, gres, args.mem, time_min, args.n, args.eta,
+    ssh_cmd = build_ssh_command(args.hold, args.host, gres, args.mem, time_min, n, args.eta,
                                 args.who or default_who(), args.lock_dir, args.python, cmd,
-                                no_snapshot=args.no_snapshot, force_busy=args.force_busy)
+                                no_snapshot=args.no_snapshot, force_busy=args.force_busy, gpus=gpus)
     line = " ".join(shlex.quote(x) for x in ssh_cmd)
     if args.dry_run:
         print(line)
