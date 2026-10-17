@@ -116,12 +116,12 @@ def _output(value: Any) -> Tuple[int, str, str]:
 def parse_gres(text: str) -> Dict[str, int]:
     """Parse GPU counts from ``gpu:type:N`` GRES tokens."""
     result: Dict[str, int] = {}
-    for match in re.finditer(r"(?:^|[\s,])gpu:([^:,\s()]+):(\d+)", text or ""):
+    for match in re.finditer(r"(?:^|[\s,/])gpu:([^:,\s()]+):(\d+)", text or ""):
         gpu_type, count = match.group(1), int(match.group(2))
         result[gpu_type] = result.get(gpu_type, 0) + count
     # Some squeue versions expose a type-less value as gpu:N.
     if not result:
-        match = re.search(r"(?:^|[\s,])gpu:(\d+)(?:\s|$)", text or "")
+        match = re.search(r"(?:^|[\s,/])gpu:(\d+)(?:\s|$)", text or "")
         if match:
             result["gpu"] = int(match.group(1))
     return result

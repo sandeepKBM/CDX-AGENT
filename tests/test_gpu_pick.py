@@ -146,3 +146,13 @@ def test_main_no_choice_returns_2_and_survives_scontrol_failure(monkeypatch, cap
     assert gpu_pick.main(["--gpu-type", "a4000", "--user", "u"]) == 2
     cap = capsys.readouterr()
     assert "rejected node=rlab1 reason=need 1" in cap.out and "scontrol show node failed" in cap.err
+
+
+def test_squeue_gres_prefix_counts_gpus_and_clients():
+    # squeue %b prints "gres/gpu:<type>:<n>"; the "gres/" prefix must not hide the count (it zeroed the cap and client checks).
+    from cdx_agent.gpu_pick import parse_squeue
+    s = parse_squeue("535104|tower_dv4c_c|rlab4|gres/gpu:a4000:2|RUNNING\n535076|small_lora4b|rlab4|gres/gpu:a4000:1|RUNNING\n"
+                     "9|tower_x|rlab3|gres/gpu:1|RUNNING")
+    assert s.gpu_count == 4
+    assert s.clients == {"rlab4": 4, "rlab3": 2}
+
