@@ -141,3 +141,16 @@ def test_handoff_rejects_non_git_repo(tmp_path):
                           env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src")),
                           text=True, capture_output=True, check=False, timeout=30)
     assert proc.returncode == 2
+
+
+def test_handoff_cap_trims_bulky_sections_but_keeps_notes_and_resume(repo, monkeypatch, tmp_path):
+    _stable(monkeypatch)
+    monkeypatch.setattr(handoff, "_report_lines", lambda *a, **k: [f"- report line {i} " + "r" * 60 for i in range(29)])
+    notes = tmp_path / "agent_notes.md"
+    notes.write_text("KEEP-THESE-NOTES\n")
+    text = handoff.build_handoff(str(repo), output_path=str(tmp_path / "out.md"), notes_path=str(notes),
+                                 max_tokens=500, generated="FIXED")
+    assert len(text) <= 500 * handoff.CHARS_PER_TOKEN
+    assert "KEEP-THESE-NOTES" in text and "## Resume" in text and "Read " in text
+    assert "section trimmed to fit --max-tokens 500" in text
+    assert "handoff truncated" not in text

@@ -425,6 +425,36 @@ def _cap_output(text: str, max_tokens: int) -> str:
     return kept.rsplit("\n", 1)[0] + "\n" + marker
 
 
+# Trimmed first when over budget; the header, notes and resume sections are never trimmed.
+TRIM_ORDER = ("## Reports", "## Open items", "## Slurm", "## Worktrees", "## Local GPUs", "## tmux sessions")
+
+
+def _trim_section(text: str, keep_chars: int, marker: str) -> str:
+    title = text.split("\n", 1)[0]
+    room = keep_chars - len(marker)
+    if room <= len(title) + 1:
+        return title + "\n" + marker
+    kept = text[:room].rsplit("\n", 1)[0]
+    return (kept if kept else title) + "\n" + marker
+
+
+def _cap_sections(sections: Sequence[str], max_tokens: int) -> str:
+    """Fit ``sections`` into ``max_tokens``, trimming the bulky sections (TRIM_ORDER) from their tails first,
+    so the header, the agent notes and the resume line always survive."""
+    budget = max(max_tokens, 1) * CHARS_PER_TOKEN
+    parts = list(sections)
+    marker = f"... (section trimmed to fit --max-tokens {max_tokens})\n"
+    for title in TRIM_ORDER:
+        excess = sum(map(len, parts)) - budget
+        if excess <= 0:
+            break
+        for i, part in enumerate(parts):
+            if part.startswith(title + "\n"):
+                parts[i] = _trim_section(part, max(len(part) - excess, 0), marker)
+                break
+    return _cap_output("".join(parts), max_tokens)
+
+
 def build_handoff(repo: str, base: str = "main", branches: str = "*", since_hours: float = 24.0,
                   slurm_host: Optional[str] = None, notes_path: Optional[str] = None,
                   max_tokens: int = 4000, no_slurm: bool = False, no_gpu: bool = False,
@@ -465,7 +495,7 @@ def build_handoff(repo: str, base: str = "main", branches: str = "*", since_hour
             f'Start a fresh session in {root} and say: "Read {out_path or "<out path>"} and continue from its open items."',
         ]),
     ])
-    return _cap_output("".join(sections), max_tokens)
+    return _cap_sections(sections, max_tokens)
 
 
 def build_parser() -> argparse.ArgumentParser:
