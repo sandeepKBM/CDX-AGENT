@@ -346,3 +346,21 @@ def test_output_filter_rewrites_only_bare_pytest(tmp_path, cmd, rewritten):
         assert new.startswith("set -o pipefail; (") and new.endswith("| tail -n 60") and cmd in new
     else:
         assert r.stdout.strip() == ""
+
+
+# --- pre_tool_use_policy.py poll guard: no foreground wait loops, no self-matching pgrep/pkill -f regexes ---------------------
+@pytest.mark.parametrize("cmd,background,denied", [
+    ('until ! pgrep -f "pytest.*test_v4_foundation" >/dev/null; do sleep 5; done; tail -5 x', False, True),   # self-match, looped 7 min
+    ("while ssh rlab1 squeue -j 1 -h | grep -q .; do sleep 300; done", False, True),
+    ("while ssh rlab1 squeue -j 1 -h | grep -q .; do sleep 300; done", True, False),                     # background watcher: free
+    ('pgrep -af "[p]ytest.*foo"', False, False),
+    ('pkill -f "serve.*tower"', False, True),
+    ("for f in a b; do echo $f; done", False, False),
+    ("timeout 900 python -m pytest -q tests", False, False),
+])
+def test_pre_policy_poll_guard(tmp_path, cmd, background, denied):
+    script = _script_copy(tmp_path, "pre_tool_use_policy.py")
+    r = _run_hook(script, {"tool_name": "Bash", "tool_input": {"command": cmd, "run_in_background": background}, "session_id": "s"})
+    assert r.returncode == 0
+    out = json.loads(r.stdout) if r.stdout.strip() else {}
+    assert (out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny") == denied
