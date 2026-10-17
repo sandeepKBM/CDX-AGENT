@@ -76,3 +76,36 @@ def test_load_spec_and_log_item(tmp_path):
     items = watch.load_spec(str(spec))
     assert items[0].item == "run" and items[0].summary == "report"
     assert watch.check_item(items[0])[0] == "done"
+
+
+def test_summary_failure_keeps_run_done_and_exit_zero(tmp_path):
+    class FailingSummary(Runner):
+        def __call__(self, command):
+            if list(command)[0] == "fake-offload":
+                self.calls.append(list(command))
+                return watch.CommandResult(1, "", "timed out")
+            return super().__call__(command)
+
+    runner = FailingSummary(job_active=False)
+    item = watch.parse_job("123:train", summary="summarize it", repo="/repo")
+    code = watch.watch_items([item], str(tmp_path), interval=0, offload_cmd="fake-offload",
+                             runner=runner, sleep_fn=lambda _: None)
+    assert code == 0
+    events = [json.loads(line) for line in (tmp_path / "status.jsonl").read_text().splitlines()]
+    assert events[-1]["state"] == "done" and events[-1]["detail"] == "finished; summary failed"
+    assert "summary command failed" in (tmp_path / "train.md").read_text()
+
+
+def test_offload_commands_get_the_long_timeout(monkeypatch):
+    seen = []
+
+    def fake_run(command, **kw):
+        seen.append(kw["timeout"])
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+        return R()
+
+    monkeypatch.setattr(watch.subprocess, "run", fake_run)
+    watch.run_command(["cdx-agent", "--offload", "--repo", "/r", "--timeout", "1800", "p"])
+    watch.run_command(["tmux", "has-session", "-t", "x"])
+    assert seen == [1900, 60]

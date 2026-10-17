@@ -67,8 +67,10 @@ def _slurm(command: str, host: Optional[str] = None) -> List[str]:
 
 def run_command(command: Sequence[str]) -> CommandResult:
     """Run one local or SSH command; this is the seam used by tests."""
+    # a Codex summary (--offload, its own --timeout 1800) runs for minutes: give it that budget, not the 60 s status-poll limit
+    timeout = 1900 if "--offload" in command else 60
     try:
-        result = subprocess.run(list(command), capture_output=True, text=True, timeout=60)
+        result = subprocess.run(list(command), capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return CommandResult(1, "", str(exc))
     return CommandResult(result.returncode, result.stdout or "", result.stderr or "")
@@ -275,6 +277,14 @@ def _run_summary(item: WatchItem, out_dir: Path, offload_cmd: str,
     return str(path)
 
 
+def _summary_error(item: WatchItem, out_dir: Path) -> str:
+    """The run finished; only its summary failed: note it next to the status (the run is NOT marked failed)."""
+    path = out_dir / f"{_safe_filename(item.item)}.md"
+    path.write_text("summary command failed (run finished normally); rerun: cdx-agent --offload with the spec's summary prompt\n",
+                    encoding="utf-8")
+    return str(path)
+
+
 def watch_items(items: Sequence[WatchItem], out_dir: str, *, interval: float = 120.0,
                 max_hours: float = 12.0, keep_going: bool = False,
                 offload_cmd: str = "cdx-agent", slurm_host: Optional[str] = None,
@@ -316,7 +326,8 @@ def watch_items(items: Sequence[WatchItem], out_dir: str, *, interval: float = 1
                 item.detail = "finished; running summary"
                 summary_path = _run_summary(item, out, offload_cmd, workdir, runner)
                 if summary_path is None:
-                    state, detail = "failed", "summary command failed"
+                    item.summary_path = _summary_error(item, out)
+                    detail = "finished; summary failed"
                 else:
                     item.summary_path = summary_path
             item.state = state
