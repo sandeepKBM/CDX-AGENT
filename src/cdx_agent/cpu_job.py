@@ -9,7 +9,11 @@
 - Default: ``sbatch`` (no GPU), prints ``job=<id> node=<n> log=<file>`` and returns at once (no waiting in the caller's turn).
   ``--wait``: ``srun`` in the foreground with ``--timeout`` (default 3600 s) and the command's exit status (e.g. a test suite).
 - The command runs in ``--cwd`` (default: the current directory; must be on shared storage, e.g. /common/users).
-Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments or no node.
+- Data-locality guard: Slurm nodes cannot read workstation-local disks. Before submitting, the repo's top-level symlinks (data,
+  checkpoints, ...), ``external/*`` symlinks and every path in the command are resolved; if one lands under an
+  ``--unreadable-prefix`` (default /data/local, env CDX_NODE_UNREADABLE, comma separated) the job is refused (exit 2) and the exact
+  local background command is printed (niced, OMP/MKL/OPENBLAS=2, CUDA_VISIBLE_DEVICES=, timeout). ``--allow-local-data`` overrides.
+Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments, no node, or data not readable from nodes.
 """
 from __future__ import annotations
 
@@ -18,8 +22,10 @@ import os
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional, Sequence
 
+DEFAULT_UNREADABLE = ("/data/local",)
 THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "TORCH_NUM_THREADS")
 
 
@@ -44,6 +50,78 @@ def pick_node(sinfo_text: str, prefixes: Sequence[str], need: int) -> Optional[s
     return best
 
 
+def _under(path: str, prefixes: Sequence[str]) -> Optional[str]:
+    for prefix in prefixes:
+        prefix = prefix.rstrip("/") or "/"
+        if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+            return prefix
+    return None
+
+
+def _repo_root(cwd: str) -> str:
+    cur = Path(os.path.abspath(cwd))
+    for d in (cur, *cur.parents):
+        if (d / ".git").exists():
+            return str(d)
+    return cur
+
+
+def find_unreadable(cmd: Sequence[str], cwd: str, prefixes: Sequence[str] = DEFAULT_UNREADABLE) -> list[tuple[str, str]]:
+    """Return ``[(what, resolved)]`` for everything the job would touch that resolves under a node-unreadable prefix.
+
+    Looks at the repo root's top-level symlinks, symlinks directly under ``external/``, and every word of the command that is
+    (or resolves relative to ``cwd`` to) an existing path or an absolute path.
+    """
+    prefixes = [p for p in prefixes if p]
+    if not prefixes:
+        return []
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def check(label: str, path: str) -> None:
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            return
+        if _under(real, prefixes) and label not in seen:
+            seen.add(label)
+            found.append((label, real))
+
+    root = _repo_root(cwd)
+    try:
+        for entry in sorted(os.scandir(root), key=lambda e: e.name):
+            if entry.is_symlink():
+                check(entry.name, entry.path)
+            elif entry.name == "external" and entry.is_dir():
+                for sub in sorted(os.scandir(entry.path), key=lambda e: e.name):
+                    if sub.is_symlink():
+                        check(f"external/{sub.name}", sub.path)
+    except OSError:
+        pass
+    words: list[str] = []
+    for word in cmd:       # a quoted shell string (bash -c '...') is split further so its paths are seen
+        try:
+            words.extend(shlex.split(word) if (" " in word or "\n" in word) else [word])
+        except ValueError:
+            words.append(word)
+    for word in words:
+        for cand in {word, word.split("=", 1)[-1], word.split("::", 1)[0]}:
+            if not cand or cand.startswith("-") and "/" not in cand:
+                continue
+            full = cand if os.path.isabs(cand) else os.path.join(cwd, cand)
+            if "/" in cand or os.path.lexists(full):
+                check(cand, full)
+    return found
+
+
+def local_command(cmd: Sequence[str], cwd: str, name: str = "cpujob", timeout: int = 3600, threads: int = 2) -> str:
+    """The exact command to run a CPU job on this machine in the background without hurting other users."""
+    env = " ".join(f"{v}={threads}" for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"))
+    log = os.path.join(cwd, "logs", "cpu_jobs", f"local_{name}.log")
+    return (f"mkdir -p {shlex.quote(os.path.dirname(log))} && cd {shlex.quote(cwd)} && {env} CUDA_VISIBLE_DEVICES= "
+            f"nohup nice -n 10 timeout {timeout} {shlex.join(cmd)} > {shlex.quote(log)} 2>&1 &")
+
+
 def build_script(cmd: Sequence[str], cwd: str, threads: int) -> str:
     env = " ".join(f"{v}={threads}" for v in THREAD_VARS)
     return f"cd {shlex.quote(cwd)} && export {env} PYTHONUNBUFFERED=1 && {shlex.join(cmd)}"
@@ -62,6 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--cwd", default=None)
     p.add_argument("--slurm-host", default=None)
+    p.add_argument("--unreadable-prefix", default=os.environ.get("CDX_NODE_UNREADABLE", ",".join(DEFAULT_UNREADABLE)),
+                   help="comma list of path prefixes Slurm nodes cannot read (workstation-local disks)")
+    p.add_argument("--allow-local-data", action="store_true", help="submit even if data resolves under an unreadable prefix")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
@@ -76,6 +157,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("cpu_job: no command (use: -- CMD ...)", file=sys.stderr)
         return 2
     cwd = os.path.abspath(a.cwd or os.getcwd())
+    bad = [] if a.allow_local_data else find_unreadable(cmd, cwd, [x.strip() for x in a.unreadable_prefix.split(",") if x.strip()])
+    if bad:
+        print("cpu_job: refused: Slurm nodes cannot read workstation-local data:", file=sys.stderr)
+        for label, real in bad:
+            print(f"  {label} -> {real}", file=sys.stderr)
+        print("Run it on this machine instead (background, niced, threads capped; do not wait on it):\n  "
+              + local_command(cmd, cwd, a.name, a.timeout), file=sys.stderr)
+        print("(override: --allow-local-data)", file=sys.stderr)
+        return 2
     node = a.node
     if node is None:
         q = subprocess.run(_slurm("sinfo -N -O NodeList,CPUsState -h", a.slurm_host), capture_output=True, text=True, timeout=60)
