@@ -370,3 +370,99 @@ def test_pre_policy_poll_guard(tmp_path, cmd, background, denied):
     assert r.returncode == 0
     out = json.loads(r.stdout) if r.stdout.strip() else {}
     assert (out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny") == denied
+
+
+@pytest.mark.parametrize("command,denied", [
+    ('git commit -m "fix: guard blocks tail --pid and while sleep loops"', False),
+    ('echo "until done; do sleep 5; done"', False),
+    ("bash -c 'while true; do sleep 5; done'", True),
+    ("ssh rlab1 'while squeue -j 1 -h | grep -q .; do sleep 60; done'", True),
+    ("P=1; timeout 590 tail --pid=$P -f /dev/null", True),
+])
+def test_pre_policy_poll_guard_only_matches_executed_commands(tmp_path, command, denied):
+    script = _script_copy(tmp_path, "pre_tool_use_policy.py")
+    result = _run_hook(script, _pre_payload(command))
+    assert result.returncode == 0
+    output = json.loads(result.stdout) if result.stdout.strip() else {}
+    assert (output.get("hookSpecificOutput", {}).get("permissionDecision") == "deny") == denied
+
+
+def test_pre_policy_poll_guard_background_still_allows_waits(tmp_path):
+    script = _script_copy(tmp_path, "pre_tool_use_policy.py")
+    payload = _pre_payload("while true; do sleep 5; done")
+    payload["tool_input"]["run_in_background"] = True
+    assert _run_hook(script, payload).stdout.strip() == ""
+
+
+def test_pre_policy_long_suite_guard(tmp_path):
+    script = _script_copy(tmp_path, "pre_tool_use_policy.py")
+    repo = _git_repo(tmp_path)
+    (repo / ".cdx").mkdir()
+    (repo / ".cdx" / "long_suites.txt").write_text("# slow suites\ntests/test_slow_*.py\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_slow_case.py").write_text("def test_slow(): pass\n")
+    (repo / "tests" / "test_fast.py").write_text("def test_fast(): pass\n")
+
+    base_payload = _pre_payload("pytest -q tests/test_slow_case.py")
+    base_payload["cwd"] = str(repo)
+    denied = _run_hook(script, base_payload)
+    assert json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Long test suite tests/test_slow_case.py:" in denied.stdout
+
+    all_payload = _pre_payload("pytest -q")
+    all_payload["cwd"] = str(repo)
+    assert json.loads(_run_hook(script, all_payload).stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    for command in (
+        "cdx-agent --cpu-job --wait -- pytest -q tests/test_slow_case.py",
+        "python -m cdx_agent.cpu_job -- pytest -q tests/test_slow_case.py",
+        "CDX_ALLOW_LONG_SUITE=1 pytest -q tests/test_slow_case.py",
+        "pytest -q tests/test_fast.py",
+        "ssh rlab1 pytest -q tests/test_slow_case.py",
+        "srun pytest -q tests/test_slow_case.py",
+    ):
+        payload = _pre_payload(command)
+        payload["cwd"] = str(repo)
+        assert _run_hook(script, payload).stdout.strip() == ""
+
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    empty_repo = _git_repo(other_root)
+    empty_payload = _pre_payload("pytest", session_id="other", tool_name="Bash")
+    empty_payload["cwd"] = str(empty_repo)
+    assert _run_hook(script, empty_payload).stdout.strip() == ""
+
+
+def test_pre_policy_load_advisory_is_env_driven_and_deduped(tmp_path, monkeypatch):
+    script = _script_copy(tmp_path, "pre_tool_use_policy.py")
+    monkeypatch.setenv("CDX_TEST_LOAD", "8")
+    monkeypatch.setenv("CDX_TEST_CPUS", "4")
+    payload = _pre_payload("python train.py", session_id="load-session")
+    first = _run_hook(script, payload)
+    assert "Machine overloaded (load 8 on 4 cores)" in first.stdout
+    assert _run_hook(script, payload).stdout.strip() == ""
+
+
+def test_post_review_restart_nudge_levels_and_missing_or_small_transcripts(tmp_path, monkeypatch):
+    script = _script_copy(tmp_path, "post_tool_use_review.py")
+    monkeypatch.setenv("CDX_RESTART_NUDGE_MB", "0.001")
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b"x" * 1200)
+    payload = _bash_payload(tmp_path, "true", session_id="transcript-session")
+    payload["transcript_path"] = str(transcript)
+
+    first = _run_hook(script, payload)
+    first_context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "This session's transcript is ~" in first_context
+    assert _run_hook(script, payload).stdout.strip() == ""
+
+    transcript.write_bytes(b"x" * 2200)
+    second = _run_hook(script, payload)
+    assert "This session's transcript is ~" in json.loads(second.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert _run_hook(script, payload).stdout.strip() == ""
+
+    small = tmp_path / "small-transcript.jsonl"
+    small.write_bytes(b"x" * 10)
+    small_payload = _bash_payload(tmp_path, "true", session_id="small-transcript-session")
+    small_payload["transcript_path"] = str(small)
+    assert _run_hook(script, small_payload).stdout.strip() == ""
