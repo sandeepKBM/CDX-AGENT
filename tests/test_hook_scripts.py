@@ -164,8 +164,8 @@ def test_post_review_baseline_then_silent_until_tree_changes(tmp_path):
 
     first = _run_hook(script, _bash_payload(repo, "touch something"))
     context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "session baseline" in context
-    assert "dirty.txt" in context
+    assert context.startswith("worktree baseline: 1 untracked")
+    assert "\n" not in context  # one summary line, not the full `git status`
 
     # Identical tree, same session: pure repeat, must be silent (this was the
     # every-Bash-call spam the fix removes).
@@ -176,8 +176,7 @@ def test_post_review_baseline_then_silent_until_tree_changes(tmp_path):
     (repo / "more.txt").write_text("y\n")
     third = _run_hook(script, _bash_payload(repo, "touch something"))
     context3 = json.loads(third.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "changed after shell command" in context3
-    assert "more.txt" in context3
+    assert context3.startswith("worktree changed: 2 untracked")
 
 
 def test_post_review_clean_tree_emits_nothing(tmp_path):
@@ -194,7 +193,25 @@ def test_post_review_token_hints_fire_independently_of_git(tmp_path):
     plain_dir.mkdir()
     proc = _run_hook(script, _bash_payload(plain_dir, "pytest -q tests/"))
     context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Token-saving follow-ups" in context
+    assert "Token tips" in context
+
+    # Once per session: a second noisy command in the same session is silent.
+    again = _run_hook(script, _bash_payload(plain_dir, "pytest -q tests/"))
+    assert again.returncode == 0
+    assert again.stdout.strip() == ""
+
+
+def test_post_review_summary_is_one_line_for_big_trees(tmp_path):
+    script = _script_copy(tmp_path, "post_tool_use_review.py")
+    repo = _git_repo(tmp_path)
+    reports = repo / "reports"
+    for i in range(40):
+        (reports / f"run{i}").mkdir(parents=True)
+        (reports / f"run{i}" / "r.md").write_text("x\n")
+    (repo / "top.txt").write_text("x\n")
+    proc = _run_hook(script, _bash_payload(repo, "make all"))
+    context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert context == "worktree baseline: 2 untracked (top: (root) 1, reports/ 1)"
 
 
 def test_post_review_tolerates_malformed_stdin(tmp_path):
