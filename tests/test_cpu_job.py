@@ -29,3 +29,7 @@ def test_dry_run_sbatch_and_srun(capsys, tmp_path):
     assert cpu_job.main(["--node", "ilab3", "--wait", "--timeout", "60", "--dry-run", "--cwd", str(tmp_path), "--", "echo", "hi"]) == 0
     assert capsys.readouterr().out.startswith("timeout 60 srun -w ilab3 ")
     assert cpu_job.main(["--node", "ilab3", "--dry-run"]) == 2
+
+
+def test_default_prefix_is_ilab_only():
+    assert cpu_job.build_parser().parse_args(["--", "x"]).prefix == "ilab"

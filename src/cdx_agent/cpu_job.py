@@ -1,9 +1,9 @@
-"""Run CPU-heavy work (tests, offline replays, data generation) on an idle ilab/rlab node instead of a loaded workstation.
+"""Run CPU-heavy work (tests, offline replays, data generation) on an idle ilab node instead of a loaded workstation.
 
     python -m cdx_agent.cpu_job [--node N] [--threads 8] [--mem 16G] [--time 2:00:00] [--name NAME] [--log FILE]
                                 [--wait] [--timeout S] [--cwd DIR] [--dry-run] -- CMD ...
 
-- Picks the node with the most idle CPUs (``sinfo``) among ``--prefix`` (default ilab,rlab) unless ``--node`` is given.
+- Picks the node with the most idle CPUs (``sinfo``) among ``--prefix`` (default ilab only; user rule) unless ``--node`` is given.
 - Sets OMP/OPENBLAS/MKL/NUMEXPR/TORCH thread limits to ``--threads`` (Slurm jobs here see every core of the node and rejected
   ``-c``/``--cpus-per-task``: thread counts are the caller's responsibility; ``ulimit -u`` 2000 is per user per node).
 - Default: ``sbatch`` (no GPU), prints ``job=<id> node=<n> log=<file>`` and returns at once (no waiting in the caller's turn).
@@ -52,7 +52,7 @@ def build_script(cmd: Sequence[str], cwd: str, threads: int) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m cdx_agent.cpu_job", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--node", default=None)
-    p.add_argument("--prefix", default="ilab,rlab")
+    p.add_argument("--prefix", default="ilab")   # user 2026-10-17: ilab only (rlab nodes carry the GPU jobs)
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--mem", default="16G")
     p.add_argument("--time", default="2:00:00")
