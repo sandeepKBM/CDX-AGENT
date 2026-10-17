@@ -32,6 +32,7 @@ HOOK_SCRIPTS: tuple[str, ...] = (
     "post_tool_use_review.py",
     "stop_summary.py",
     "token_risk_warn.py",
+    "agent_model_gate.py",
 )
 
 Engine = Literal["codex", "claude"]
@@ -58,7 +59,18 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
                         "statusMessage": "Checking token-risk command patterns",
                     },
                 ],
-            }
+            },
+            {   # every subagent names type / model / why; overrides of codex_tools/base/agent_policy.json ask the user
+                "matcher": "Agent|Task",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'/usr/bin/python3 "{hooks_dir / "agent_model_gate.py"}"',
+                        "timeout": 30,
+                        "statusMessage": "Checking agent model policy",
+                    }
+                ],
+            },
         ],
         "PostToolUse": [
             {

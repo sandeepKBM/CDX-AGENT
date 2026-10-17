@@ -279,3 +279,50 @@ def test_post_review_stats_rotate(tmp_path):
     assert proc.returncode == 0
     assert (script.parent / ".tool_output_stats.jsonl.1").is_file()
     assert stats.is_file()
+
+
+# --- agent_model_gate.py: every Agent launch names type / model / why; overrides ask the user -------------------------------
+def _agent_payload(prompt: str, model=None, sub=None, tool_name: str = "Agent") -> dict:
+    ti = {"prompt": prompt, "description": "t"}
+    if model is not None:
+        ti["model"] = model
+    if sub is not None:
+        ti["subagent_type"] = sub
+    return {"tool_name": tool_name, "tool_input": ti, "session_id": "s1", "cwd": "/tmp"}
+
+
+def _gate(tmp_path, monkeypatch, payload):
+    script = _script_copy(tmp_path, "agent_model_gate.py")
+    monkeypatch.setenv("AGENT_GATE_LOG", str(tmp_path / "launch.jsonl"))
+    r = _run_hook(script, payload)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout.strip()
+    return json.loads(out)["hookSpecificOutput"]["permissionDecision"] if out else None
+
+
+@pytest.mark.parametrize("prompt,model,sub,want", [
+    ("AGENT: type=run model=haiku why=launch the queue from a written recipe\nbody", "haiku", None, None),
+    ("AGENT: type=design model=opus why=trade-offs between three planner designs", "opus", None, None),
+    ("AGENT: type=run model=opus why=launch the queue from a written recipe", "opus", None, "ask"),    # override -> user
+    ("AGENT: type=debug model=sonnet why=find why task4 held all episodes", None, None, "deny"),      # model param unset
+    ("AGENT: type=debug model=sonnet why=find why task4 held all episodes", "haiku", None, "deny"),   # param != header
+    ("AGENT: type=wait model=haiku why=wait for the slurm job to finish", "haiku", None, "deny"),     # never an agent
+    ("AGENT: type=nosuch model=haiku why=something long enough here", "haiku", None, "deny"),
+    ("AGENT: type=run model=haiku why=short", "haiku", None, "deny"),
+    ("no header at all", "sonnet", None, "deny"),
+    ("anything", None, "fork", "ask"),
+])
+def test_agent_gate_decisions(tmp_path, monkeypatch, prompt, model, sub, want):
+    assert _gate(tmp_path, monkeypatch, _agent_payload(prompt, model, sub)) == want
+
+
+def test_agent_gate_ignores_other_tools_and_logs_agent_launches(tmp_path, monkeypatch):
+    assert _gate(tmp_path, monkeypatch, {"tool_name": "Bash", "tool_input": {"command": "ls"}}) is None
+    assert not (tmp_path / "launch.jsonl").exists()
+    _gate(tmp_path, monkeypatch, _agent_payload("AGENT: type=search model=haiku why=find all users of task_gate", "haiku"))
+    rec = json.loads((tmp_path / "launch.jsonl").read_text().splitlines()[-1])
+    assert rec["decision"] == "allow" and rec["type"] == "search" and rec["model"] == "haiku"
+
+
+def test_agent_gate_old_task_tool_name_is_gated(tmp_path, monkeypatch):
+    assert _gate(tmp_path, monkeypatch, _agent_payload("no header", tool_name="Task")) == "deny"

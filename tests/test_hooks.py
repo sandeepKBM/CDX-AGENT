@@ -89,7 +89,7 @@ def test_install_hooks_for_repo_end_to_end(tmp_path):
     assert result.hooks_json_path.is_file()
     payload = json.loads(result.hooks_json_path.read_text())
     assert hooks.referenced_scripts(payload) == set(hooks.HOOK_SCRIPTS)
-    assert len(result.linked_scripts) == 4
+    assert len(result.linked_scripts) == len(hooks.HOOK_SCRIPTS)
 
 
 def test_install_hooks_for_runtime_both_engines_isolated(tmp_path):
