@@ -357,6 +357,7 @@ def test_output_filter_rewrites_only_bare_pytest(tmp_path, cmd, rewritten):
     ('pkill -f "serve.*tower"', False, True),
     ("for f in a b; do echo $f; done", False, False),
     ("timeout 900 python -m pytest -q tests", False, False),
+    ("cat > w.sh <<'EOF'\nwhile alive; do sleep 300; done\nEOF\necho ok", False, False),   # writing a watcher script is not waiting
 ])
 def test_pre_policy_poll_guard(tmp_path, cmd, background, denied):
     script = _script_copy(tmp_path, "pre_tool_use_policy.py")
