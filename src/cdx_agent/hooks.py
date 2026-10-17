@@ -33,6 +33,7 @@ HOOK_SCRIPTS: tuple[str, ...] = (
     "stop_summary.py",
     "token_risk_warn.py",
     "agent_model_gate.py",
+    "output_filter.py",
 )
 
 Engine = Literal["codex", "claude"]
@@ -58,6 +59,17 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
                         "timeout": 30,
                         "statusMessage": "Checking token-risk command patterns",
                     },
+                ],
+            },
+            {   # plain pytest runs: output cut to the tail, exit status kept (CDX_RAW=1 / CDX_OUTPUT_FILTER=0 opt out)
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'/usr/bin/python3 "{hooks_dir / "output_filter.py"}"',
+                        "timeout": 30,
+                        "statusMessage": "Trimming test output",
+                    }
                 ],
             },
             {   # every subagent names type / model / why; overrides of codex_tools/base/agent_policy.json ask the user
@@ -157,7 +169,7 @@ def write_hooks_json(hooks_dir: Path, hooks_json_path: Path) -> None:
     hooks_json_path.write_text(rendered)
 
 
-def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | None = None) -> dict:
+def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | None = None, env_file: Path | None = None) -> dict:
     """Claude Code loads hooks from a settings file's top-level "hooks" key
     (confirmed empirically: `claude --settings <path>` with
     `{"hooks": {...}}` fires the configured hooks) -- unlike Codex, which
@@ -171,7 +183,43 @@ def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | No
         except (json.JSONDecodeError, OSError):
             payload = {}
     payload["hooks"] = build_hooks_payload(hooks_dir)
+    env_defaults = load_env_defaults(env_file)
+    if env_defaults:
+        payload["env"] = {**env_defaults, **(payload.get("env") or {})}       # the user's own env wins
     return payload
+
+
+def load_env_defaults(env_file: Path | None) -> dict:
+    """Shared Claude env defaults (tools_root/base/claude_env.json; keys starting with '_' are comments). None = no defaults."""
+    if env_file is None:
+        return {}
+    try:
+        data = json.loads(Path(env_file).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: str(v) for k, v in data.items() if not k.startswith("_")}
+
+
+AGENT_MARKER = "managed-by: cdx-agent"
+
+
+def install_agent_defs(src_dir: Path, dst_dir: Path) -> list[Path]:
+    """Copy shared subagent definitions (tools_root/base/claude_agents/*.md) into ~/.claude/agents. A file there that lacks the
+    managed-by marker is the user's own and is never overwritten."""
+    out: list[Path] = []
+    if not src_dir.is_dir():
+        return out
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for src in sorted(src_dir.glob("*.md")):
+        dst = dst_dir / src.name
+        text = src.read_text()
+        if dst.exists():
+            cur = dst.read_text(errors="ignore")
+            if AGENT_MARKER not in cur or cur == text:
+                continue
+        dst.write_text(text)
+        out.append(dst)
+    return out
 
 
 def claude_settings_path_for_runtime(runtime_dir: Path) -> Path:
@@ -182,8 +230,8 @@ def claude_settings_path_for_runtime(runtime_dir: Path) -> Path:
     return runtime_dir / "claude_hooks_settings.json"
 
 
-def write_claude_settings(hooks_dir: Path, base_settings_path: Path | None, output_path: Path) -> None:
-    payload = build_claude_settings_payload(hooks_dir, base_settings_path)
+def write_claude_settings(hooks_dir: Path, base_settings_path: Path | None, output_path: Path, env_file: Path | None = None) -> None:
+    payload = build_claude_settings_payload(hooks_dir, base_settings_path, env_file)
     rendered = json.dumps(payload, indent=2) + "\n"
     if output_path.exists():
         if output_path.read_text(errors="ignore") == rendered:
@@ -220,7 +268,8 @@ def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine 
     if engine == "claude":
         claude_settings_path = claude_settings_path_for_runtime(runtime_dir)
         base_settings_path = runtime_dir / "claude_settings.json"
-        write_claude_settings(hooks_dir, base_settings_path, claude_settings_path)
+        write_claude_settings(hooks_dir, base_settings_path, claude_settings_path, config.tools_root / "base" / "claude_env.json")
+        install_agent_defs(config.tools_root / "base" / "claude_agents", Path.home() / ".claude" / "agents")
     return HookInstallResult(
         hooks_dir=hooks_dir,
         hooks_json_path=hooks_json_path,

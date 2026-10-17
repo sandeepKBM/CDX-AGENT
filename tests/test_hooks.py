@@ -205,3 +205,26 @@ def test_write_claude_settings_unchanged_content_no_bak(tmp_path):
     hooks.write_claude_settings(tmp_path / "hooks", None, output)
     hooks.write_claude_settings(tmp_path / "hooks", None, output)
     assert list(tmp_path.glob("claude_hooks_settings.json.bak.*")) == []
+
+
+def test_claude_settings_env_defaults_user_env_wins(tmp_path):
+    env_file = tmp_path / "claude_env.json"
+    env_file.write_text(json.dumps({"_comment": "x", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet", "A": "1"}))
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps({"env": {"A": "user"}}))
+    payload = hooks.build_claude_settings_payload(tmp_path / "hooks", base, env_file)
+    assert payload["env"] == {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet", "A": "user"}
+    assert "env" not in hooks.build_claude_settings_payload(tmp_path / "hooks", None, None)
+
+
+def test_install_agent_defs_never_overwrites_user_files(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir(); dst.mkdir()
+    (src / "Explore.md").write_text("---\nmodel: haiku\n# managed-by: cdx-agent\n---\nv2\n")
+    (src / "mine.md").write_text("---\n# managed-by: cdx-agent\n---\nours\n")
+    (dst / "mine.md").write_text("user's own agent\n")
+    (dst / "Explore.md").write_text("---\n# managed-by: cdx-agent\n---\nv1\n")
+    out = hooks.install_agent_defs(src, dst)
+    assert [p.name for p in out] == ["Explore.md"]
+    assert (dst / "Explore.md").read_text().endswith("v2\n") and (dst / "mine.md").read_text() == "user's own agent\n"
+    assert hooks.install_agent_defs(src, dst) == []

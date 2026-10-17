@@ -326,3 +326,23 @@ def test_agent_gate_ignores_other_tools_and_logs_agent_launches(tmp_path, monkey
 
 def test_agent_gate_old_task_tool_name_is_gated(tmp_path, monkeypatch):
     assert _gate(tmp_path, monkeypatch, _agent_payload("no header", tool_name="Task")) == "deny"
+
+
+# --- output_filter.py: bare pytest runs are cut to the tail, everything else untouched --------------------------------------
+@pytest.mark.parametrize("cmd,rewritten", [
+    ("pytest -q tests/x.py", True),
+    ("PYTHONPATH=src timeout 600 /x/bin/python -m pytest -q tests", True),
+    ("pytest tests | tail -3", False),
+    ("cd a && pytest", False),
+    ("CDX_RAW=1 pytest -q", False),
+    ("ls -la", False),
+])
+def test_output_filter_rewrites_only_bare_pytest(tmp_path, cmd, rewritten):
+    script = _script_copy(tmp_path, "output_filter.py")
+    r = _run_hook(script, {"tool_name": "Bash", "tool_input": {"command": cmd}})
+    assert r.returncode == 0
+    if rewritten:
+        new = json.loads(r.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert new.startswith("set -o pipefail; (") and new.endswith("| tail -n 60") and cmd in new
+    else:
+        assert r.stdout.strip() == ""
