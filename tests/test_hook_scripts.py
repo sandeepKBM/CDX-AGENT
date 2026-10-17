@@ -358,6 +358,11 @@ def test_output_filter_rewrites_only_bare_pytest(tmp_path, cmd, rewritten):
     ("for f in a b; do echo $f; done", False, False),
     ("timeout 900 python -m pytest -q tests", False, False),
     ("cat > w.sh <<'EOF'\nwhile alive; do sleep 300; done\nEOF\necho ok", False, False),   # writing a watcher script is not waiting
+    ("P=1; timeout 590 tail --pid=$P -f /dev/null; cat x", False, True),   # 2026-10-17: an agent waited on its own bg pytest this way
+    ("wait $pid", False, True),
+    ("echo hi; wait 123", False, True),
+    ('git commit -m "guard: tail on pid / wait on another process"', False, False),   # prose is not a wait
+    ("tail -n 5 log", False, False),
 ])
 def test_pre_policy_poll_guard(tmp_path, cmd, background, denied):
     script = _script_copy(tmp_path, "pre_tool_use_policy.py")
