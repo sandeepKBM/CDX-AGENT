@@ -219,3 +219,63 @@ def test_post_review_tolerates_malformed_stdin(tmp_path):
     proc = _run_hook(script, "not json at all")
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+# --- pre_tool_use_policy.py and token_risk_warn.py ----------------------------------
+
+
+def _pre_payload(command: str, session_id: str = "sess-1", tool_name: str = "Bash") -> dict:
+    return {"tool_name": tool_name, "tool_input": {"command": command}, "session_id": session_id}
+
+
+def test_advisory_hooks_dedupe_messages_but_not_permission_decisions(tmp_path):
+    pre = _script_copy(tmp_path, "pre_tool_use_policy.py")
+    first = _run_hook(pre, _pre_payload("find .", session_id="a"))
+    assert "Token risk:" in json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert _run_hook(pre, _pre_payload("find .", session_id="a")).stdout.strip() == ""
+    assert _run_hook(pre, _pre_payload("find .", session_id="b")).stdout.strip() != ""
+
+    deny = _pre_payload("rm -rf ./build", session_id="a")
+    first_deny = json.loads(_run_hook(pre, deny).stdout)
+    second_deny = json.loads(_run_hook(pre, deny).stdout)
+    assert first_deny["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert second_deny["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    risk = _script_copy(tmp_path, "token_risk_warn.py")
+    assert _run_hook(risk, _pre_payload("ls -R .", session_id="a")).stdout.strip() != ""
+    assert _run_hook(risk, _pre_payload("ls -R .", session_id="a")).stdout.strip() == ""
+
+
+def test_advisory_state_corruption_is_tolerated(tmp_path):
+    script = _script_copy(tmp_path, "token_risk_warn.py")
+    (script.parent / ".risk_advisory_state.json").write_text("not json")
+    proc = _run_hook(script, _pre_payload("find ."))
+    assert proc.returncode == 0 and proc.stdout.strip()
+
+
+def test_post_review_large_output_stats_and_dedupe(tmp_path):
+    script = _script_copy(tmp_path, "post_tool_use_review.py")
+    response = {"stdout": "o" * 5000, "stderr": "e" * 4001}
+    payload = _bash_payload(tmp_path, "echo secret-command-text", output="")
+    payload["tool_response"] = response
+    first = _run_hook(script, payload)
+    context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Large output (9 KB)" in context
+    assert "secret-command-text" not in (tmp_path / "hooks" / ".tool_output_stats.jsonl").read_text()
+    second = _run_hook(script, payload)
+    assert "Large output" not in second.stdout
+    stats = (tmp_path / "hooks" / ".tool_output_stats.jsonl").read_text().splitlines()
+    assert len(stats) == 2
+    records = [json.loads(line) for line in stats]
+    assert all(record["tool"] == "Bash" and record["chars"] == 9001 for record in records)
+    assert all(set(record) == {"t", "session", "tool", "chars"} for record in records)
+
+
+def test_post_review_stats_rotate(tmp_path):
+    script = _script_copy(tmp_path, "post_tool_use_review.py")
+    stats = script.parent / ".tool_output_stats.jsonl"
+    stats.write_text("x" * (5 * 1024 * 1024 + 1))
+    proc = _run_hook(script, _bash_payload(tmp_path, "true"))
+    assert proc.returncode == 0
+    assert (script.parent / ".tool_output_stats.jsonl.1").is_file()
+    assert stats.is_file()

@@ -77,6 +77,8 @@ cdx-agent --offload "<self-contained prompt>"            # Codex reasoning offlo
 cdx-agent --notify events.jsonl --routine routine.txt --then "<summary cmd>"   # one-shot wake: 0 settled, 2 anomaly, 3 logger down, 4 timeout
 cdx-agent --move-verify SRC DST                          # copy + checksum/size verify; prints the user's delete+symlink line, never deletes
 cdx-agent --gpu-lock HOLD_JOBID --n 1 -- <cmd>           # run inside a shared Slurm GPU hold with flock'd GPUs; --gpu-lock --status lists holders
+cdx-agent --brief <WORKTREE|BRANCH> [--base B]            # deterministic <=3k-token brief to seed a fresh subagent/Codex worker (no forks)
+cdx-agent --handoff [--notes NOTES.md]                   # machine-written restart file for a long main session (docs/status/<date>_handoff_auto.md)
 ```
 `--doctor` also checks the Codex install (binary link, CLI version, configured model available).
 
