@@ -24,7 +24,7 @@ def test_parse_gres_and_sinfo_skips_nothing_until_selection():
 
 def test_parse_squeue_counts_active_gpus_and_clients():
     stats = gpu_pick.parse_squeue(SQUEUE, client_jobs="tower_", slots_per_gpu=2)
-    assert stats.gpu_count == 5
+    assert stats.gpu_count == 2 and stats.pending_gpus == 3 and stats.held_gpus == 0     # the cap counts running jobs only
     assert stats.clients == {"rlab1": 4}
 
 
@@ -38,7 +38,7 @@ def test_choice_prefers_most_free_then_client_limit_and_type_filter():
 
 
 def test_cap_client_limit_and_drain_are_explained():
-    cap = gpu_pick.evaluate(SINFO, SQUEUE, ["a4000"], n=1, cap=5)
+    cap = gpu_pick.evaluate(SINFO, SQUEUE, ["a4000"], n=1, cap=2)   # 2 running + 1 > 2 (pending not counted)
     assert cap.choice is None
     assert any("GPU cap" in reason for _, reason in cap.reasons)
     limited = gpu_pick.evaluate(SINFO, SQUEUE, ["a4000"], n=1, cap=12,
@@ -156,3 +156,89 @@ def test_squeue_gres_prefix_counts_gpus_and_clients():
     assert s.gpu_count == 4
     assert s.clients == {"rlab4": 4, "rlab3": 2}
 
+
+
+def test_cap_counts_running_only_held_and_pending_reported():
+    # 2026-10-21: 23 held/pending 1-GPU jobs made every node "user GPU cap 24+3>12" although only 2 GPUs ran.
+    squeue = "".join(f"{i}|t5x_{i}||gres/gpu:1|PENDING|JobHeldUser\n" for i in range(17))
+    squeue += "".join(f"{i}|s0_{i}||gres/gpu:1|PENDING|Priority\n" for i in range(100, 106))
+    squeue += "532911|cap_coder|rlab2|gres/gpu:a100:2|RUNNING|None\n"
+    stats = gpu_pick.parse_squeue(squeue)
+    assert (stats.gpu_count, stats.pending_gpus, stats.held_gpus) == (2, 6, 17)
+    ev = gpu_pick.evaluate("rlab3 gpu:a4000:8 gpu:a4000:1 alloc\n", squeue, ["a4000"], n=1)
+    assert ev.choice is not None and ev.choice.node == "rlab3"
+    assert not gpu_pick.evaluate("rlab3 gpu:a4000:8 gpu:a4000:1 alloc\n", squeue, ["a4000"], n=11).choice   # 2+11 > 12
+
+
+SCONTROL_CPU = """\
+NodeName=rlab3 CPUAlloc=96 CPUEfctv=96 CPUTot=96 RealMemory=1027551 AllocMem=165888 State=ALLOCATED
+NodeName=rlab4 CPUAlloc=50 CPUEfctv=96 CPUTot=96 RealMemory=256000 AllocMem=256000 State=MIXED
+NodeName=ilab1 CPUAlloc=60 CPUTot=64 RealMemory=786432 AllocMem=131072 State=MIXED
+"""
+SINFO_CPU = "rlab3 gpu:a4000:8 gpu:a4000:1 alloc\nrlab4 gpu:a4000:8 gpu:a4000:6 mix\nilab1 gpu:a4500:8 gpu:a4500:0 mix\n"
+
+
+def test_cpu_check_rejects_nodes_with_all_cpus_allocated():
+    info = gpu_pick.parse_scontrol(SCONTROL_CPU)
+    assert info["rlab3"].free_cpus == 0 and info["rlab4"].free_cpus == 46 and info["ilab1"].free_cpus == 4  # CPUTot fallback
+    ev = gpu_pick.evaluate(SINFO_CPU, "", ["a4000", "a4500"], scontrol_text=SCONTROL_CPU, mem_mb=48 * 1024)
+    r = dict(ev.reasons)
+    assert "free CPUs 0 < 1 (CPUAlloc 96 of 96)" in r["rlab3"]
+    assert "free memory 0G" in r["rlab4"]
+    assert ev.choice.node == "ilab1"
+    assert gpu_pick.evaluate(SINFO_CPU, "", ["a4500"], scontrol_text=SCONTROL_CPU, cpus=8).choice is None
+    assert gpu_pick.evaluate(SINFO_CPU, "", ["a4000"], scontrol_text=SCONTROL_CPU, cpus=0, mem_mb=None).choice.node == "rlab3"
+
+
+def test_status_rows_say_why_free_gpus_cannot_start():
+    rows = {r["node"]: r for r in gpu_pick.status_rows(SINFO_CPU, SCONTROL_CPU, mem_mb=48 * 1024)}
+    assert rows["rlab3"]["free"] == 7 and rows["rlab3"]["start"] == "CPUs full (96/96)"
+    assert rows["rlab4"]["start"].startswith("mem 0G free")
+    assert rows["ilab1"]["start"] == "yes" and rows["ilab1"]["cpu_free"] == 4 and rows["ilab1"]["mem_total_g"] == 768
+
+
+WS = """0, GPU-a, NVIDIA GeForce RTX 2080 Ti, 1476, 11264, 0
+1, GPU-b, NVIDIA GeForce RTX 2080 Ti, 5342, 11264, 4
+2, GPU-c, NVIDIA GeForce RTX 2080 Ti, 3, 11264, 0
+---
+GPU-a,3030503,1472,ss5772
+GPU-b,2184688,5334,jhd79
+GPU-b,2184689,8,jhd79
+"""
+
+
+def test_parse_workstation_owners_per_gpu():
+    g = gpu_pick.parse_workstation(WS)
+    assert [x["index"] for x in g] == [0, 1, 2]
+    assert g[0]["owners"] == {"ss5772": 1472} and g[1]["owners"] == {"jhd79": 5342} and g[2]["owners"] == {}
+    assert g[1]["used_mib"] == 5342 and g[1]["total_mib"] == 11264 and g[1]["util"] == 4
+
+
+def test_main_status_prints_inventory_cap_line_and_workstations(monkeypatch, capsys):
+    def fake(command):
+        text = command[-1]
+        if "sinfo" in text:
+            return (0, SINFO_CPU, "")
+        if "scontrol" in text:
+            return (0, SCONTROL_CPU, "")
+        if "-t RUNNING" in text:
+            return (0, "", "")
+        if "nvidia-smi" in text:
+            return (0, WS, "") if "westeros" in command else (255, "", "ssh: connect to host arrakis: timed out")
+        return (0, "1|x||gres/gpu:1|PENDING|JobHeldUser\n2|y|rlab2|gres/gpu:a100:2|RUNNING|None\n", "")
+
+    monkeypatch.setattr(gpu_pick, "run_command", fake)
+    monkeypatch.setattr("socket.gethostname", lambda: "elsewhere")
+    assert gpu_pick.main(["--status", "--user", "ss5772", "--mem", "48G"]) == 0
+    out = capsys.readouterr().out
+    assert "rlab3\ta4000:8\t7/8\t0/96\t" in out and "CPUs full (96/96)" in out
+    assert "total: 24 GPUs, 17 free, 8 startable (on 1 nodes)" in out
+    assert "ss5772: running 2/12 GPUs (cap), pending 0, held 1" in out
+    assert "# westeros" in out and "jhd79 5342" in out and "free" in out
+    assert "# arrakis: unreachable" in out and "timed out" in out
+
+
+def test_main_requires_gpu_type_unless_status():
+    import pytest
+    with pytest.raises(SystemExit):
+        gpu_pick.main(["--user", "u"])

@@ -3,19 +3,21 @@
     python -m cdx_agent.gpu_pick --gpu-type a4000[,4500_ada,...] [--n 1]
         [--prefix rlab,ilab] [--user USER] [--cap 12] [--per-node-clients 4]
         [--shared-clients 2] [--client-jobs REGEX] [--slots-per-gpu 2]
-        [--mem 60G] [--min-disk-gb 50] [--explain]
+        [--mem 60G] [--cpus 1] [--min-disk-gb 50] [--explain]
+    python -m cdx_agent.gpu_pick --status [--prefix rlab,ilab] [--mem 60G] [--workstations westeros,arrakis]
 
 The selector reads ``sinfo``, ``scontrol show node``, the user's active ``squeue``
 jobs and the running jobs of all users over ``ssh -o BatchMode=yes -o
 ConnectTimeout=10`` to ``$CDX_SLURM_HOST`` or ``rlab1``.  A node is picked only if a
-job can really start there: enough free GPUs and free memory (``RealMemory - AllocMem
->= --mem``), a state that is not PLANNED/DRAIN/DOWN/RESERVED/MAINT, room under the
+job can really start there: enough free GPUs, free memory (``RealMemory - AllocMem
+>= --mem``) and free CPUs (``CPUEfctv|CPUTot - CPUAlloc >= --cpus``), a state that is not PLANNED/DRAIN/DOWN/RESERVED/MAINT, room under the
 per-node client limit (our running ``--client-jobs`` GPUs x ``--slots-per-gpu`` plus
 the new job; ``--per-node-clients`` when we are alone on the node, ``--shared-clients``
 when other users run jobs there) and ``--min-disk-gb`` free in /freespace/local (``ssh
 <node> df -P``; unreachable = warning, not a rejection).  Output: the chosen node with
 the full ``sbatch`` options (including ``--mem``) first, then one ``rejected node=..
-reason=..`` line per rejected node.
+reason=..`` line per rejected node.  The account cap (``--cap``) counts RUNNING jobs only;
+pending and held GPUs are reported on stderr.  ``--status`` prints the inventory instead (see --help).
 """
 from __future__ import annotations
 
@@ -49,12 +51,20 @@ class NodeInfo:
     real_mb: Optional[int]
     alloc_mb: Optional[int]
     state: str
+    cpu_total: Optional[int] = None         # CPUEfctv (usable CPUs) when present, else CPUTot
+    cpu_alloc: Optional[int] = None
 
     @property
     def free_mb(self) -> Optional[int]:
         if self.real_mb is None or self.alloc_mb is None:
             return None
         return self.real_mb - self.alloc_mb
+
+    @property
+    def free_cpus(self) -> Optional[int]:
+        if self.cpu_total is None or self.cpu_alloc is None:
+            return None
+        return self.cpu_total - self.cpu_alloc
 
 
 @dataclass
@@ -64,17 +74,24 @@ class QueueJob:
     node: str
     gres: str
     state: str
+    reason: str = ""
 
     @property
     def gpus(self) -> int:
         return gpu_count(self.gres)
 
+    @property
+    def held(self) -> bool:
+        return "held" in self.reason.lower()
+
 
 @dataclass
 class QueueStats:
-    gpu_count: int
+    gpu_count: int                  # GPUs of RUNNING jobs: what the account's GrpTRES cap counts
     clients: Dict[str, int]
     jobs: List[QueueJob]
+    pending_gpus: int = 0           # waiting jobs (not held): they take cap room only once they start
+    held_gpus: int = 0              # held jobs (squeue reason JobHeld*)
 
 
 @dataclass
@@ -190,7 +207,8 @@ def parse_scontrol(text: str) -> Dict[str, NodeInfo]:
         def num(key: str) -> Optional[int]:
             return int(fields[key]) if fields.get(key, "").isdigit() else None
 
-        nodes[name] = NodeInfo(name, num("RealMemory"), num("AllocMem"), fields.get("State", ""))
+        cpu_total = num("CPUEfctv") if num("CPUEfctv") is not None else num("CPUTot")
+        nodes[name] = NodeInfo(name, num("RealMemory"), num("AllocMem"), fields.get("State", ""), cpu_total, num("CPUAlloc"))
     return nodes
 
 
@@ -226,18 +244,28 @@ def probe_disk(node: str, path: str = "/freespace/local") -> Optional[float]:
 
 
 def parse_squeue(text: str, client_jobs: str = "tower_|isaac", slots_per_gpu: int = 2) -> QueueStats:
-    """Parse ``%i|%j|%N|%b|%T`` rows and sum active GPU/client load."""
+    """Parse ``%i|%j|%N|%b|%T[|%r]`` rows: GPUs of running jobs (the cap), of pending and of held jobs, and client load.
+
+    Only RUNNING jobs count toward the cap: Slurm's GrpTRES limit holds a pending job back by itself (reason
+    QOSGrpGRES), and counting held/pending jobs rejected every node while 23 jobs waited (2026-10-21)."""
     jobs: List[QueueJob] = []
-    total = 0
+    total = pending = held = 0
     clients: Dict[str, int] = {}
     matcher = re.compile(client_jobs) if client_jobs else None
     for line in text.splitlines():
-        fields = line.rstrip("\n").split("|", 4)
-        if len(fields) != 5 or fields[0].lower() in {"jobid", "%i"}:
+        fields = line.rstrip("\n").split("|", 5)
+        if len(fields) not in (5, 6) or fields[0].lower() in {"jobid", "%i"}:
             continue
         job = QueueJob(*fields)
         state = job.state.upper().split("+", 1)[0]
         if state not in {"RUNNING", "PENDING"}:
+            continue
+        if state == "PENDING":
+            if job.held:
+                held += job.gpus
+            else:
+                pending += job.gpus
+            jobs.append(job)
             continue
         total += job.gpus
         if matcher is not None and matcher.search(job.name):
@@ -246,7 +274,7 @@ def parse_squeue(text: str, client_jobs: str = "tower_|isaac", slots_per_gpu: in
                 if node and node not in {"N/A", "(null)", "(none)", "-"}:
                     clients[node] = clients.get(node, 0) + job.gpus * slots_per_gpu
         jobs.append(job)
-    return QueueStats(total, clients, jobs)
+    return QueueStats(total, clients, jobs, pending, held)
 
 
 BLOCKED_STATES = ("drain", "drng", "down", "maint", "planned", "plnd", "reserved", "resv", "fail", "inval")
@@ -262,10 +290,12 @@ def evaluate(sinfo_text: str, squeue_text: str, gpu_types: Sequence[str], *, n: 
              per_node_clients: int = 4, client_jobs: str = "tower_|isaac",
              slots_per_gpu: int = 2, scontrol_text: Optional[str] = None, mem_mb: Optional[int] = None,
              other_user_nodes: Optional[Set[str]] = None, shared_clients: int = 2,
-             min_disk_gb: float = 0, disk_probe: Optional[Callable[[str], Optional[float]]] = None) -> Evaluation:
+             min_disk_gb: float = 0, disk_probe: Optional[Callable[[str], Optional[float]]] = None,
+             cpus: int = 1) -> Evaluation:
     """Evaluate all nodes and return the best eligible choice plus reasons.
 
-    ``scontrol_text``/``mem_mb`` enable the free-memory and full-state checks, ``other_user_nodes`` the shared-node client
+    ``scontrol_text``/``mem_mb`` enable the free-memory and full-state checks (``scontrol_text`` also the free-CPU check against
+    ``cpus``: free GPUs on a node whose CPUs are all allocated cannot start a job), ``other_user_nodes`` the shared-node client
     limit, ``disk_probe``/``min_disk_gb`` the node-local disk check (run last, only on nodes that passed everything else).
     """
     wanted = [gpu_type.strip() for gpu_type in gpu_types if gpu_type.strip()]
@@ -316,6 +346,14 @@ def evaluate(sinfo_text: str, squeue_text: str, gpu_types: Sequence[str], *, n: 
                 reasons.append((node.name, f"free memory {free_mb // 1024}G < requested {mem_mb // 1024}G "
                                            f"(RealMemory {node_info.real_mb} - AllocMem {node_info.alloc_mb} MB)"))
                 continue
+        if info and cpus > 0:
+            node_info = info.get(node.name)
+            free_cpus = node_info.free_cpus if node_info else None
+            if free_cpus is None:
+                warnings.append(f"node={node.name} CPUs unknown (scontrol), not checked")
+            elif free_cpus < cpus:
+                reasons.append((node.name, f"free CPUs {free_cpus} < {cpus} (CPUAlloc {node_info.cpu_alloc} of {node_info.cpu_total})"))
+                continue
         needed_clients = n * slots_per_gpu
         limit = shared_clients if node.name in others else per_node_clients
         if node_clients + needed_clients > limit:
@@ -343,13 +381,114 @@ def choose_node(sinfo_text: str, squeue_text: str, gpu_types: Sequence[str], **k
     return evaluate(sinfo_text, squeue_text, gpu_types, **kwargs).choice
 
 
+def status_rows(sinfo_text: str, scontrol_text: Optional[str], *, prefixes: Sequence[str] = ("rlab", "ilab"),
+                mem_mb: int = 60 * 1024, cpus: int = 1) -> List[Dict[str, Any]]:
+    """One row per node: GPUs total/used/free, CPUs and memory free/total, and whether a 1-GPU job with ``mem_mb`` /
+    ``cpus`` can start there now (``start`` = "yes" or the first blocking reason)."""
+    info = parse_scontrol(scontrol_text) if scontrol_text else {}
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for node in parse_sinfo(sinfo_text):
+        if node.name in seen or (prefixes and not any(node.name.startswith(p) for p in prefixes)):
+            continue
+        seen.add(node.name)
+        ni = info.get(node.name)
+        total, used = sum(node.gres.values()), sum(min(node.gres_used.get(t, 0), c) for t, c in node.gres.items())
+        state = ni.state if ni and ni.state else node.state
+        why = []
+        if _state_blocked(state):
+            why.append(f"state {state}")
+        if total - used < 1:
+            why.append("no free GPU")
+        if ni and ni.free_cpus is not None and ni.free_cpus < cpus:
+            why.append(f"CPUs full ({ni.cpu_alloc}/{ni.cpu_total})")
+        if ni and ni.free_mb is not None and ni.free_mb < mem_mb:
+            why.append(f"mem {ni.free_mb // 1024}G free < {mem_mb // 1024}G")
+        rows.append(dict(node=node.name, types=",".join(f"{t}:{c}" for t, c in node.gres.items()) or "-", total=total, used=used,
+                         free=total - used, cpu_free=ni.free_cpus if ni else None, cpu_total=ni.cpu_total if ni else None,
+                         mem_free_g=(ni.free_mb // 1024) if ni and ni.free_mb is not None else None,
+                         mem_total_g=(ni.real_mb // 1024) if ni and ni.real_mb is not None else None,
+                         state=state, start="yes" if not why else "; ".join(why)))
+    return rows
+
+
+WORKSTATION_PROBE = (
+    "nvidia-smi --query-gpu=index,uuid,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits; echo ---; "
+    "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits | tr -d ' ' | "
+    "while IFS=, read -r u p m; do echo \"$u,$p,$m,$(ps -o user= -p \"$p\" | tr -d ' ')\"; done"
+)
+
+
+def parse_workstation(text: str) -> List[Dict[str, Any]]:
+    """WORKSTATION_PROBE output -> one row per GPU: index, name, MiB used/total, util %, process owners (user -> MiB)."""
+    gpu_part, _, app_part = text.partition("---")
+    gpus: List[Dict[str, Any]] = []
+    by_uuid: Dict[str, Dict[str, Any]] = {}
+    for line in gpu_part.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 6 or not f[0].isdigit():
+            continue
+        g = dict(index=int(f[0]), name=f[2], used_mib=int(float(f[3])), total_mib=int(float(f[4])),
+                 util=int(float(f[5])) if f[5].replace(".", "").isdigit() else None, owners={})
+        gpus.append(g)
+        by_uuid[f[1]] = g
+    for line in app_part.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 4 or f[0] not in by_uuid:
+            continue
+        owner = f[3] or "?"
+        mib = int(float(f[2])) if f[2].replace(".", "").isdigit() else 0
+        by_uuid[f[0]]["owners"][owner] = by_uuid[f[0]]["owners"].get(owner, 0) + mib
+    return gpus
+
+
+def probe_workstation(host: str) -> Tuple[int, str, str]:
+    """Run WORKSTATION_PROBE locally when ``host`` is this machine, else over ssh (BatchMode, 10 s connect)."""
+    import socket
+    local = host.split(".")[0] == socket.gethostname().split(".")[0]
+    cmd = ["bash", "-c", WORKSTATION_PROBE] if local else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, WORKSTATION_PROBE]
+    return _output(run_command(cmd))
+
+
+def print_status(sinfo_text: str, scontrol_text: Optional[str], queue: QueueStats, *, cap: int, user: str,
+                 prefixes: Sequence[str], mem_mb: int, cpus: int, workstations: Sequence[str],
+                 probe: Callable[[str], Tuple[int, str, str]] = probe_workstation) -> None:
+    rows = status_rows(sinfo_text, scontrol_text, prefixes=prefixes, mem_mb=mem_mb, cpus=cpus)
+    print(f"# Slurm ({','.join(prefixes) or 'all'}): can a 1-GPU job with --mem {mem_mb // 1024}G and {cpus} CPU start now?")
+    print("node\tgpu types\tgpus free/total\tcpus free/total\tmem free/total G\tstate\tstart")
+    for r in rows:
+        cpu = f"{r['cpu_free']}/{r['cpu_total']}" if r["cpu_free"] is not None else "?"
+        mem = f"{r['mem_free_g']}/{r['mem_total_g']}" if r["mem_free_g"] is not None else "?"
+        print(f"{r['node']}\t{r['types']}\t{r['free']}/{r['total']}\t{cpu}\t{mem}\t{r['state']}\t{r['start']}")
+    tot, free = sum(r["total"] for r in rows), sum(r["free"] for r in rows)
+    print(f"total: {tot} GPUs, {free} free, {sum(r['free'] for r in rows if r['start'] == 'yes')} startable "
+          f"(on {sum(r['start'] == 'yes' for r in rows)} nodes)")
+    print(f"{user or 'user'}: running {queue.gpu_count}/{cap} GPUs (cap), pending {queue.pending_gpus}, held {queue.held_gpus}")
+    for host in workstations:
+        rc, out, err = probe(host)
+        gpus = parse_workstation(out) if rc == 0 else []
+        if not gpus:
+            print(f"# {host}: unreachable or no nvidia-smi ({(err or 'no output').strip().splitlines()[-1][:120] if (err or '').strip() else 'no output'})")
+            continue
+        print(f"# {host} (not Slurm; check owners before use)")
+        print("gpu\tname\tmem used/total MiB\tutil %\towners (MiB)")
+        for g in gpus:
+            owners = ", ".join(f"{u} {m}" for u, m in sorted(g["owners"].items())) or "free"
+            print(f"{g['index']}\t{g['name']}\t{g['used_mib']}/{g['total_mib']}\t{g['util']}\t{owners}")
+
+
 def _parser_prefixes(value: str) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m cdx_agent.gpu_pick", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--gpu-type", required=True, metavar="TYPE[,TYPE...]")
+    p.add_argument("--gpu-type", default=None, metavar="TYPE[,TYPE...]", help="required unless --status")
+    p.add_argument("--status", action="store_true",
+                   help="inventory instead of a pick: per node GPUs / CPUs / memory free and whether a job can start, our "
+                        "running/pending/held GPUs, and the --workstations' nvidia-smi with process owners")
+    p.add_argument("--workstations", default="westeros,arrakis", help="--status: non-Slurm GPU hosts to probe ('' = none)")
+    p.add_argument("--cpus", type=int, default=1, help="CPUs the job needs free on the node (0 = skip the CPU check)")
     p.add_argument("--n", type=int, default=1)
     p.add_argument("--prefix", default="rlab,ilab")
     p.add_argument("--user", default=os.environ.get("USER", ""))
@@ -367,14 +506,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.status and not args.gpu_type:
+        parser.error("--gpu-type is required (or pass --status)")
     if args.n < 1 or args.cap < 0 or args.per_node_clients < 0 or args.shared_clients < 0 or args.slots_per_gpu < 0:
         print("gpu_pick: counts must be non-negative and --n must be positive", file=sys.stderr)
         return 2
     try:
         mem_mb = parse_mem_mb(args.mem)
         sinfo = _output(run_command(_slurm("sinfo -N -O NodeList:30,Gres:60,GresUsed:80,StateCompact:12 -h", args.slurm_host)))
-        squeue_command = f'squeue -u {shlex.quote(args.user)} -h -o "%i|%j|%N|%b|%T"'
+        squeue_command = f'squeue -u {shlex.quote(args.user)} -h -o "%i|%j|%N|%b|%T|%r"'
         squeue = _output(run_command(_slurm(squeue_command, args.slurm_host)))
         if sinfo[0] != 0 or squeue[0] != 0:
             detail = (sinfo[2] or squeue[2] or "Slurm query failed").strip().replace("\n", " ")
@@ -386,6 +528,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("gpu_pick: warning: scontrol show node failed; memory and full node state not checked", file=sys.stderr)
         if everyone[0] != 0:
             print("gpu_pick: warning: squeue for all users failed; shared-node client limit not applied", file=sys.stderr)
+        if args.status:
+            queue = parse_squeue(squeue[1], client_jobs=args.client_jobs, slots_per_gpu=args.slots_per_gpu)
+            print_status(sinfo[1], scontrol[1] if scontrol[0] == 0 else None, queue, cap=args.cap, user=args.user,
+                         prefixes=_parser_prefixes(args.prefix), mem_mb=mem_mb, cpus=args.cpus,
+                         workstations=[h.strip() for h in args.workstations.split(",") if h.strip()])
+            return 0
         evaluation = evaluate(sinfo[1], squeue[1], args.gpu_type.split(","), n=args.n,
                               prefixes=_parser_prefixes(args.prefix), cap=args.cap,
                               per_node_clients=args.per_node_clients,
@@ -393,7 +541,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               scontrol_text=scontrol[1] if scontrol[0] == 0 else None, mem_mb=mem_mb,
                               other_user_nodes=parse_other_user_nodes(everyone[1], args.user) if everyone[0] == 0 else set(),
                               shared_clients=args.shared_clients, min_disk_gb=args.min_disk_gb,
-                              disk_probe=probe_disk if args.min_disk_gb > 0 else None)
+                              disk_probe=probe_disk if args.min_disk_gb > 0 else None, cpus=args.cpus)
     except (re.error, OSError, ValueError) as exc:
         print(f"gpu_pick: {exc}", file=sys.stderr)
         return 2
@@ -402,6 +550,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("node\tstate\tfree(requested)\tclients")
         for node, state, free, _, clients in evaluation.rows:
             print(f"{node}\t{state}\t{free}\t{clients}")
+    queue = parse_squeue(squeue[1], client_jobs=args.client_jobs, slots_per_gpu=args.slots_per_gpu)
+    if queue.pending_gpus or queue.held_gpus:
+        print(f"gpu_pick: note: cap counts running GPUs only ({queue.gpu_count}); pending {queue.pending_gpus}, held "
+              f"{queue.held_gpus} not counted", file=sys.stderr)
     for warning in evaluation.warnings:
         print(f"gpu_pick: warning: {warning}", file=sys.stderr)
     choice = evaluation.choice
