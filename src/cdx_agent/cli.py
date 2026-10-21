@@ -218,6 +218,20 @@ def _launch_parser(mode: str) -> argparse.ArgumentParser:
         help="Join an already-running session's runtime for a second concurrent window "
         "(e.g. a second terminal) instead of fighting over the lock or killing it.",
     )
+    conflict.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Like --cancel-active, then relaunch Claude with --resume <latest session of this repo>, so the "
+        "cancelled conversation carries over (its interrupted background agents can be resumed from it).",
+    )
+    parser.add_argument(
+        "--drain",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="With --cancel-active/--takeover: first wait up to SECONDS for the old session's background "
+        "agents/shells to stop writing output (default 0 = no wait).",
+    )
     token_saver = parser.add_mutually_exclusive_group()
     token_saver.add_argument(
         "--token-saver",

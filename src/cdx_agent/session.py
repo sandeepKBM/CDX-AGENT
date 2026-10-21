@@ -298,6 +298,81 @@ def cancel_session(repo: Path, runtime_dir: Path, dry_run: bool = False) -> Canc
     return CancelResult(action, signaled_pids=signaled, moved_to=moved_to)
 
 
+# --- Claude session discovery (for --takeover / --drain) ----------------------------------
+#
+# Claude Code background subagents and background shells run INSIDE the session process, so
+# cancelling the session always stops them. Their transcripts survive on disk:
+#   <account_home>/.claude/projects/<slug>/<session_id>.jsonl                       (conversation)
+#   <account_home>/.tmp/claude-*/<slug>/<session_id>/tasks/<task_id>.output          (background tasks)
+# where <slug> is the repo path with "/" replaced by "-". --takeover uses these to relaunch with
+# `--resume <session_id>`, so the cancelled conversation (and its interrupted agents) carries over.
+
+TASK_ACTIVE_WINDOW_SECONDS = 120.0
+DRAIN_POLL_SECONDS = 10.0
+
+
+def claude_repo_slug(repo: Path) -> str:
+    return str(repo).replace("/", "-")
+
+
+def claude_transcripts_dir(account_home: Path, repo: Path) -> Path:
+    return Path(account_home) / ".claude" / "projects" / claude_repo_slug(repo)
+
+
+def latest_claude_session(account_home: Path, repo: Path) -> tuple[str, float] | None:
+    """(session_id, mtime) of the most recently written top-level transcript for this repo, or None."""
+    tdir = claude_transcripts_dir(account_home, repo)
+    if not tdir.is_dir():
+        return None
+    best: tuple[str, float] | None = None
+    for f in tdir.glob("*.jsonl"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mtime > best[1]:
+            best = (f.stem, mtime)
+    return best
+
+
+def claude_task_dirs(account_home: Path, repo: Path, session_id: str) -> list[Path]:
+    slug = claude_repo_slug(repo)
+    return sorted(p for p in (Path(account_home) / ".tmp").glob(f"claude-*/{slug}/{session_id}/tasks") if p.is_dir())
+
+
+def running_background_tasks(
+    task_dirs: list[Path], now: float | None = None, window_s: float = TASK_ACTIVE_WINDOW_SECONDS
+) -> list[Path]:
+    """Task output files written within the last `window_s` seconds: a heuristic for background
+    agents / shells that are still running (finished tasks stop writing)."""
+    now = time.time() if now is None else now
+    active: list[Path] = []
+    for tdir in task_dirs:
+        for f in tdir.glob("*.output"):
+            try:
+                if now - f.stat().st_mtime <= window_s:
+                    active.append(f)
+            except OSError:
+                continue
+    return sorted(active)
+
+
+def drain_background_tasks(
+    task_dirs: list[Path],
+    timeout_s: float,
+    poll_s: float = DRAIN_POLL_SECONDS,
+    window_s: float = TASK_ACTIVE_WINDOW_SECONDS,
+) -> list[Path]:
+    """Wait until no background task has written within `window_s`, or `timeout_s` passes.
+    Returns the tasks still active at the end (empty = drained)."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    active = running_background_tasks(task_dirs, window_s=window_s)
+    while active and time.monotonic() < deadline:
+        time.sleep(max(0.0, min(poll_s, deadline - time.monotonic())))
+        active = running_background_tasks(task_dirs, window_s=window_s)
+    return active
+
+
 ConflictMode = Literal["diagnose", "cancel", "refuse"]
 
 
@@ -420,6 +495,12 @@ __all__ = [
     "acquire_lock",
     "cancel_session",
     "child_pids",
+    "claude_repo_slug",
+    "claude_task_dirs",
+    "claude_transcripts_dir",
+    "drain_background_tasks",
+    "latest_claude_session",
+    "running_background_tasks",
     "command_cancel_active",
     "command_session_doctor",
     "compressed_output_path",

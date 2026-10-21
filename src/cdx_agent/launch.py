@@ -308,10 +308,51 @@ def sync_docs_for_repo(
 # --- CLI commands --------------------------------------------------------------------
 
 
+RESUME_FLAGS = ("--resume", "-r", "--continue", "-c")
+
+
+def has_resume_flag(passthrough: list[str]) -> bool:
+    """True if the engine args already ask Claude to resume/continue a session."""
+    return any(tok in RESUME_FLAGS or tok.startswith("--resume=") for tok in passthrough)
+
+
+def report_background_tasks(account_home: Path, repo: Path, session_id: str | None, drain_s: float, dry_run: bool) -> None:
+    """Before cancelling a live Claude session: list its background agents/shells that are still
+    writing output (they stop when the session process is cancelled; their transcripts are kept),
+    and optionally wait up to `drain_s` seconds for them to finish first."""
+    if session_id is None:
+        found = session.latest_claude_session(account_home, repo)
+        session_id = found[0] if found else None
+    if session_id is None:
+        return
+    task_dirs = session.claude_task_dirs(account_home, repo, session_id)
+    active = session.running_background_tasks(task_dirs)
+    if not active:
+        print(f"  session {session_id}: no background agents/shells active.", file=sys.stderr)
+        return
+    window = int(session.TASK_ACTIVE_WINDOW_SECONDS)
+    print(f"  session {session_id}: {len(active)} background agent/shell task(s) wrote output in the last {window} s:", file=sys.stderr)
+    for f in active[:12]:
+        print(f"    {f.name}", file=sys.stderr)
+    if drain_s > 0 and not dry_run:
+        print(f"  --drain: waiting up to {drain_s:.0f} s for them to finish ...", file=sys.stderr)
+        active = session.drain_background_tasks(task_dirs, drain_s)
+        print(f"  --drain: {len(active)} still active.", file=sys.stderr)
+    if active:
+        print(
+            "  Cancelling stops these; their transcripts stay on disk. After --takeover (which resumes this "
+            "conversation) they can be resumed from the new session by messaging each agent id.",
+            file=sys.stderr,
+        )
+
+
 def command_launch(args) -> int:
     """`cdx-agent launch` -- the bash daily driver's replacement front door.
-    Diagnose-only on a lock conflict unless --cancel-active is explicitly
-    passed (never implicitly kills anything, per session.py's design)."""
+    Diagnose-only on a lock conflict unless --cancel-active or --takeover is explicitly
+    passed (never implicitly kills anything, per session.py's design).
+    --takeover = --cancel-active + relaunch Claude with `--resume <latest session of this repo>`, so the
+    cancelled conversation carries over (its interrupted background agents can then be resumed).
+    --drain SECONDS waits for the old session's background tasks to finish before cancelling."""
     cfg = load_config(getattr(args, "config", None))
     repo = Path(args.repo)
     access_mode: AccessMode = "full" if args.full else "safe" if args.safe else cfg.default_access_mode
@@ -323,6 +364,23 @@ def command_launch(args) -> int:
     passthrough = translate_passthrough_for_engine(args.engine, passthrough)
     secondary = getattr(args, "secondary", False)
     token_saver = getattr(args, "token_saver", False)
+    takeover = bool(getattr(args, "takeover", False))
+    drain_s = float(getattr(args, "drain", 0.0) or 0.0)
+
+    takeover_session: str | None = None
+    if takeover:
+        if args.engine == "claude":
+            found = session.latest_claude_session(cfg.account_home, repo_root(repo))
+            if found is None:
+                print("takeover: no Claude transcript found for this repo; a fresh session will start.", file=sys.stderr)
+            elif has_resume_flag(passthrough):
+                print("takeover: engine args already resume a session; leaving them unchanged.", file=sys.stderr)
+            else:
+                takeover_session = found[0]
+                passthrough = ["--resume", takeover_session, *passthrough]
+                print(f"takeover: will resume Claude session {takeover_session}", file=sys.stderr)
+        else:
+            print("takeover: resuming is Claude-only; for codex it behaves like --cancel-active.", file=sys.stderr)
 
     outcome = launch(
         cfg,
@@ -344,11 +402,19 @@ def command_launch(args) -> int:
                 f"  lock_pid={diagnosis.lock_pid} alive={diagnosis.owner_alive} verified={diagnosis.owner_verified}",
                 file=sys.stderr,
             )
-        if not args.cancel_active:
-            print("Pass --cancel-active to diagnose-and-cancel a stale/conflicting session.", file=sys.stderr)
+        if not (args.cancel_active or takeover):
+            print(
+                "Pass --cancel-active to diagnose-and-cancel a stale/conflicting session, or --takeover to cancel it "
+                "and resume its conversation (claude).",
+                file=sys.stderr,
+            )
             return 1
 
         resolved_repo = repo_root(repo)
+        if args.engine == "claude" and diagnosis is not None and diagnosis.owner_alive:
+            report_background_tasks(cfg.account_home, resolved_repo, takeover_session, drain_s, args.dry_run)
+            if not takeover:
+                print("  Tip: --takeover cancels and then resumes this same conversation.", file=sys.stderr)
         rctx_runtime_dir = provision_runtime(
             cfg, resolved_repo, access_mode=access_mode, engine=args.engine, dry_run=True
         ).runtime_dir
