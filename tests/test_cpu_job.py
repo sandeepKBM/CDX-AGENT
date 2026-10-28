@@ -120,3 +120,12 @@ def test_default_unreadable_prefix_is_data_local(monkeypatch):
     monkeypatch.delenv("CDX_NODE_UNREADABLE", raising=False)
     assert cpu_job.build_parser().parse_args(["--", "x"]).unreadable_prefix == "/data/local"
     assert cpu_job.DEFAULT_UNREADABLE == ("/data/local",)
+
+
+def test_per_proc_threads():
+    from cdx_agent.cpu_job import per_proc_threads, build_script
+    assert per_proc_threads(8, 1) == 8
+    assert per_proc_threads(8, 8) == 1
+    assert per_proc_threads(8, 3) == 2
+    assert per_proc_threads(2, 16) == 1
+    assert "OMP_NUM_THREADS=1 " in build_script(["true"], "/tmp", per_proc_threads(8, 8))

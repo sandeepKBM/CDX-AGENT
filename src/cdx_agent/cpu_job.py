@@ -195,6 +195,11 @@ def local_command(cmd: Sequence[str], cwd: str, name: str = "cpujob", timeout: i
             f"nohup nice -n 10 timeout {timeout} {shlex.join(cmd)} > {shlex.quote(log)} 2>&1 &")
 
 
+def per_proc_threads(threads: int, procs: int) -> int:
+    """OMP/MKL/torch threads for EACH of ``procs`` worker processes, so the job uses about ``threads`` CPUs in total."""
+    return max(1, int(threads) // max(1, int(procs)))
+
+
 def build_script(cmd: Sequence[str], cwd: str, threads: int) -> str:
     env = " ".join(f"{v}={threads}" for v in THREAD_VARS)
     return f"cd {shlex.quote(cwd)} && export {env} PYTHONUNBUFFERED=1 && {shlex.join(cmd)}"
@@ -207,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--mem", default=None, help="job memory (default 16G, or from --profile)")
     p.add_argument("--profile", default=None, help="memory profile from the footprint table (%s)" % FOOTPRINTS)
-    p.add_argument("--procs", type=int, default=1, help="process count for --profile per_proc_gb")
+    p.add_argument("--procs", type=int, default=1, help="worker processes: memory = per_proc_gb x N (--profile); thread vars = --threads // N per process")
     p.add_argument("--force", action="store_true", help="with --node: submit even if the node fails the memory/CPU/state check")
     p.add_argument("--time", default="2:00:00")
     p.add_argument("--name", default="cpujob")
@@ -272,7 +277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if r[4] and not a.force:
             print(f"cpu_job: refused --node {node}: {r[4]} ({why}); add --force to submit anyway", file=sys.stderr)
             return 2
-    script = build_script(cmd, cwd, a.threads)
+    script = build_script(cmd, cwd, per_proc_threads(a.threads, a.procs))   # --procs N: threads per process = threads // N
     if a.wait:
         remote = f"timeout {a.timeout} srun -w {node} --mem={a.mem} -t {a.time} -J {shlex.quote(a.name)} bash -c {shlex.quote(script)}"
     else:
