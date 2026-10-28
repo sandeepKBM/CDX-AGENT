@@ -233,7 +233,7 @@ def test_main_status_prints_inventory_cap_line_and_workstations(monkeypatch, cap
     out = capsys.readouterr().out
     assert "rlab3\ta4000:8\t7/8\t0/96\t" in out and "CPUs full (96/96)" in out
     assert "total: 24 GPUs, 17 free, 8 startable (on 1 nodes)" in out
-    assert "ss5772: running 2/12 GPUs (cap), pending 0, held 1" in out
+    assert "ss5772: running 2/8 GPUs (cap), pending 0, held 1" in out
     assert "# westeros" in out and "jhd79 5342" in out and "free" in out
     assert "# arrakis: unreachable" in out and "timed out" in out
 

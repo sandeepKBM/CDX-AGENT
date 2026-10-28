@@ -1,7 +1,7 @@
 """Choose an eligible Slurm GPU node before submitting a job.
 
     python -m cdx_agent.gpu_pick --gpu-type a4000[,4500_ada,...] [--n 1]
-        [--prefix rlab,ilab] [--user USER] [--cap 12] [--per-node-clients 4]
+        [--prefix rlab,ilab] [--user USER] [--cap N] [--node-limit N] [--per-node-clients 4]
         [--shared-clients 2] [--client-jobs REGEX] [--slots-per-gpu 2]
         [--mem 60G] [--cpus 1] [--min-disk-gb 50] [--explain]
     python -m cdx_agent.gpu_pick --status [--prefix rlab,ilab] [--mem 60G] [--workstations westeros,arrakis]
@@ -16,7 +16,9 @@ the new job; ``--per-node-clients`` when we are alone on the node, ``--shared-cl
 when other users run jobs there) and ``--min-disk-gb`` free in /freespace/local (``ssh
 <node> df -P``; unreachable = warning, not a rejection).  Output: the chosen node with
 the full ``sbatch`` options (including ``--mem``) first, then one ``rejected node=..
-reason=..`` line per rejected node.  The account cap (``--cap``) counts RUNNING jobs only;
+reason=..`` line per rejected node.  The account cap (``--cap``, ``--node-limit``) is read live from ``sacctmgr``
+GrpTRES (fallback 8 GPUs / 1 node); it counts RUNNING jobs only, and with node=1 a node other than the one
+our running jobs use (or any node, when they span more nodes than the limit) would pend: AssocGrpNodeLimit;
 pending and held GPUs are reported on stderr.  ``--status`` prints the inventory instead (see --help).
 """
 from __future__ import annotations
@@ -277,6 +279,52 @@ def parse_squeue(text: str, client_jobs: str = "tower_|isaac", slots_per_gpu: in
     return QueueStats(total, clients, jobs, pending, held)
 
 
+def _expand_nodes(text: str) -> Set[str]:
+    """Expand a squeue node list such as ``rlab1,ilab[2-3,5]`` to a set of names."""
+    out: Set[str] = set()
+    for m in re.finditer(r"([A-Za-z][\w-]*?)(?:\[([^\]]+)\]|(\d*))(?=,|$)", text.replace(" ", "")):
+        prefix, ranges, plain = m.groups()
+        if ranges is None:
+            out.add(prefix + (plain or ""))
+            continue
+        for part in ranges.split(","):
+            lo, _, hi = part.partition("-")
+            if lo.isdigit() and (not hi or hi.isdigit()):
+                width = len(lo)
+                out.update(f"{prefix}{i:0{width}d}" for i in range(int(lo), int(hi or lo) + 1))
+    return {n for n in out if n not in {"N/A", "(null)", "(none)", "-"}}
+
+
+def running_nodes(queue: QueueStats) -> Set[str]:
+    """Nodes used by our RUNNING jobs (what GrpTRES node=N counts)."""
+    nodes: Set[str] = set()
+    for job in queue.jobs:
+        if job.state.upper().split("+", 1)[0] == "RUNNING":
+            nodes |= _expand_nodes(job.node)
+    return nodes
+
+
+def node_limit_note(queue: QueueStats, node_limit: Optional[int]) -> str:
+    """Non-empty when NO new job can start: running jobs already span more nodes than the node limit."""
+    nodes = running_nodes(queue)
+    if node_limit is not None and len(nodes) > node_limit:
+        return f"new jobs will pend: running jobs span {len(nodes)} nodes, node limit {node_limit} ({', '.join(sorted(nodes))})"
+    return ""
+
+
+def read_grptres(user: str, host: Optional[str] = None, default: Tuple[int, int] = (8, 1)) -> Tuple[int, int]:
+    """Per-user GrpTRES (gpus, nodes) live from sacctmgr; ``default`` when unreadable or not set."""
+    try:
+        rc, out, _ = _output(run_command(_slurm(f"sacctmgr -nP show assoc user={shlex.quote(user)} format=grptres", host)))
+    except (OSError, ValueError):
+        return default
+    if rc != 0:
+        return default
+    gpus = re.search(r"gres/gpu=(\d+)", out)
+    nodes = re.search(r"(?:^|,)node=(\d+)", out, re.M)
+    return (int(gpus.group(1)) if gpus else default[0], int(nodes.group(1)) if nodes else default[1])
+
+
 BLOCKED_STATES = ("drain", "drng", "down", "maint", "planned", "plnd", "reserved", "resv", "fail", "inval")
 
 
@@ -286,7 +334,7 @@ def _state_blocked(state: str) -> bool:
 
 
 def evaluate(sinfo_text: str, squeue_text: str, gpu_types: Sequence[str], *, n: int = 1,
-             prefixes: Sequence[str] = ("rlab", "ilab"), cap: int = 12,
+             prefixes: Sequence[str] = ("rlab", "ilab"), cap: int = 12, node_limit: Optional[int] = None,
              per_node_clients: int = 4, client_jobs: str = "tower_|isaac",
              slots_per_gpu: int = 2, scontrol_text: Optional[str] = None, mem_mb: Optional[int] = None,
              other_user_nodes: Optional[Set[str]] = None, shared_clients: int = 2,
@@ -310,6 +358,8 @@ def evaluate(sinfo_text: str, squeue_text: str, gpu_types: Sequence[str], *, n: 
     disk_cache: Dict[str, Optional[float]] = {}
     seen: Set[str] = set()
     cap_reason = f"user GPU cap {queue.gpu_count}+{n}>{cap}" if queue.gpu_count + n > cap else ""
+    used = running_nodes(queue)
+    limit_note = node_limit_note(queue, node_limit)
     for node in nodes:
         if node.name in seen:               # sinfo -N repeats a node once per partition
             continue
@@ -329,6 +379,12 @@ def evaluate(sinfo_text: str, squeue_text: str, gpu_types: Sequence[str], *, n: 
             continue
         if cap_reason:
             reasons.append((node.name, cap_reason))
+            continue
+        if limit_note:
+            reasons.append((node.name, f"would pend: AssocGrpNodeLimit ({limit_note})"))
+            continue
+        if node_limit is not None and used and len(used) >= node_limit and node.name not in used:
+            reasons.append((node.name, f"would pend: AssocGrpNodeLimit (running jobs on {','.join(sorted(used))}, node limit {node_limit})"))
             continue
         if not matching:
             reasons.append((node.name, "no requested GPU type on node"))
@@ -451,6 +507,7 @@ def probe_workstation(host: str) -> Tuple[int, str, str]:
 
 
 def print_status(sinfo_text: str, scontrol_text: Optional[str], queue: QueueStats, *, cap: int, user: str,
+                 node_limit: Optional[int] = None,
                  prefixes: Sequence[str], mem_mb: int, cpus: int, workstations: Sequence[str],
                  probe: Callable[[str], Tuple[int, str, str]] = probe_workstation) -> None:
     rows = status_rows(sinfo_text, scontrol_text, prefixes=prefixes, mem_mb=mem_mb, cpus=cpus)
@@ -464,6 +521,14 @@ def print_status(sinfo_text: str, scontrol_text: Optional[str], queue: QueueStat
     print(f"total: {tot} GPUs, {free} free, {sum(r['free'] for r in rows if r['start'] == 'yes')} startable "
           f"(on {sum(r['start'] == 'yes' for r in rows)} nodes)")
     print(f"{user or 'user'}: running {queue.gpu_count}/{cap} GPUs (cap), pending {queue.pending_gpus}, held {queue.held_gpus}")
+    if node_limit is not None:
+        used = running_nodes(queue)
+        print(f"node limit {node_limit}: running jobs on {len(used)} node(s) {','.join(sorted(used)) or '-'}")
+        note = node_limit_note(queue, node_limit)
+        if note:
+            print(f"WARNING: {note}")
+        elif used and len(used) >= node_limit:
+            print(f"note: only {','.join(sorted(used))} can start new jobs; other nodes would pend: AssocGrpNodeLimit")
     for host in workstations:
         rc, out, err = probe(host)
         gpus = parse_workstation(out) if rc == 0 else []
@@ -492,7 +557,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n", type=int, default=1)
     p.add_argument("--prefix", default="rlab,ilab")
     p.add_argument("--user", default=os.environ.get("USER", ""))
-    p.add_argument("--cap", type=int, default=12)
+    p.add_argument("--cap", type=int, default=None, help="GPU cap (default: live sacctmgr GrpTRES, fallback 8)")
+    p.add_argument("--node-limit", type=int, default=None, help="node limit (default: live sacctmgr GrpTRES, fallback 1)")
     p.add_argument("--per-node-clients", type=int, default=4)
     p.add_argument("--shared-clients", type=int, default=2,
                    help="per-node client limit when other users run jobs on the node (--per-node-clients applies when alone)")
@@ -510,6 +576,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if not args.status and not args.gpu_type:
         parser.error("--gpu-type is required (or pass --status)")
+    if args.cap is None or args.node_limit is None:
+        live_cap, live_nodes = read_grptres(args.user, args.slurm_host)
+        args.cap = live_cap if args.cap is None else args.cap
+        args.node_limit = live_nodes if args.node_limit is None else args.node_limit
     if args.n < 1 or args.cap < 0 or args.per_node_clients < 0 or args.shared_clients < 0 or args.slots_per_gpu < 0:
         print("gpu_pick: counts must be non-negative and --n must be positive", file=sys.stderr)
         return 2
@@ -530,12 +600,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("gpu_pick: warning: squeue for all users failed; shared-node client limit not applied", file=sys.stderr)
         if args.status:
             queue = parse_squeue(squeue[1], client_jobs=args.client_jobs, slots_per_gpu=args.slots_per_gpu)
-            print_status(sinfo[1], scontrol[1] if scontrol[0] == 0 else None, queue, cap=args.cap, user=args.user,
+            print_status(sinfo[1], scontrol[1] if scontrol[0] == 0 else None, queue, cap=args.cap, node_limit=args.node_limit, user=args.user,
                          prefixes=_parser_prefixes(args.prefix), mem_mb=mem_mb, cpus=args.cpus,
                          workstations=[h.strip() for h in args.workstations.split(",") if h.strip()])
             return 0
         evaluation = evaluate(sinfo[1], squeue[1], args.gpu_type.split(","), n=args.n,
-                              prefixes=_parser_prefixes(args.prefix), cap=args.cap,
+                              prefixes=_parser_prefixes(args.prefix), cap=args.cap, node_limit=args.node_limit,
                               per_node_clients=args.per_node_clients,
                               client_jobs=args.client_jobs, slots_per_gpu=args.slots_per_gpu,
                               scontrol_text=scontrol[1] if scontrol[0] == 0 else None, mem_mb=mem_mb,
