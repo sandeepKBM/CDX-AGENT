@@ -22,7 +22,43 @@ def test_build_script_sets_threads_and_cwd():
     assert "TORCH_NUM_THREADS=4" in s and s.endswith("'tests/a b.py'")
 
 
-def test_dry_run_sbatch_and_srun(capsys, tmp_path):
+SCON = (
+    "NodeName=ilab1 CPUTot=64 CPUAlloc=18 RealMemory=524288 AllocMem=524000 State=MIXED\n"
+    "NodeName=ilab2 CPUTot=64 CPUAlloc=18 RealMemory=524288 AllocMem=100000 State=MIXED+DRAIN\n"
+    "NodeName=ilab3 CPUTot=96 CPUAlloc=16 RealMemory=524288 AllocMem=100000 State=MIXED\n"
+)
+
+
+def test_node_rows_mem_state_cpu():
+    rows = cpu_job.node_rows(SINFO, SCON, ["ilab"], 8, 16 * 1024)
+    assert [r[0] for r in rows if r[4] is None] == ["ilab3"]
+    byname = {r[0]: r for r in rows}
+    assert "free mem" in byname["ilab1"][4] and "state" in byname["ilab2"][4]
+    assert cpu_job.node_rows(SINFO, SCON, ["ilab"], 90, 1024)[0][4] is not None
+
+
+def test_main_no_qualifying_node_and_explicit_refuse(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
+    base = ["--dry-run", "--cwd", str(tmp_path), "--"]
+    assert cpu_job.main(["--mem", "600G"] + base + ["true"]) == 2
+    assert "Best 3" in capsys.readouterr().err
+    assert cpu_job.main(["--node", "ilab1"] + base + ["true"]) == 2
+    assert "refused" in capsys.readouterr().err
+    assert cpu_job.main(["--node", "ilab1", "--force"] + base + ["true"]) == 0
+    assert cpu_job.main(base + ["true"]) == 0
+    cap = capsys.readouterr()
+    assert "-w ilab3 " in cap.out and "node=ilab3" in cap.err
+
+
+def test_profile_mem(tmp_path):
+    f = tmp_path / "fp.json"
+    f.write_text('{"profiles": {"x": {"steady_gb": 1, "peak_gb": 2.2, "per_proc_gb": 0.5}}}')
+    assert cpu_job.profile_mem("x", 1, str(f)) == "3G"
+    assert cpu_job.profile_mem("x", 8, str(f)) == "4G"
+
+
+def test_dry_run_sbatch_and_srun(capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
     assert cpu_job.main(["--node", "ilab3", "--dry-run", "--cwd", str(tmp_path), "--name", "t", "--", "echo", "hi"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("sbatch --parsable -w ilab3 ") and "--wrap" in out and "OMP_NUM_THREADS=8" in out
@@ -62,7 +98,8 @@ def test_find_unreadable_flags_repo_symlinks_and_command_paths(tmp_path):
     assert cpu_job.find_unreadable(["bash", "-c", f"cat {local}/f"], str(plain), [str(tmp_path / "wslocal")])
 
 
-def test_main_refuses_and_prints_local_background_command(tmp_path, capsys):
+def test_main_refuses_and_prints_local_background_command(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
     local = tmp_path / "wslocal" / "d"
     local.mkdir(parents=True)
     repo = _repo(tmp_path, local)

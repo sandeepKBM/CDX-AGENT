@@ -18,6 +18,8 @@ Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments, no node, or d
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shlex
 import subprocess
@@ -25,6 +27,9 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from cdx_agent.gpu_pick import _state_blocked, parse_mem_mb, parse_scontrol
+
+FOOTPRINTS = "/common/users/ss5772/codex_tools/base/footprints.json"
 DEFAULT_UNREADABLE = ("/data/local",)
 THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "TORCH_NUM_THREADS")
 
@@ -48,6 +53,74 @@ def pick_node(sinfo_text: str, prefixes: Sequence[str], need: int) -> Optional[s
         if idle >= need and idle > best_idle:
             best, best_idle = parts[0], idle
     return best
+
+
+def idle_cpus(sinfo_text: str) -> dict:
+    out = {}
+    for line in sinfo_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                out[parts[0]] = int(parts[1].split("/")[1])
+            except (IndexError, ValueError):
+                pass
+    return out
+
+
+def node_rows(sinfo_text: str, scontrol_text: str, prefixes: Sequence[str], need_cpus: int, mem_mb: int, nodes: Optional[Sequence[str]] = None):
+    """-> [(node, idle_cpus, free_mb|None, state, problem|None)] ranked best first (qualifying nodes first, by idle CPUs).
+
+    Free memory is RealMemory - AllocMem (gpu_pick.parse_scontrol); a node qualifies only if free mem >= mem_mb, idle CPUs >= need_cpus
+    and its state accepts jobs (not drain/down/maint/reserved...).
+    """
+    idle, info, rows = idle_cpus(sinfo_text), parse_scontrol(scontrol_text), []
+    for name in (nodes if nodes is not None else idle):
+        if nodes is None and not any(name.startswith(p) for p in prefixes):
+            continue
+        i, n = idle.get(name), info.get(name)
+        free = n.free_mb if n else None
+        state = n.state if n else "?"
+        why = []
+        if i is None or i < need_cpus:
+            why.append(f"idle CPUs {i} < {need_cpus}")
+        if free is None:
+            why.append("free mem unknown")
+        elif free < mem_mb:
+            why.append(f"free mem {free / 1024:.0f}G < {mem_mb / 1024:.0f}G")
+        if n is None or _state_blocked(state):
+            why.append(f"state {state}")
+        rows.append((name, i if i is not None else -1, free, state, "; ".join(why) or None))
+    rows.sort(key=lambda r: (r[4] is not None, -r[1], -(r[2] or 0)))
+    return rows
+
+
+def fmt_row(r) -> str:
+    free = "?" if r[2] is None else f"{r[2] / 1024:.0f}G"
+    return f"{r[0]}: free mem {free}, idle CPUs {r[1]}, state {r[3]}" + (f" [{r[4]}]" if r[4] else "")
+
+
+def profile_mem(name: str, procs: int, path: str = FOOTPRINTS) -> str:
+    """Default --mem (e.g. ``4G``) from the footprint table: max(peak_gb, per_proc_gb * procs), rounded up."""
+    with open(path) as f:
+        prof = json.load(f)["profiles"][name]
+    vals = [float(prof.get("peak_gb") or 0)]
+    if prof.get("per_proc_gb") is not None:
+        vals.append(float(prof["per_proc_gb"]) * procs)
+    return f"{max(1, math.ceil(max(vals)))}G"
+
+
+def ensure_footprints(path: str = FOOTPRINTS) -> None:
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"profiles": {"mujoco-mpc-sweep": {"steady_gb": 0.5, "peak_gb": 0.5, "per_proc_gb": 0.5}}}, f, indent=2)
+            f.write("\n")
+
+
+def _fetch(host: Optional[str]) -> tuple:
+    sinfo = subprocess.run(_slurm("sinfo -N -O NodeList,CPUsState -h", host), capture_output=True, text=True, timeout=60).stdout
+    scon = subprocess.run(_slurm("scontrol show node -o", host), capture_output=True, text=True, timeout=60).stdout
+    return sinfo, scon
 
 
 def _under(path: str, prefixes: Sequence[str]) -> Optional[str]:
@@ -132,7 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--node", default=None)
     p.add_argument("--prefix", default="ilab")   # user 2026-10-17: ilab only (rlab nodes carry the GPU jobs)
     p.add_argument("--threads", type=int, default=8)
-    p.add_argument("--mem", default="16G")
+    p.add_argument("--mem", default=None, help="job memory (default 16G, or from --profile)")
+    p.add_argument("--profile", default=None, help="memory profile from the footprint table (%s)" % FOOTPRINTS)
+    p.add_argument("--procs", type=int, default=1, help="process count for --profile per_proc_gb")
+    p.add_argument("--force", action="store_true", help="with --node: submit even if the node fails the memory/CPU/state check")
     p.add_argument("--time", default="2:00:00")
     p.add_argument("--name", default="cpujob")
     p.add_argument("--log", default=None, help="sbatch log (default: <cwd>/logs/cpu_jobs/<name>_%%j.log)")
@@ -166,12 +242,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               + local_command(cmd, cwd, a.name, a.timeout), file=sys.stderr)
         print("(override: --allow-local-data)", file=sys.stderr)
         return 2
-    node = a.node
+    mem = a.mem
+    if a.profile:
+        ensure_footprints()
+        try:
+            pm = profile_mem(a.profile, a.procs)
+        except (OSError, KeyError, ValueError) as e:
+            print(f"cpu_job: profile {a.profile!r} not usable ({e!r}) in {FOOTPRINTS}", file=sys.stderr)
+            return 2
+        mem = mem or pm
+    mem = mem or "16G"
+    a.mem = mem
+    mem_mb = parse_mem_mb(mem)
+    prefixes = [s.strip() for s in a.prefix.split(",") if s.strip()]
+    sinfo, scon = _fetch(a.slurm_host)
+    node, why = a.node, None
     if node is None:
-        q = subprocess.run(_slurm("sinfo -N -O NodeList,CPUsState -h", a.slurm_host), capture_output=True, text=True, timeout=60)
-        node = pick_node(q.stdout, [s.strip() for s in a.prefix.split(",") if s.strip()], need=a.threads)
-        if node is None:
-            print(f"cpu_job: no {a.prefix} node with >= {a.threads} idle CPUs", file=sys.stderr)
+        rows = node_rows(sinfo, scon, prefixes, a.threads, mem_mb)
+        ok = [r for r in rows if r[4] is None]
+        if not ok:
+            print(f"cpu_job: no {a.prefix} node has >= {a.threads} idle CPUs, >= {mem} free memory and an accepting state. Best 3:", file=sys.stderr)
+            for r in rows[:3]:
+                print("  " + fmt_row(r), file=sys.stderr)
+            return 2
+        node, why = ok[0][0], fmt_row(ok[0])
+    else:
+        r = node_rows(sinfo, scon, prefixes, a.threads, mem_mb, nodes=[node])[0]
+        why = fmt_row(r)
+        if r[4] and not a.force:
+            print(f"cpu_job: refused --node {node}: {r[4]} ({why}); add --force to submit anyway", file=sys.stderr)
             return 2
     script = build_script(cmd, cwd, a.threads)
     if a.wait:
@@ -182,6 +281,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         remote = (f"sbatch --parsable -w {node} --mem={a.mem} -t {a.time} -J {shlex.quote(a.name)} -o {shlex.quote(log)} "
                   f"--wrap {shlex.quote(script)}")
     if a.dry_run:
+        print(f"cpu_job: node={node} mem={mem}: {why}", file=sys.stderr)
         print(remote)
         return 0
     r = subprocess.run(_slurm(remote, a.slurm_host), text=True, capture_output=not a.wait)
