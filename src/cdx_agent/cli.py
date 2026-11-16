@@ -6,6 +6,7 @@ from typing import Callable
 
 from . import graph
 from . import hooks
+from . import hygiene
 from . import launch
 from . import onboarding
 from . import runtime
@@ -51,6 +52,8 @@ LEGACY_ALIASES: dict[str, str] = {
     "safe-rg": "safe-rg",
     "safe-git-diff": "safe-git-diff",
     "launch": "launch",
+    "--hygiene": "hygiene",
+    "hygiene": "hygiene",
     "session-doctor": "session-doctor",
     "cancel-active": "cancel-active",
     "reap-stale-runtimes": "reap-stale-runtimes",
@@ -206,6 +209,12 @@ def _launch_parser(mode: str) -> argparse.ArgumentParser:
     access.add_argument("--full", action="store_true", help="Full-access sandbox/permissions.")
     access.add_argument("--safe", action="store_true", help="Restricted sandbox/permissions.")
     parser.add_argument("--dry-run", action="store_true", help="Print what would happen without launching.")
+    parser.add_argument(
+        "--worktree",
+        default=None,
+        metavar="NAME",
+        help="Launch in <repo>/.claude/worktrees/NAME instead of the repo checkout (opt-in; default unchanged).",
+    )
     conflict = parser.add_mutually_exclusive_group()
     conflict.add_argument(
         "--cancel-active",
@@ -372,6 +381,7 @@ def _dispatch_table() -> dict[str, tuple[Callable[[str], argparse.ArgumentParser
         "safe-rg": (_safe_rg_parser, token_tools.command_safe_rg),
         "safe-git-diff": (_safe_git_diff_parser, token_tools.command_safe_git_diff),
         "launch": (_launch_parser, launch.command_launch),
+        "hygiene": (hygiene.hygiene_parser, hygiene.command_hygiene),
         "session-doctor": (_session_target_parser, session.command_session_doctor),
         "cancel-active": (_cancel_active_parser, session.command_cancel_active),
         "reap-stale-runtimes": (_reap_stale_runtimes_parser, runtime.command_reap_stale_runtimes),

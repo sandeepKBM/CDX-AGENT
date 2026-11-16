@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import context_docs, hooks, session, skills
+from . import context_docs, hooks, hygiene, session, skills
 from .config import Config, load_config, repo_root
 from .runtime import AccessMode, Engine, RuntimeContext, provision_runtime
 
@@ -173,6 +173,8 @@ class PrepareResult:
     link_decisions: tuple[skills.LinkDecision, ...]
     doc_sync: context_docs.SyncResult | None
     hook_install: hooks.HookInstallResult | None
+    stale_worktrees: tuple[str, ...] = ()
+    hygiene_line: str = ""
 
 
 def prepare_launch(
@@ -202,6 +204,18 @@ def prepare_launch(
     resolved_repo = repo_root(repo)
     rctx = provision_runtime(config, resolved_repo, access_mode=access_mode, engine=engine, dry_run=dry_run)
 
+    # Read-only checks; never change the launch directory.
+    stale = tuple(hygiene.stale_checkout_worktrees(resolved_repo))
+    if stale:
+        print("WARNING: " + hygiene.stale_warning_line(list(stale)), file=sys.stderr)
+    hygiene_line = ""
+    try:
+        hygiene_line = hygiene.summary_line(hygiene.build_report(resolved_repo))
+    except Exception:  # hygiene must never block a launch
+        hygiene_line = ""
+    if hygiene_line:
+        print(hygiene_line, file=sys.stderr)
+
     lock_handle: session.LockHandle | None = None
     if secondary or dry_run:
         diagnosis = session.diagnose_session(resolved_repo, rctx.runtime_dir)
@@ -225,6 +239,11 @@ def prepare_launch(
         )
         working_rules = context_docs.load_working_rules_template(config)
         rendered_rules = context_docs.render_working_rules(working_rules, token_saver=token_saver)
+        rendered_rules = context_docs.filter_global_sections(
+            rendered_rules, context_docs.load_exclude_sections(resolved_repo)
+        )
+        if stale:
+            rendered_rules = rendered_rules.rstrip("\n") + "\n\n" + hygiene.stale_warning_line(list(stale)) + "\n"
         doc_sync = context_docs.sync_runtime_docs(rctx.runtime_dir, rendered_rules, engine=engine)
         hook_install = hooks.install_hooks_for_runtime(config, rctx.runtime_dir, engine=engine)
 
@@ -249,6 +268,8 @@ def prepare_launch(
         link_decisions=link_decisions,
         doc_sync=doc_sync,
         hook_install=hook_install,
+        stale_worktrees=stale,
+        hygiene_line=hygiene_line,
     )
 
 
@@ -355,6 +376,8 @@ def command_launch(args) -> int:
     --drain SECONDS waits for the old session's background tasks to finish before cancelling."""
     cfg = load_config(getattr(args, "config", None))
     repo = Path(args.repo)
+    if getattr(args, "worktree", None):
+        repo = hygiene.resolve_worktree(repo, args.worktree)
     access_mode: AccessMode = "full" if args.full else "safe" if args.safe else cfg.default_access_mode
     passthrough = list(args.passthrough or [])
     if "--" in passthrough:

@@ -292,3 +292,40 @@ __all__ = [
     "sync_runtime_docs",
     "target_path",
 ]
+
+
+GLOBAL_RULES_CONFIG = Path(".cdx") / "global_rules.json"
+
+
+def load_exclude_sections(repo: Path) -> list[str]:
+    """`<repo>/.cdx/global_rules.json` = {"exclude_sections": ["<heading prefix>", ...]}.
+    Missing/invalid file -> [] (inject everything)."""
+    import json
+
+    path = Path(repo) / GLOBAL_RULES_CONFIG
+    try:
+        data = json.loads(path.read_text())
+        items = data.get("exclude_sections", [])
+        return [str(x) for x in items] if isinstance(items, list) else []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def filter_global_sections(text: str, exclude_prefixes: list[str]) -> str:
+    """Drop top-level (`# `) sections whose heading text starts with any prefix
+    (case-insensitive). Text before the first heading is kept."""
+    prefixes = [p.strip().lower().lstrip("# ").strip() for p in exclude_prefixes if p.strip()]
+    if not prefixes:
+        return text
+    out: list[str] = []
+    skip = False
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        if not in_fence and line.startswith("# "):
+            heading = line[2:].strip().lower()
+            skip = any(heading.startswith(p) for p in prefixes)
+        if not skip:
+            out.append(line)
+    return "".join(out)

@@ -43,7 +43,9 @@ def _script_copy(tmp_path: Path, name: str) -> Path:
     return dst
 
 
-def _run_hook(script: Path, payload) -> subprocess.CompletedProcess:
+def _run_hook(script: Path, payload, env_extra: dict | None = None) -> subprocess.CompletedProcess:
+    env = {**os.environ, **(env_extra or {})}
+    env.pop("CDX_WORKTREE_NOTES", None) if not (env_extra or {}).get("CDX_WORKTREE_NOTES") else None
     stdin_text = payload if isinstance(payload, str) else json.dumps(payload)
     return subprocess.run(
         [sys.executable, str(script)],
@@ -51,6 +53,7 @@ def _run_hook(script: Path, payload) -> subprocess.CompletedProcess:
         text=True,
         capture_output=True,
         timeout=30,
+        env=env,
     )
 
 
@@ -157,26 +160,38 @@ def test_post_review_silent_for_read_only_command(tmp_path):
     assert proc.stdout.strip() == ""
 
 
+WT_ON = {"CDX_WORKTREE_NOTES": "1"}
+
+
 def test_post_review_baseline_then_silent_until_tree_changes(tmp_path):
     script = _script_copy(tmp_path, "post_tool_use_review.py")
     repo = _git_repo(tmp_path)
     (repo / "dirty.txt").write_text("x\n")
 
-    first = _run_hook(script, _bash_payload(repo, "touch something"))
+    first = _run_hook(script, _bash_payload(repo, "touch something"), WT_ON)
     context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
     assert context.startswith("worktree baseline: 1 untracked")
     assert "\n" not in context  # one summary line, not the full `git status`
 
     # Identical tree, same session: pure repeat, must be silent (this was the
     # every-Bash-call spam the fix removes).
-    second = _run_hook(script, _bash_payload(repo, "touch something"))
+    second = _run_hook(script, _bash_payload(repo, "touch something"), WT_ON)
     assert second.returncode == 0
     assert second.stdout.strip() == ""
 
     (repo / "more.txt").write_text("y\n")
-    third = _run_hook(script, _bash_payload(repo, "touch something"))
+    third = _run_hook(script, _bash_payload(repo, "touch something"), WT_ON)
     context3 = json.loads(third.stdout)["hookSpecificOutput"]["additionalContext"]
     assert context3.startswith("worktree changed: 2 untracked")
+
+
+def test_post_review_worktree_notes_silent_by_default(tmp_path):
+    script = _script_copy(tmp_path, "post_tool_use_review.py")
+    repo = _git_repo(tmp_path)
+    (repo / "dirty.txt").write_text("x\n")
+    proc = _run_hook(script, _bash_payload(repo, "touch something"))
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == ""
 
 
 def test_post_review_clean_tree_emits_nothing(tmp_path):
@@ -209,7 +224,7 @@ def test_post_review_summary_is_one_line_for_big_trees(tmp_path):
         (reports / f"run{i}").mkdir(parents=True)
         (reports / f"run{i}" / "r.md").write_text("x\n")
     (repo / "top.txt").write_text("x\n")
-    proc = _run_hook(script, _bash_payload(repo, "make all"))
+    proc = _run_hook(script, _bash_payload(repo, "make all"), WT_ON)
     context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
     assert context == "worktree baseline: 2 untracked (top: (root) 1, reports/ 1)"
 
