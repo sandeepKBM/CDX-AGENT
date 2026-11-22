@@ -79,3 +79,19 @@ def test_waiting_clears_after_later_tool_use(tmp_path):
     assert "WAITING" not in agent_usage.parse_transcript(path).flags
     path.write_text(_tu("t1", "Bash", command="sleep 30") + "\n")
     assert "WAITING" in agent_usage.parse_transcript(path).flags
+
+
+def test_active_only_excludes_finished_transcript(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    working = tasks / "a111.output"
+    working.write_text(record("user", {"role": "user", "content": "go"}) + "\n"
+                       + record("assistant", {"role": "assistant", "content": [
+                           {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x"}}]}) + "\n")
+    done = tasks / "a222.output"
+    done.write_text(record("user", {"role": "user", "content": "go"}) + "\n"
+                    + record("assistant", {"role": "assistant", "content": [{"type": "text", "text": "final report"}]}) + "\n")
+    reports = agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=False)
+    assert {r.id: ("DONE" in r.flags) for r in reports} == {"a111": False, "a222": True}
+    active = agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=True)
+    assert [r.id for r in active] == ["a111"]

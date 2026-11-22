@@ -158,6 +158,7 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
     last_record_was_tool_use = False
     anonymous_tool_pending = False
     anonymous_tool_number = 0
+    final_report = False   # last message is an assistant text with no tool call: the subagent delivered its report and stopped
     try:
         stat = path.stat()
         size_mb = stat.st_size / (1024 * 1024)
@@ -181,6 +182,9 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
                 role = str(message.get("role", record.get("type", "")))
                 content = message.get("content")
                 last_record_was_tool_use = False
+                final_report = (role == "assistant" and bool(_text_content(content).strip())
+                                and not (isinstance(content, list) and any(
+                                    isinstance(b, Mapping) and b.get("type") == "tool_use" for b in content)))
                 if role == "user":
                     text = _text_content(content)
                     if text:
@@ -238,7 +242,9 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
     no_result_wait = last_record_was_tool_use and bool(pending_tools)
     waiting = is_bash_wait or (minutes >= idle_min and no_result_wait)
     flags: List[str] = []
-    if waiting:
+    if final_report and not pending_tools:
+        flags.append("DONE")
+    elif waiting:
         flags.append("WAITING")
     elif minutes >= idle_min:
         flags.append("IDLE")
@@ -267,7 +273,8 @@ def collect_reports(tasks_dirs: Optional[Sequence[str]] = None, *, idle_min: flo
     reports = [parse_transcript(path, now=current, idle_min=idle_min) for path in discover_agent_files(tasks_dirs)]
     reports.sort(key=lambda report: (-report.mtime, report.id))
     if active_only:
-        reports = [report for report in reports if report.minutes_since <= 60.0]
+        # working = not finished (no DONE flag), not idle past the threshold, and touched within the hour (a WAITING agent counts)
+        reports = [r for r in reports if "DONE" not in r.flags and "IDLE" not in r.flags and r.minutes_since <= 60.0]
     return reports
 
 

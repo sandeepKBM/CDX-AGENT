@@ -17,7 +17,9 @@ Subagent types (policy types[t].subagent_types, list; built-in defaults when abs
 web-fetch; run -> runner; wait -> none; other types unrestricted): a launch whose subagent_type is not allowed for its declared
 type is denied with the allowed list.
 Concurrency: running agents per session are tracked in .agent_gate_state.json beside this hook ({session_id: {key: {desc, started}}}).
-PreToolUse Agent adds an entry; entries expire after 6 h (no PostToolUse removal is wired for this hook; expiry by age only).
+PreToolUse Agent adds an entry. SubagentStop (subagent_claims.py calls release()) removes one entry of that session: the entry whose
+key equals the event's tool_use_id when it carries one, else the oldest (the stop payload has agent_id, not the launch's tool_use_id,
+so the counter is exact, the identity of the finished entry is not). Backstop: an entry older than 2 h does not count.
 With >= 4 running the launch asks (CDX_ENGINE=codex has no "ask": deny).
 Every launch is appended to ~/.claude/agent_launch_log.jsonl (machine log; AGENT_GATE_LOG overrides the path).
 """
@@ -47,7 +49,7 @@ HEADER = re.compile(r"^\s*AGENT:\s*type=(?P<type>[\w-]+)\s+model=(?P<model>[\w.-
 MIN_WHY = 15
 STATE = Path(__file__).resolve().with_name(".agent_gate_state.json")
 MAX_RUNNING = 4
-STATE_TTL_S = 6 * 3600
+STATE_TTL_S = 2 * 3600   # backstop only: a finished agent is removed by release() on SubagentStop
 DEFAULT_SUBAGENT_TYPES = {"search": ["Explore", "claude-code-guide", "web-fetch"], "run": ["runner"], "wait": []}
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
@@ -132,10 +134,8 @@ def _effort(spec: dict, ti: dict, info: dict, decision: str | None, reason: str)
     return decision, reason, info
 
 
-def _concurrency(payload: dict, now: float | None = None) -> int:
-    """Record this launch in the state file; return the number of agents already running in this session (before this one)."""
-    now = time.time() if now is None else now
-    sid = str(payload.get("session_id") or "unknown")
+def _load(now: float) -> dict:
+    """The state file with expired entries (older than STATE_TTL_S) dropped."""
     try:
         state = json.loads(STATE.read_text())
         if not isinstance(state, dict):
@@ -147,21 +147,53 @@ def _concurrency(payload: dict, now: float | None = None) -> int:
         state[k] = {e: v for e, v in entries.items() if isinstance(v, dict) and now - float(v.get("started", 0)) < STATE_TTL_S}
         if not state[k]:
             del state[k]
-    ti = payload.get("tool_input") or {}
-    running = len(state.get(sid, {}))
-    key = str(payload.get("tool_use_id") or f"{ti.get('description')}@{now:.3f}")
-    state.setdefault(sid, {})[key] = {"desc": str(ti.get("description") or "")[:80], "started": now}
+    return state
+
+
+def _save(state: dict) -> None:
     try:
         STATE.write_text(json.dumps(state))
     except OSError:
         pass
+
+
+def _concurrency(payload: dict, now: float | None = None) -> int:
+    """Record this launch in the state file; return the number of agents already running in this session (before this one)."""
+    now = time.time() if now is None else now
+    sid = str(payload.get("session_id") or "unknown")
+    state = _load(now)
+    ti = payload.get("tool_input") or {}
+    running = len(state.get(sid, {}))
+    key = str(payload.get("tool_use_id") or f"{ti.get('description')}@{now:.3f}")
+    state.setdefault(sid, {})[key] = {"desc": str(ti.get("description") or "")[:80], "started": now}
+    _save(state)
     return running
+
+
+def release(payload: dict, now: float | None = None) -> bool:
+    """SubagentStop: a subagent of this session finished; drop its entry (tool_use_id match, else the oldest). True if one was removed."""
+    now = time.time() if now is None else now
+    sid = str(payload.get("session_id") or "unknown")
+    state = _load(now)
+    entries = state.get(sid)
+    if not entries:
+        return False
+    tid = str(payload.get("tool_use_id") or "")
+    key = tid if tid in entries else min(entries, key=lambda e: float(entries[e].get("started", 0)))
+    del entries[key]
+    if not entries:
+        del state[sid]
+    _save(state)
+    return True
 
 
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
+        return 0
+    if payload.get("hook_event_name") == "SubagentStop":
+        release(payload)
         return 0
     if payload.get("tool_name") not in ("Agent", "Task"):
         return 0

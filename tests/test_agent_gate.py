@@ -79,3 +79,64 @@ def test_token_risk_warn_is_silent_noop():
     for stdin in (json.dumps(payload), "not json", ""):
         r = subprocess.run([sys.executable, str(script)], input=stdin, text=True, capture_output=True, timeout=30)
         assert r.returncode == 0 and r.stdout == ""
+
+
+def _stop(tmp_path, session="s1", tid=None):
+    """A SubagentStop event through subagent_claims.py (which calls the gate's release())."""
+    hooks = tmp_path / "hooks"
+    hooks.mkdir(exist_ok=True)
+    for f in ("agent_model_gate.py", "subagent_claims.py"):
+        shutil.copy(HOOKS / f, hooks / f)
+    payload = {"hook_event_name": "SubagentStop", "session_id": session, "agent_id": "a1", "cwd": str(tmp_path),
+               "last_assistant_message": "done"}
+    if tid:
+        payload["tool_use_id"] = tid
+    e = {**os.environ, "CDX_CLAIMS_DIR": str(tmp_path / "claims")}
+    r = subprocess.run([sys.executable, str(hooks / "subagent_claims.py")], input=json.dumps(payload), text=True,
+                       capture_output=True, timeout=30, env=e)
+    assert r.returncode == 0, r.stderr
+
+
+def _count(tmp_path, session="s1"):
+    f = tmp_path / "hooks" / ".agent_gate_state.json"
+    return len(json.loads(f.read_text()).get(session, {})) if f.exists() else 0
+
+
+def test_stop_event_clears_the_count(tmp_path):
+    _gate(tmp_path, _payload("search", "haiku", "Explore", 0))
+    assert _count(tmp_path) == 1
+    _stop(tmp_path)
+    assert _count(tmp_path) == 0
+    _stop(tmp_path)   # a stop with nothing tracked is a no-op
+    assert _count(tmp_path) == 0
+
+
+def test_four_finished_plus_one_new_does_not_ask(tmp_path):
+    for n in range(4):
+        _gate(tmp_path, _payload("search", "haiku", "Explore", n))
+    for _ in range(4):
+        _stop(tmp_path)
+    assert _dec(_gate(tmp_path, _payload("search", "haiku", "Explore", 9))) in (None, "allow")
+    assert _count(tmp_path) == 1
+
+
+def test_stop_matches_tool_use_id_else_oldest(tmp_path):
+    for n in range(3):
+        _gate(tmp_path, _payload("search", "haiku", "Explore", n))
+    _stop(tmp_path, tid="u1")
+    st = json.loads((tmp_path / "hooks" / ".agent_gate_state.json").read_text())["s1"]
+    assert sorted(st) == ["u0", "u2"]
+    _stop(tmp_path)   # no id: oldest goes
+    st = json.loads((tmp_path / "hooks" / ".agent_gate_state.json").read_text())["s1"]
+    assert sorted(st) == ["u2"]
+
+
+def test_expiry_backstop_is_two_hours(tmp_path):
+    import time
+    _gate(tmp_path, _payload("search", "haiku", "Explore", 0))
+    f = tmp_path / "hooks" / ".agent_gate_state.json"
+    st = json.loads(f.read_text())
+    st["s1"]["u0"]["started"] = time.time() - 2 * 3600 - 60
+    f.write_text(json.dumps(st))
+    _gate(tmp_path, _payload("search", "haiku", "Explore", 1))
+    assert sorted(json.loads(f.read_text())["s1"]) == ["u1"]

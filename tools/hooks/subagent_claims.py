@@ -37,6 +37,12 @@ def main() -> int:
         return 0
     if payload.get("hook_event_name") not in (None, "SubagentStop"):
         return 0
+    try:   # the agent gate counts running agents; this stop frees one slot (never blocks the stop)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import agent_model_gate
+        agent_model_gate.release(payload)
+    except Exception:
+        pass
     cwd = str(payload.get("cwd") or os.getcwd())
     project = _project(cwd)
     claim = str(payload.get("last_assistant_message") or "")
