@@ -297,9 +297,31 @@ def scan(roots: Optional[Sequence[Path]] = None, project: str = "", use_inuse: b
 def apply(report: str, dry_run: bool = False) -> int:
     data = json.loads(Path(report).read_text(encoding="utf-8"))
     rows = data["rows"] if isinstance(data, dict) else data
-    paths = [r["path"] for r in rows
-             if isinstance(r, dict) and r.get("action") in ("delete", "trash") and r.get("path")]
-    return trash.rm(paths, dry_run=dry_run) if paths else 0
+    rows = [r for r in rows if isinstance(r, dict) and r.get("action") in ("delete", "trash") and r.get("path")]
+    rc = 0
+    paths = []
+    for r in rows:
+        if r.get("rule") == "agent_worktree" and r.get("action") == "delete":
+            rc |= _remove_worktree(r["path"], dry_run)   # tier a: clean + merged; git keeps its metadata consistent
+        else:
+            paths.append(r["path"])
+    if paths:
+        rc |= trash.rm(paths, dry_run=dry_run)
+    return rc
+
+
+def _remove_worktree(path: str, dry_run: bool) -> int:
+    """`git worktree remove` (no --force: git itself refuses a dirty tree), then prune. The branch is kept."""
+    cmd = ["git", "-C", path, "worktree", "remove", path]
+    if dry_run:
+        print("would run: " + " ".join(cmd))
+        return 0
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        print(f"junk: worktree remove failed for {path}: {r.stderr.strip()[-300:]}", file=sys.stderr)
+        return 1
+    print(f"removed worktree {path}")
+    return 0
 
 
 def _human(n: int) -> str:

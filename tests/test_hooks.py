@@ -219,7 +219,8 @@ def test_claude_settings_env_defaults_user_env_wins(tmp_path):
 
 def test_install_agent_defs_never_overwrites_user_files(tmp_path):
     src, dst = tmp_path / "src", tmp_path / "dst"
-    src.mkdir(); dst.mkdir()
+    src.mkdir()
+    dst.mkdir()
     (src / "Explore.md").write_text("---\nmodel: haiku\n# managed-by: cdx-agent\n---\nv2\n")
     (src / "mine.md").write_text("---\n# managed-by: cdx-agent\n---\nours\n")
     (dst / "mine.md").write_text("user's own agent\n")

@@ -13,7 +13,6 @@ from . import runtime
 from . import session
 from . import skills
 from . import token_tools
-from . import workspace_mirror
 
 
 LEGACY_ALIASES: dict[str, str] = {
@@ -64,12 +63,6 @@ LEGACY_ALIASES: dict[str, str] = {
     "skills-audit": "skills-audit",
     "validate-skills": "validate-skills",
     "init-user": "init-user",
-    "dg": "dg",
-    "dg-workspace-init": "dg-workspace-init",
-    "dg-workspace-list": "dg-workspace-list",
-    "dg-workspace-show": "dg-workspace-show",
-    "dg-workspace-clean": "dg-workspace-clean",
-    "dg-workspace-run": "dg-workspace-run",
 }
 
 
@@ -90,10 +83,6 @@ def _general_help() -> str:
         "  cdx-agent sync-docs [--repo PATH] [--engine codex|claude] [--adopt|--force]\n"
         "  cdx-agent skills-list|skills-audit|validate-skills [--repo PATH]\n"
         "  cdx-agent init-user [--user-root PATH] [--tools-root PATH] [--from-existing-user PATH]\n"
-        "  cdx-agent dg --root PATH\n"
-        "  cdx-agent dg-workspace-init --name NAME PATH [PATH ...]\n"
-        "  cdx-agent dg-workspace-list|dg-workspace-show --name NAME|dg-workspace-clean --name NAME\n"
-        "  cdx-agent dg-workspace-run --name NAME\n"
         "  cdx-agent --graph [--repo PATH] [--task TEXT] [--max-files N]\n"
         "  cdx-agent --context --repo PATH --task TEXT\n"
         "  cdx-agent --relevant --repo PATH --task TEXT\n"
@@ -323,45 +312,9 @@ def _init_user_parser(mode: str) -> argparse.ArgumentParser:
     return parser
 
 
-def _dg_parser(mode: str) -> argparse.ArgumentParser:
-    parser = _parser_base(f"cdx-agent {mode}", "Run GrapeRoot/Dual-Graph (dg) against a single directory.")
-    parser.add_argument("--root", required=True, help="Directory to run dg against.")
-    parser.add_argument("--config", default=None)
-    parser.add_argument("--force-home-scan", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("passthrough", nargs=argparse.REMAINDER)
-    return parser
 
 
-def _dg_workspace_init_parser(mode: str) -> argparse.ArgumentParser:
-    parser = _parser_base(f"cdx-agent {mode}", "Create or overwrite a multi-folder workspace manifest.")
-    parser.add_argument("--name", required=True, help="Workspace name (manifest filename stem).")
-    parser.add_argument("paths", nargs="+", help="Member directories to include in the workspace.")
-    parser.add_argument("--force", action="store_true", help="Overwrite an existing manifest of the same name.")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be written without writing it.")
-    parser.add_argument("--config", default=None, help="Path to a cdx-agent config file (overrides discovery).")
-    return parser
 
-
-def _dg_workspace_list_parser(mode: str) -> argparse.ArgumentParser:
-    parser = _parser_base(f"cdx-agent {mode}", "List configured workspace manifests.")
-    parser.add_argument("--config", default=None)
-    return parser
-
-
-def _dg_workspace_name_parser(mode: str) -> argparse.ArgumentParser:
-    parser = _parser_base(f"cdx-agent {mode}", "Target a named (or manifest-path) workspace.")
-    parser.add_argument("--name", required=True, help="Workspace name or path to its manifest file.")
-    parser.add_argument("--config", default=None, help="Path to a cdx-agent config file (overrides discovery).")
-    return parser
-
-
-def _dg_workspace_run_parser(mode: str) -> argparse.ArgumentParser:
-    parser = _dg_workspace_name_parser(mode)
-    parser.add_argument("--force-home-scan", action="store_true", help="Allow scanning a home-like directory.")
-    parser.add_argument("--dry-run", action="store_true", help="Show the dg invocation without running it.")
-    parser.add_argument("passthrough", nargs=argparse.REMAINDER, help="Extra args forwarded to dg.")
-    return parser
 
 
 def _dispatch_table() -> dict[str, tuple[Callable[[str], argparse.ArgumentParser], Callable[[argparse.Namespace], int]]]:
@@ -392,12 +345,6 @@ def _dispatch_table() -> dict[str, tuple[Callable[[str], argparse.ArgumentParser
         "skills-audit": (_skills_parser, skills.command_skills_audit),
         "validate-skills": (_skills_parser, skills.command_validate_skills),
         "init-user": (_init_user_parser, onboarding.command_init_user),
-        "dg": (_dg_parser, workspace_mirror.command_dg),
-        "dg-workspace-init": (_dg_workspace_init_parser, workspace_mirror.command_dg_workspace_init),
-        "dg-workspace-list": (_dg_workspace_list_parser, workspace_mirror.command_dg_workspace_list),
-        "dg-workspace-show": (_dg_workspace_name_parser, workspace_mirror.command_dg_workspace_show),
-        "dg-workspace-clean": (_dg_workspace_name_parser, workspace_mirror.command_dg_workspace_clean),
-        "dg-workspace-run": (_dg_workspace_run_parser, workspace_mirror.command_dg_workspace_run),
     }
 
 

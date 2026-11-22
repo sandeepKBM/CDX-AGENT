@@ -3,6 +3,7 @@
     python -m cdx_agent.modes --check-flag FLAG       exit 0 if known, else 2 with "unknown option ..."
     python -m cdx_agent.modes --supports-dry-run FLAG exit 0 if the mode honors --dry-run, else 3
     python -m cdx_agent.modes --help-text             help generated from this registry, grouped by category
+    python -m cdx_agent.modes --python-module FLAG     print the module of a python-implemented mode (exit 1 if none)
 """
 from __future__ import annotations
 
@@ -81,6 +82,7 @@ MODES: List[Mode] = [
     _m("--trash", "trash index, restore, drain", "data", "python", "trash", writes=True),
     _m("--inuse", "check whether paths are in use", "data", "python", "inuse"),
     _m("--run", "place and run a command: step in your hold, Slurm job, westeros GPU or local", "session", "python", "run", dry=True, writes=True, net=True),
+    _m("--model-diff", "compare compiled MuJoCo models (A.xml B.xml) or --lint X.xml", "session", "python", "model_diff"),
     _m("--exp", "experiment runs: wrap, run, prereg, compare, diff, export, archive", "session", "python", "exp", writes=True),
     _m("--suite", "per-file pytest fan-out with the test-routing map", "session", "python", "suite"),
     _m("--check", "check .cdx conventions, docs drift, report wording, refs", "session", "python", "check"),
@@ -161,6 +163,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         print(unknown_message(args[1]), file=sys.stderr)
         return 2
+    if len(args) == 2 and args[0] == "--python-module":   # registry-driven dispatch for python modes (WP9)
+        mode = lookup(args[1])
+        if mode is not None and mode.impl == "python" and mode.module and mode.kind == "mode":
+            print(mode.module)
+            return 0
+        return 1
     if len(args) == 2 and args[0] == "--supports-dry-run":
         mode = lookup(args[1])
         return 0 if mode is not None and mode.supports_dry_run else 3

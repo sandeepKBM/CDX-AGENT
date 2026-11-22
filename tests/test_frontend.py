@@ -129,3 +129,13 @@ def test_hash_repro_and_teardown_dispatch_to_python_modules(env):
     logged = calls(log)
     assert any("cdx_agent.hash_repro --want" in c for c in logged)
     assert any("cdx_agent.teardown" in c for c in logged)
+
+
+def test_registry_python_mode_without_bash_case_dispatches_to_module(env):
+    # --model-diff has no case in the bash file; the registry names its module, so it runs and never launches a session
+    e, log, home = env
+    res = run(env, "--model-diff", "--help")
+    assert res.returncode == 0, res.stderr
+    assert "cdx-agent --model-diff" in res.stdout
+    assert any("-m cdx_agent.model_diff --help" in c for c in calls(log))
+    assert not any("launch" in c for c in calls(log))

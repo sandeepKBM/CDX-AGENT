@@ -59,7 +59,8 @@ def test_stale_checkout_detects_differing_worktree(repo, tmp_path):
 
 
 def test_stale_checkout_ignores_older_worktree_copy(repo, tmp_path):
-    import os, time
+    import os
+    import time
     wt = repo / ".claude" / "worktrees" / "old"
     _g(repo, "worktree", "add", "-q", "-b", "old", str(wt))
     (wt / "AGENTS.md").write_text("old rules\n")

@@ -121,7 +121,7 @@ def test_cli_runs_then_and_never_writes_events(events, tmp_path):
     _fake_logger(events, [(0.2, "WATCH", "fine"), (0.3, "PROTO", "bad frame")])
     r = subprocess.run(
         [sys.executable, "-m", "cdx_agent.notify", str(events), "--routine", str(routine), "--poll", "0.05",
-         "--stale", "5", "--then", "echo ledger-update"],
+         "--stale", "5", "--from-offset", str(len(before)), "--then", "echo ledger-update"],  # no startup race
         capture_output=True, text=True, timeout=30, env=dict(os.environ, PYTHONPATH=SRC),
     )
     assert r.returncode == notify.EXIT_ANOMALY, r.stderr

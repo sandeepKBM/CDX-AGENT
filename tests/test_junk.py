@@ -115,3 +115,21 @@ def test_apply_only_passes_delete_and_trash(tmp_path, monkeypatch):
         {"path": "/c", "action": "keep"}, {"path": "/d", "action": "report"}]}))
     assert junk.apply(str(rep), dry_run=True) == 0
     assert seen == [(["/a", "/b"], True)]
+
+
+def test_apply_removes_clean_worktree_with_git(tmp_path):
+    import json as _json
+    import subprocess as sp
+    from cdx_agent import junk as _junk
+    repo = tmp_path / "repo"
+    sp.run(["git", "init", "-q", str(repo)], check=True)
+    sp.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+           check=True)
+    wt = tmp_path / "wt"
+    sp.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(wt)], check=True)
+    rep = tmp_path / "r.json"
+    rep.write_text(_json.dumps({"rows": [{"path": str(wt), "rule": "agent_worktree", "action": "delete"}]}))
+    assert _junk.apply(str(rep), dry_run=True) == 0 and wt.exists()
+    assert _junk.apply(str(rep)) == 0
+    assert not wt.exists()
+    assert "wt" not in sp.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True).stdout

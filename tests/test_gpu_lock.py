@@ -157,7 +157,7 @@ def test_node_run_locks_snapshots_runs_and_cleans_up(tmp_path):
     assert kv["self"].startswith(run_root) and kv["self"].endswith("/step.sh")       # ran the node-local copy
     assert kv["wrapper"].startswith(run_root) and kv["wrapper"].endswith("/gpu_lock.py")  # wrapper re-exec'd
     assert kv["orig"] == str(script)
-    assert kv["owner"].startswith(f"testproj host=") and f" pid={p.pid} " in kv["owner"] and "eta=20" in kv["owner"]
+    assert kv["owner"].startswith("testproj host=") and f" pid={p.pid} " in kv["owner"] and "eta=20" in kv["owner"]
     assert kv["held"] == "yes"
     assert not (locks / "gpu1.owner").exists()                      # owner removed
     assert not _locked_elsewhere(locks / "gpu1.lock")               # lock released

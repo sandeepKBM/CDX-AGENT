@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from cdx_agent import values
+
 
 class _Loader(yaml.SafeLoader):
     """YAML 1.2 booleans: only true/false. YAML 1.1 reads `on`/`off`/`yes`/`no` as bool, which turns the bound key `on:`
@@ -34,7 +36,6 @@ _Loader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|Tr
 def _load(text):
     return yaml.load(text, Loader=_Loader)
 
-from cdx_agent import values
 
 TAGS = ("MEASURED", "MODEL", "ASSUMED", "USER")
 _BOUND_HINTS = ("tag", "source", "on", "n", "stat")

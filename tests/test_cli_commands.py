@@ -290,31 +290,4 @@ def test_resync_via_cli(cli_env, capsys):
     assert "auth\t" in out
 
 
-def test_dg_workspace_roundtrip_via_cli(cli_env, capsys):
-    dep1 = cli_env["tmp_path"] / "dep1"
-    dep2 = cli_env["tmp_path"] / "dep2"
-    dep1.mkdir()
-    dep2.mkdir()
 
-    assert main(["dg-workspace-init", "--name", "myws", str(dep1), str(dep2)]) == 0
-    capsys.readouterr()
-
-    assert main(["dg-workspace-list"]) == 0
-    out = capsys.readouterr().out
-    assert "myws ->" in out
-
-    assert main(["dg-workspace-show", "--name", "myws"]) == 0
-    out = capsys.readouterr().out
-    assert "present" in out
-
-    assert main(["dg-workspace-clean", "--name", "myws"]) == 0
-    out = capsys.readouterr().out
-    assert "No generated mirror to remove" in out
-
-
-def test_dg_reports_missing_binary_gracefully_via_cli(cli_env, capsys, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    exit_code = main(["dg", "--root", str(cli_env["repo"])])
-    assert exit_code == 2
-    err = capsys.readouterr().err
-    assert "dg not found on PATH" in err

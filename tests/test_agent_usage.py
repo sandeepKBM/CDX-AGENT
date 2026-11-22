@@ -1,7 +1,6 @@
 import json
 import os
 import time
-from pathlib import Path
 
 from cdx_agent import agent_usage
 

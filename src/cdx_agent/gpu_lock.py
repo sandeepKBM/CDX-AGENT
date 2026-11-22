@@ -40,7 +40,6 @@ import signal
 import socket
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 try:  # also runs as a standalone snapshot on a node (stdlib only): site facts are optional there

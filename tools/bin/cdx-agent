@@ -40,6 +40,7 @@ INSTALL_TARGET="auto"
 TARGET_LOG_FILE=""
 CURRENT_LOGDIR=""
 COMPRESS_COMMAND=()
+PY_MODULE=""    # module of a registry-dispatched python mode (WP9)
 MODULE_ARGS=()   # rest of argv for --offload/--notify/--move-verify/--gpu-lock/--brief (cdx_agent.<module>)
 TARGET_REPO=""
 FORCE_HOME_SCAN=0
@@ -268,14 +269,6 @@ write_token_saver_marker() {
 
 token_tool_script() {
   printf '%s/%s' "$TOKEN_TOOLS_ROOT" "$1"
-}
-
-record_usage_snapshot() {
-  local logdir="$1"
-  local phase="$2"
-  if have_cmd ccusage; then
-    ccusage codex daily > "$logdir/usage_snapshot_${phase}.txt" 2>&1 || true
-  fi
 }
 
 record_launch_metadata() {
@@ -657,7 +650,6 @@ launch_codex() {
   record_launch_metadata "$logdir" \
     "$([[ "$ACCESS_MODE" == "full" ]] && printf 'danger-full-access' || printf 'workspace-write')" \
     "on-request"
-  record_usage_snapshot "$logdir" before
 
   local -a python_args=(launch --repo "$repo" --engine "$ENGINE" "$access_flag")
   [[ "$DRY_RUN" -eq 1 ]] && python_args+=(--dry-run)
@@ -683,7 +675,6 @@ launch_codex() {
   cdx_agent_py "${python_args[@]}" -- "${PASSTHROUGH[@]}"
   status=$?
   set -e
-  record_usage_snapshot "$logdir" after
   finalize_launch_log "$logdir"
   return "$status"
 }
@@ -1038,6 +1029,14 @@ while [[ $# -gt 0 ]]; do
       elif [[ "$SEEN_SEPARATOR" -eq 0 && "$1" == --* ]]; then
         # Unknown --flag before "--": ask the mode registry for the nearest flag and stop (F13).
         PYTHONPATH="$CDX_AGENT_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m cdx_agent.modes --check-flag "$1" || exit 2
+        # A registered python mode without its own case above: dispatch it from the registry, never launch a session.
+        if PY_MODULE="$(PYTHONPATH="$CDX_AGENT_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m cdx_agent.modes --python-module "$1")"; then
+          MODE="${1#--}"
+          shift
+          MODULE_ARGS=("$@")
+          break
+        fi
+        PY_MODULE=""
       fi
       PASSTHROUGH+=("$1")
       shift
@@ -1053,6 +1052,11 @@ if [[ "$MODE" != "launch" && "$MODE" != "help" ]] && cdx_is_dry_run; then
     echo "cdx-agent: --$MODE has no dry run" >&2
     exit 2
   fi
+fi
+
+if [[ -n "${PY_MODULE:-}" ]]; then
+  if cdx_is_dry_run; then cdx_agent_mod "$PY_MODULE" --dry-run "${MODULE_ARGS[@]}"; else cdx_agent_mod "$PY_MODULE" "${MODULE_ARGS[@]}"; fi
+  exit $?
 fi
 
 case "$MODE" in
