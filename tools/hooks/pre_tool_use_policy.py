@@ -16,10 +16,10 @@ ADVISORY_STATE_FILENAME = ".pre_policy_advisory_state.json"
 MAX_ADVISORY_SESSIONS = 200
 
 
+# Deletes (rm/find -delete/git clean/...) are tiered by delete_guard.py (WP3); only non-delete destruction here.
+# Checked against executed text only (heredoc bodies and non-executed quotes stripped).
 BLOCK_PATTERNS = (
-    re.compile(r"(^|[;&|]\s*)rm\s+-rf(\s|$)"),
     re.compile(r"git\s+reset\s+--hard(\s|$)"),
-    re.compile(r"git\s+clean\s+-fdx(\s|$)"),
 )
 
 WARN_PATTERNS = (
@@ -581,6 +581,24 @@ def _token_risk_warnings(command: str) -> list[str]:
     return warnings
 
 
+def _delete_verdict(command: str, payload: dict[str, Any]):
+    """Deletion tiers (delete_guard.py beside this file's real path). An import failure denies deletes only."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import delete_guard
+    except Exception:
+        if re.search(r"(^|[\s;&|(])(rm|rmdir|unlink|shred)\s|-delete\b|git\s+clean\b", command):
+            from types import SimpleNamespace
+            return SimpleNamespace(action="deny", reason="cdx-agent delete policy unavailable; use `cdx-agent --rm PATH...`.")
+        return None
+    ti = payload.get("tool_input") or {}
+    return delete_guard.check(command, str(payload.get("cwd") or os.getcwd()),
+                              session_id=str(payload.get("session_id") or ""),
+                              agent_id=str(payload.get("agent_id") or (ti.get("agent_id") if isinstance(ti, dict) else "") or ""))
+
+
 def main() -> int:
     payload = _load_payload()
     tool_name = str(payload.get("tool_name", ""))
@@ -591,9 +609,15 @@ def main() -> int:
     if not command:
         return 0
 
+    executed = _strip_heredocs(_strip_nonexecuted_quotes(command))
     for pattern in BLOCK_PATTERNS:
-        if pattern.search(command):
-            return _deny("Blocked by cdx-agent hook: destructive command pattern.")
+        if pattern.search(executed):
+            return _deny("Blocked by cdx-agent hook: destructive command pattern (git reset --hard).")
+
+    if tool_name == "Bash":
+        verdict = _delete_verdict(command, payload)
+        if verdict is not None and verdict.action == "deny":
+            return _deny(verdict.reason)
 
     ti = payload.get("tool_input") or {}
     poll = poll_guard(command, bool(ti.get("run_in_background")) if isinstance(ti, dict) else False)
