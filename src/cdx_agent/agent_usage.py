@@ -183,12 +183,17 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
                 role = str(message.get("role", record.get("type", "")))
                 content = message.get("content")
                 last_record_was_tool_use = False
-                final_report = (role == "assistant" and bool(_text_content(content).strip())
-                                and not (isinstance(content, list) and any(
-                                    isinstance(b, Mapping) and b.get("type") == "tool_use" for b in content)))
-                handback = (role == "assistant" and isinstance(content, list) and any(
-                    isinstance(b, Mapping) and b.get("type") == "tool_use" and str(b.get("name", "")).endswith("SubagentHandback")
-                    for b in content))
+                # the end state follows the last assistant message; a tool_result after it (the handback's own result)
+                # keeps it, a new user prompt (the agent was resumed) clears it
+                if role == "assistant":
+                    final_report = (bool(_text_content(content).strip())
+                                    and not (isinstance(content, list) and any(
+                                        isinstance(b, Mapping) and b.get("type") == "tool_use" for b in content)))
+                    handback = (isinstance(content, list) and any(
+                        isinstance(b, Mapping) and b.get("type") == "tool_use" and str(b.get("name", "")).endswith("SubagentHandback")
+                        for b in content))
+                elif role == "user" and _text_content(content).strip():
+                    final_report = handback = False
                 if role == "user":
                     text = _text_content(content)
                     if text:

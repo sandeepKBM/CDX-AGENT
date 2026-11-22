@@ -107,3 +107,26 @@ def test_handback_ending_transcript_is_done(tmp_path):
     reports = agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=False)
     assert "DONE" in reports[0].flags
     assert agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=True) == []
+
+
+def test_handback_followed_by_its_tool_result_is_done(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "a444.output").write_text(
+        record("user", {"role": "user", "content": "go"}) + "\n"
+        + record("assistant", {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t9", "name": "SubagentHandback", "input": {"message": "report"}}]}) + "\n"
+        + record("user", {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t9", "content": "delivered"}]}) + "\n")
+    assert "DONE" in agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=False)[0].flags
+
+
+def test_resumed_after_handback_is_not_done(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "a555.output").write_text(
+        record("user", {"role": "user", "content": "go"}) + "\n"
+        + record("assistant", {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t9", "name": "SubagentHandback", "input": {"message": "report"}}]}) + "\n"
+        + record("user", {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t9", "content": "delivered"}]}) + "\n"
+        + record("user", {"role": "user", "content": "one more fix please"}) + "\n")
+    assert "DONE" not in agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=False)[0].flags
