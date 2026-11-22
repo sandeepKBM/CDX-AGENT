@@ -22,3 +22,4 @@ plan: `~/.claude/plans/silly-zooming-crab-of-b4a98a3b-56de-4a81-a10e-acad1dddbb3
 | 2026-11-20 | Q5 | Remove Codex-only modes and the 9 `dg` modes (+ `multi-root-context-map`). | - |
 | 2026-11-20 | Q6 | Raw `sbatch`/`srun` becomes a deny once standard launchers exist. | advisory |
 | 2026-11-20 | WP3 | Deletion tiers (a) allow-list delete+log, (b) trash, (c) user only; trash TTL 7 days. | literal `rm -rf` block |
+| 2026-11-22 | Q4 | `--safe` sandbox enabled after the live test (results in `site/base/claude_sandbox_safe.json` `_comment`), with the base-rule line: in `--safe`, run ssh/srun/sbatch/cdx-agent as plain commands. | Q4 "ships disabled until live test" |
