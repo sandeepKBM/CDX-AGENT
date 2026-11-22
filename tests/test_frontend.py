@@ -84,3 +84,48 @@ def test_help_text_golden():
 
 def test_bash_syntax():
     assert subprocess.run(["bash", "-n", str(BASH)]).returncode == 0
+
+
+REMOVED_FLAGS = ["--dg", "--graperoot", "--dg-root", "--graperoot-root", "--dg-workspace", "--dg-workspace-init",
+                 "--dg-workspace-list", "--dg-workspace-show", "--dg-workspace-clean",
+                 "--doctor", "--token-doctor", "--usage", "--usage-session", "--usage-month"]
+
+
+@pytest.mark.parametrize("flag", REMOVED_FLAGS)
+def test_removed_flag_exits_2_with_suggestion(env, flag):
+    e, log, home = env
+    res = run(env, flag)
+    assert res.returncode == 2
+    assert f"unknown option {flag}" in res.stderr
+    assert all("cdx_agent.modes" in c for c in calls(log))
+
+
+def test_removed_doctor_suggests_session_doctor(env):
+    assert "did you mean --session-doctor?" in run(env, "--doctor").stderr
+
+
+def test_bash_help_has_no_removed_modes_and_new_headings(env):
+    res = run(env, "--help")
+    assert res.returncode == 0
+    words = set(res.stdout.split())
+    for flag in REMOVED_FLAGS:
+        assert flag not in words
+    assert "GrapeRoot" not in res.stdout and "Dual-Graph" not in res.stdout
+    assert "runs codex" not in res.stdout
+    assert "Jobs and helpers" in res.stdout
+    for flag in ("--cpu-job", "--watch", "--gpu-pick", "--handoff", "--run", "--node", "--exp", "--junk", "--suite", "--claude", "--codex", "--secondary"):
+        assert flag in words, flag
+    jobs = res.stdout.index("Jobs and helpers")
+    for flag in ("--cpu-job", "--watch", "--gpu-pick", "--handoff", "--run", "--suite"):
+        assert res.stdout.index(f"  {flag}", jobs) > jobs
+
+
+def test_hash_repro_and_teardown_dispatch_to_python_modules(env):
+    e, log, home = env
+    res = run(env, "--hash-repro", "--want")
+    assert res.returncode == 2 and "--want needs a value" in res.stderr
+    res = run(env, "--teardown")
+    assert res.returncode == 2 and "usage: cdx-agent --teardown" in res.stderr
+    logged = calls(log)
+    assert any("cdx_agent.hash_repro --want" in c for c in logged)
+    assert any("cdx_agent.teardown" in c for c in logged)

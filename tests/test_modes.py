@@ -5,7 +5,7 @@ from cdx_agent import modes
 
 BASH = Path(__file__).resolve().parents[1] / "tools" / "bin" / "cdx-agent"
 
-DEPRECATED = {"--dg", "--graperoot", "--dg-root", "--graperoot-root", "--dg-workspace", "--dg-workspace-init",
+REMOVED = {"--dg", "--graperoot", "--dg-root", "--graperoot-root", "--dg-workspace", "--dg-workspace-init",
               "--dg-workspace-list", "--dg-workspace-show", "--dg-workspace-clean",
               "--doctor", "--token-doctor", "--usage", "--usage-session", "--usage-month"}
 
@@ -22,12 +22,33 @@ def bash_flags():
 
 def test_registry_has_every_bash_flag():
     found = bash_flags()
-    assert len(found) > 60
+    assert len(found) > 50
     assert found <= set(modes.BY_FLAG), sorted(found - set(modes.BY_FLAG))
 
 
-def test_deprecated_set():
-    assert {m.flag for m in modes.MODES if m.deprecated} == DEPRECATED
+def test_removed_modes_are_gone_from_registry_and_bash():
+    assert not (REMOVED & set(modes.BY_FLAG))
+    assert not (REMOVED & bash_flags())
+    assert not any(m.deprecated for m in modes.MODES)
+    for flag in REMOVED:
+        assert modes.unknown_message(flag).startswith(f"unknown option {flag}")
+
+
+def test_removed_flag_gets_a_suggestion():
+    assert "did you mean --session-doctor?" in modes.unknown_message("--doctor")
+    assert modes.main(["--check-flag", "--dg-workspace"]) == 2
+
+
+def test_help_text_has_no_removed_modes():
+    text = modes.help_text()
+    for flag in REMOVED:
+        assert flag not in text.split()
+    assert "dual-graph" not in text
+
+
+def test_hash_repro_and_teardown_are_python_modes():
+    assert modes.BY_FLAG["--hash-repro"].impl == "python" and modes.BY_FLAG["--hash-repro"].module == "hash_repro"
+    assert modes.BY_FLAG["--teardown"].impl == "python" and modes.BY_FLAG["--teardown"].module == "teardown"
 
 
 def test_dry_run_flags():

@@ -36,8 +36,6 @@ def _o(flag, help):
 
 MODES: List[Mode] = [
     # diagnostics
-    _m("--doctor", "Codex tool checks (deprecated)", "diagnostics", "python", "offload", dep=True),
-    _m("--token-doctor", "token tool checks (deprecated)", "diagnostics", dep=True),
     _m("--session-doctor", "report session/runtime state for this repo", "diagnostics", "python", "cli"),
     _m("--workspace-doctor", "workspace graph checks", "diagnostics"),
     _m("--validate-skills", "validate skills", "skills"),
@@ -59,21 +57,7 @@ MODES: List[Mode] = [
     _m("--summarize-log", "summarize a log file", "graph"),
     _m("--compress-output", "run a command and compress its output (rest of argv)", "graph", writes=True),
     # usage
-    _m("--usage", "daily usage (deprecated)", "usage", dep=True),
-    _m("--usage-session", "session usage (deprecated)", "usage", dep=True),
-    _m("--usage-month", "monthly usage (deprecated)", "usage", dep=True),
     _m("--agent-usage", "agent usage report", "usage", "python", "agent_usage"),
-    # GrapeRoot / Dual-Graph (all deprecated)
-    _m("--dg", "dual-graph for the repo (deprecated)", "dual-graph", dry=True, writes=True, dep=True),
-    _m("--graperoot", "GrapeRoot for the repo (deprecated)", "dual-graph", dry=True, writes=True, dep=True),
-    _m("--dg-root", "dual-graph for PATH (deprecated)", "dual-graph", dry=True, writes=True, dep=True),
-    _m("--graperoot-root", "GrapeRoot for PATH (deprecated)", "dual-graph", dry=True, writes=True, dep=True),
-    _m("--dg-workspace", "dual-graph workspace SPEC (deprecated)", "dual-graph", dry=True, writes=True, dep=True),
-    _m("--dg-workspace-init", "create dual-graph workspace NAME PATH... (deprecated)", "dual-graph",
-       dry=True, writes=True, dep=True),
-    _m("--dg-workspace-list", "list dual-graph workspaces (deprecated)", "dual-graph", dep=True),
-    _m("--dg-workspace-show", "show a dual-graph workspace (deprecated)", "dual-graph", dep=True),
-    _m("--dg-workspace-clean", "clean a dual-graph workspace (deprecated)", "dual-graph", writes=True, dep=True),
     # cluster / jobs (rest of argv goes to the module)
     _m("--offload", "offload long work to a GPU host", "cluster", "python", "offload", writes=True, net=True),
     _m("--notify", "send a notification", "cluster", "python", "notify", net=True),
@@ -84,8 +68,8 @@ MODES: List[Mode] = [
     _m("--watch", "watch a running job", "cluster", "python", "watch", net=True),
     _m("--handoff", "write a session handoff", "session", "python", "handoff", writes=True, net=True),
     _m("--brief", "session brief", "session", "python", "brief"),
-    _m("--hash-repro", "re-run a command until its hash matches", "cluster"),
-    _m("--teardown", "generate a teardown script from SPEC.json", "cluster", writes=True),
+    _m("--hash-repro", "re-run a command until its hash matches", "cluster", "python", "hash_repro"),
+    _m("--teardown", "generate a teardown script from SPEC.json", "cluster", "python", "teardown", writes=True),
     # data
     _m("--coldbank", "cold bank and per-host caches", "data", "python", "coldbank", writes=True),
     _m("--hygiene", "repo/runtime hygiene check", "data", "python", "hygiene"),
@@ -128,7 +112,7 @@ MODES: List[Mode] = [
 
 BY_FLAG: Dict[str, Mode] = {m.flag: m for m in MODES}
 CATEGORY_ORDER = ["data", "cluster", "session", "site", "diagnostics", "skills", "setup", "graph", "usage",
-                  "dual-graph", "options", "help", "misc"]
+                  "options", "help", "misc"]
 
 
 def normalize(flag: str) -> str:

@@ -248,3 +248,42 @@ def test_pretooluse_matcher_skips_edit_write(tmp_path):
     pre = _h.build_hooks_payload(tmp_path)["PreToolUse"]
     assert pre[0]["matcher"] == "Bash|apply_patch"
     assert not any("token_risk_warn" in h["command"] for e in pre for h in e["hooks"])
+
+def test_install_hooks_for_repo_claude_writes_settings_json_hooks(tmp_path):
+    cfg = _cfg(tmp_path)
+    repo = tmp_path / "myrepo"
+    (repo / ".claude").mkdir(parents=True)
+    settings = repo / ".claude" / "settings.json"
+    settings.write_text(json.dumps({"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}}))
+    result = hooks.install_hooks_for_repo(cfg, repo, engine="claude")
+    assert result.claude_settings_path == settings
+    payload = json.loads(settings.read_text())
+    assert payload["model"] == "opus"                                        # other keys kept
+    assert payload["hooks"]["Stop"][0]["hooks"][0]["command"] == "mine.sh"   # user's own hook kept
+    wired = hooks.referenced_scripts({k: v for k, v in payload["hooks"].items() if k != "Stop"})
+    assert "pre_tool_use_policy.py" in wired
+    assert not (repo / ".claude" / "hooks.json").exists()
+    assert len(list((repo / ".claude").glob("settings.json.bak.*"))) == 1
+    # idempotent: second run changes nothing and takes no new backup
+    hooks.install_hooks_for_repo(cfg, repo, engine="claude")
+    assert json.loads(settings.read_text()) == payload
+    assert len(list((repo / ".claude").glob("settings.json.bak.*"))) == 1
+
+
+def test_install_hooks_for_repo_claude_refuses_invalid_settings(tmp_path):
+    cfg = _cfg(tmp_path)
+    repo = tmp_path / "myrepo"
+    (repo / ".claude").mkdir(parents=True)
+    (repo / ".claude" / "settings.json").write_text("{not json")
+    with pytest.raises(ValueError):
+        hooks.install_hooks_for_repo(cfg, repo, engine="claude")
+    assert (repo / ".claude" / "settings.json").read_text() == "{not json"
+
+
+def test_install_hooks_for_repo_codex_keeps_hooks_json(tmp_path):
+    cfg = _cfg(tmp_path)
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    hooks.install_hooks_for_repo(cfg, repo, engine="codex")
+    assert (repo / ".codex" / "hooks.json").is_file()
+    assert not (repo / ".claude" / "settings.json").exists()

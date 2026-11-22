@@ -173,6 +173,79 @@ def test_cancel_refuses_to_signal_pid_that_no_longer_holds_the_lock(tmp_path):
         bystander.wait(timeout=5)
 
 
+def test_lock_content_has_pid_host_and_start_time(tmp_path):
+    from cdx_agent.config import hostname_short
+
+    lock_path = tmp_path / "lock"
+    handle = session.acquire_lock(lock_path)
+    try:
+        info = session.read_lock_info(lock_path)
+        assert info.pid == os.getpid()
+        assert info.host == hostname_short()
+        assert info.start_time == session.process_start_time(os.getpid())
+        assert info.start_time is not None
+    finally:
+        session.release_lock(handle)
+
+
+def test_old_pid_only_lock_file_is_still_read(tmp_path):
+    lock_path = tmp_path / "lock"
+    lock_path.write_text("4242\n")
+    info = session.read_lock_info(lock_path)
+    assert (info.pid, info.host, info.start_time) == (4242, None, None)
+    assert session.read_lock_pid(lock_path) == 4242
+    assert not session.lock_owner_is_foreign(info)
+
+
+def test_process_start_time_handles_spaces_in_comm(monkeypatch):
+    stat = "123 (we ird) name) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 987654 1 2"
+    monkeypatch.setattr(session.Path, "read_text", lambda self, *a, **k: stat if str(self) == "/proc/123/stat" else "")
+    assert session.process_start_time(123) == 987654
+
+
+def test_foreign_host_lock_is_never_signaled(tmp_path):
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        start = session.process_start_time(bystander.pid)
+        session.lock_path_for(runtime_dir).write_text(f"{bystander.pid} some-other-host-xyz {start}\n")
+        diagnosis = session.diagnose_session(repo, runtime_dir)
+        assert diagnosis.foreign_host and not diagnosis.owner_alive and diagnosis.lock_host == "some-other-host-xyz"
+        result = session.cancel_session(repo, runtime_dir)
+        assert result.action == "refused" and "some-other-host-xyz" in result.detail
+        assert runtime_dir.is_dir()
+        time.sleep(0.2)
+        assert bystander.poll() is None
+    finally:
+        bystander.terminate()
+        bystander.wait(timeout=5)
+
+
+def test_same_host_pid_with_different_start_time_is_stale(tmp_path):
+    from cdx_agent.config import hostname_short
+
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        start = session.process_start_time(bystander.pid)
+        session.lock_path_for(runtime_dir).write_text(f"{bystander.pid} {hostname_short()} {start + 12345}\n")
+        diagnosis = session.diagnose_session(repo, runtime_dir)
+        assert not diagnosis.owner_alive and not diagnosis.foreign_host
+        result = session.cancel_session(repo, runtime_dir)
+        assert result.action == "cleaned_up_only" and result.signaled_pids == ()
+        time.sleep(0.2)
+        assert bystander.poll() is None
+    finally:
+        bystander.terminate()
+        bystander.wait(timeout=5)
+
+
 def test_cancel_cleans_up_only_when_lock_pid_already_dead(tmp_path):
     repo = tmp_path / "myrepo"
     repo.mkdir()
