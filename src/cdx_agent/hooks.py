@@ -253,9 +253,51 @@ def hooks_locations_for_runtime(runtime_dir: Path) -> tuple[Path, Path]:
     return runtime_dir / "hooks", runtime_dir / "hooks.json"
 
 
+def _entry_uses_dir(entry: dict, hooks_dir: Path) -> bool:
+    prefix = str(hooks_dir)
+    return any(prefix in str(h.get("command", "")) for h in entry.get("hooks", []) if isinstance(h, dict))
+
+
+def merge_repo_claude_settings(hooks_dir: Path, settings_path: Path) -> bool:
+    """Claude Code reads hooks from the "hooks" key of `<repo>/.claude/settings.json`, not from `.claude/hooks.json`.
+    Merge ours into that key: other top-level keys and the user's own hook entries stay; entries that point into our
+    hooks dir are replaced. The old file is backed up to `settings.json.bak.<date>` when it changes. Returns True if written."""
+    existing: dict = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"{settings_path} is not valid JSON ({exc}); fix or move it, nothing was written") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{settings_path} is not a JSON object; nothing was written")
+        existing = loaded
+    merged_hooks: dict = {}
+    current = existing.get("hooks")
+    if isinstance(current, dict):
+        for event, entries in current.items():
+            if isinstance(entries, list):
+                merged_hooks[event] = [e for e in entries if not (isinstance(e, dict) and _entry_uses_dir(e, hooks_dir))]
+    for event, entries in build_hooks_payload(hooks_dir).items():
+        merged_hooks[event] = merged_hooks.get(event, []) + entries
+    payload = {**existing, "hooks": merged_hooks}
+    rendered = json.dumps(payload, indent=2) + "\n"
+    if settings_path.exists():
+        if settings_path.read_text(errors="ignore") == rendered:
+            return False
+        backup_path(settings_path)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(rendered)
+    return True
+
+
 def install_hooks_for_repo(config: Config, repo: Path, engine: Engine = "codex") -> HookInstallResult:
     hooks_dir, hooks_json_path = hooks_locations_for_repo(repo, engine)
     linked = install_hook_scripts(config.tools_root / "hooks", hooks_dir)
+    if engine == "claude":
+        settings_path = repo / ".claude" / "settings.json"
+        merge_repo_claude_settings(hooks_dir, settings_path)
+        return HookInstallResult(hooks_dir=hooks_dir, hooks_json_path=settings_path, linked_scripts=tuple(linked),
+                                 claude_settings_path=settings_path)
     write_hooks_json(hooks_dir, hooks_json_path)
     return HookInstallResult(hooks_dir=hooks_dir, hooks_json_path=hooks_json_path, linked_scripts=tuple(linked))
 
@@ -285,7 +327,10 @@ def command_install_hooks(args) -> int:
     cfg = load_config(getattr(args, "config", None))
     repo = repo_root(Path(args.repo))
     result = install_hooks_for_repo(cfg, repo, engine=args.engine)
-    print(f"hooks_json={result.hooks_json_path}")
+    if result.claude_settings_path is not None:
+        print(f"settings_json={result.claude_settings_path}")
+    else:
+        print(f"hooks_json={result.hooks_json_path}")
     print(f"scripts_linked={len(result.linked_scripts)}")
     return 0
 
@@ -303,6 +348,7 @@ __all__ = [
     "install_hook_scripts",
     "install_hooks_for_repo",
     "install_hooks_for_runtime",
+    "merge_repo_claude_settings",
     "referenced_scripts",
     "write_claude_settings",
     "write_hooks_json",

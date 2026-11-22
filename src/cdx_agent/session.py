@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .config import load_config, repo_root, sanitize_name, timestamp
+from .config import hostname_short, load_config, repo_root, sanitize_name, timestamp
 from .runtime import runtime_context
 
 try:
@@ -76,7 +76,7 @@ def acquire_lock(lock_path: Path) -> LockHandle | None:
         return None
     pid = os.getpid()
     os.ftruncate(fd, 0)
-    os.write(fd, f"{pid}\n".encode("utf-8"))
+    os.write(fd, format_lock_content(pid).encode("utf-8"))
     os.fsync(fd)
     return LockHandle(path=lock_path, fd=fd, pid=pid)
 
@@ -89,14 +89,70 @@ def release_lock(handle: LockHandle) -> None:
         os.close(handle.fd)
 
 
-def read_lock_pid(lock_path: Path) -> int | None:
+@dataclass(frozen=True)
+class LockInfo:
+    pid: int
+    host: str | None = None          # None: old PID-only lock file
+    start_time: int | None = None    # /proc/<pid>/stat field 22 (clock ticks since boot); None: unknown
+
+
+def process_start_time(pid: int) -> int | None:
+    """Field 22 of /proc/<pid>/stat (starttime). The comm field may contain spaces, so split after the last ')'."""
+    try:
+        content = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    close_paren = content.rfind(")")
+    if close_paren == -1:
+        return None
+    fields = content[close_paren + 2 :].split()   # fields[0] is field 3 (state), so field 22 is fields[19]
+    if len(fields) < 20 or not fields[19].isdigit():
+        return None
+    return int(fields[19])
+
+
+def format_lock_content(pid: int) -> str:
+    """`PID HOST STARTTIME` (STARTTIME `-` where /proc is unavailable). read_lock_info also reads old PID-only files."""
+    start = process_start_time(pid)
+    return f"{pid} {hostname_short()} {start if start is not None else '-'}\n"
+
+
+def read_lock_info(lock_path: Path) -> LockInfo | None:
     if not lock_path.is_file():
         return None
     try:
-        content = lock_path.read_text().strip()
+        parts = lock_path.read_text().split()
     except OSError:
         return None
-    return int(content) if content.isdigit() else None
+    if not parts or not parts[0].isdigit():
+        return None
+    pid = int(parts[0])
+    if len(parts) == 1:
+        return LockInfo(pid)
+    start = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
+    return LockInfo(pid, host=parts[1], start_time=start)
+
+
+def read_lock_pid(lock_path: Path) -> int | None:
+    info = read_lock_info(lock_path)
+    return info.pid if info is not None else None
+
+
+def lock_owner_is_foreign(info: LockInfo) -> bool:
+    """The lock was written on another host: its PID means nothing here and must never be signaled."""
+    return info.host is not None and info.host != hostname_short()
+
+
+def lock_owner_is_stale(info: LockInfo) -> bool:
+    """Same host, but the PID is gone or now belongs to a different process (start time differs)."""
+    if lock_owner_is_foreign(info):
+        return False
+    if not pid_is_alive(info.pid):
+        return True
+    if info.start_time is None:
+        return False
+    current = process_start_time(info.pid)
+    return current is not None and current != info.start_time
 
 
 def is_lock_held_by(lock_path: Path, pid: int) -> bool:
@@ -188,14 +244,19 @@ class SessionDiagnosis:
     owner_alive: bool
     owner_verified: bool
     owner_cmdline: str
+    lock_host: str | None = None
+    foreign_host: bool = False
 
 
 def diagnose_session(repo: Path, runtime_dir: Path) -> SessionDiagnosis:
     lock_path = lock_path_for(runtime_dir)
-    pid = read_lock_pid(lock_path)
-    alive = pid_is_alive(pid) if pid is not None else False
+    info = read_lock_info(lock_path)
+    pid = info.pid if info is not None else None
+    foreign = info is not None and lock_owner_is_foreign(info)
+    # A foreign-host PID is never probed or signaled; a same-host PID with a different start time is stale.
+    alive = pid is not None and not foreign and pid_is_alive(pid) and not lock_owner_is_stale(info)
     verified = is_lock_held_by(lock_path, pid) if (pid is not None and alive) else False
-    cmdline = read_cmdline(pid) if pid is not None else ""
+    cmdline = read_cmdline(pid) if (pid is not None and not foreign) else ""
     return SessionDiagnosis(
         repo=repo,
         runtime_dir=runtime_dir,
@@ -204,6 +265,8 @@ def diagnose_session(repo: Path, runtime_dir: Path) -> SessionDiagnosis:
         owner_alive=alive,
         owner_verified=verified,
         owner_cmdline=cmdline,
+        lock_host=info.host if info is not None else None,
+        foreign_host=foreign,
     )
 
 
@@ -260,6 +323,15 @@ def cancel_session(repo: Path, runtime_dir: Path, dry_run: bool = False) -> Canc
     not signaled -- it may be stale, foreign, or have already exited and been
     reused by an unrelated process."""
     diagnosis = diagnose_session(repo, runtime_dir)
+
+    if diagnosis.foreign_host:
+        return CancelResult(
+            "refused",
+            detail=(
+                f"lock was taken on host {diagnosis.lock_host}, not this host; "
+                f"PID {diagnosis.lock_pid} is not signaled from here (cancel it on {diagnosis.lock_host})"
+            ),
+        )
 
     if diagnosis.lock_pid is not None and diagnosis.owner_alive and not diagnosis.owner_verified:
         return CancelResult(

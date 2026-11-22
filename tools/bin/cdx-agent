@@ -6,12 +6,10 @@ USER_ROOT="/common/users/ss5772"
 ACCOUNT_HOME="/common/home/ss5772"
 TOOLS_ROOT="$USER_ROOT/codex_tools"
 TOKEN_TOOLS_ROOT="$TOOLS_ROOT/token_tools"
-SKILL_VALIDATOR_SCRIPT="$TOKEN_TOOLS_ROOT/validate_skills.py"
 HOOKS_ROOT="$TOOLS_ROOT/hooks"
 LEGACY_WRAPPER="$USER_ROOT/bin/cdx-danger-auto"
 BASE_AGENTS_TEMPLATE="$TOOLS_ROOT/base/AGENTS.md"
 REPO_AGENTS_TEMPLATE="$TOOLS_ROOT/templates/repo.AGENTS.md"
-HOOKS_EXAMPLE="$TOOLS_ROOT/hooks/hooks.example.json"
 REPO_GRAPH_ROOT="$TOOLS_ROOT/repo_graph_agent"
 REPO_GRAPH_PYTHONPATH="$REPO_GRAPH_ROOT"
 SITE_PTH="$ACCOUNT_HOME/.local/lib/python3.12/site-packages/codex_tools_repo_graph_agent.pth"
@@ -20,13 +18,6 @@ SITE_PTH="$ACCOUNT_HOME/.local/lib/python3.12/site-packages/codex_tools_repo_gra
 # REPO_GRAPH_PYTHONPATH above, so no pip install is required for bash to delegate to it.
 CDX_AGENT_PYTHONPATH="${CDX_AGENT_PYTHONPATH:-$ACCOUNT_HOME/CDX-AGENT/src}"
 DISABLED_MCP_FRAGMENT="$TOOLS_ROOT/base/mcp.repo_graph.example.toml.disabled"
-TOOLS_SKILLS_ROOT="$TOOLS_ROOT/skills"
-SKILLS_APPROVED_ROOT="$TOOLS_ROOT/skills_approved"
-SKILLS_CUSTOM_ROOT="$TOOLS_ROOT/skills_custom"
-SKILLS_QUARANTINE_ROOT="$TOOLS_ROOT/skills_quarantine"
-USER_AGENTS_SKILLS_ROOT="$ACCOUNT_HOME/.agents/skills"
-WORKSPACE_MANIFEST_ROOT="/common/users/ss5772/.cdx/workspaces"
-WORKSPACE_MIRROR_ROOT="/common/users/ss5772/.cdx/dg_workspaces"
 
 MODE="launch"
 ACCESS_MODE="full"
@@ -41,7 +32,6 @@ TOKEN_SAVER=0
 YES=0
 DRY_RUN=0
 SEEN_SEPARATOR=0
-DG_WORKSPACE_FORCE=0
 CANCEL_ACTIVE=0
 NO_CANCEL_ACTIVE=0
 TAKEOVER=0
@@ -54,10 +44,6 @@ MODULE_ARGS=()   # rest of argv for --offload/--notify/--move-verify/--gpu-lock/
 TARGET_REPO=""
 FORCE_HOME_SCAN=0
 PASSTHROUGH=()
-DG_ROOT_OVERRIDE=""
-DG_WORKSPACE_SPEC=""
-DG_WORKSPACE_INIT_NAME=""
-DG_WORKSPACE_INIT_PATHS=()
 
 if [[ "${CDX_DRY_RUN:-0}" == "1" ]]; then
   DRY_RUN=1
@@ -81,373 +67,6 @@ current_dir() {
 
 cdx_is_dry_run() {
   [[ "${CDX_DRY_RUN:-0}" == "1" || "$DRY_RUN" -eq 1 ]]
-}
-
-cdx_abs_path() {
-  local path="$1"
-  if have_cmd readlink; then
-    readlink -f "$path"
-  else
-    python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$path"
-  fi
-}
-
-cdx_sanitize_name() {
-  printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
-}
-
-cdx_validate_workspace_name() {
-  local name="$1"
-  if [[ -z "$name" || "$name" == "." || "$name" == ".." || "$name" == *"/"* ]]; then
-    return 1
-  fi
-  [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]]
-}
-
-cdx_workspace_name_from_spec() {
-  local spec="$1"
-  local base
-  if [[ -f "$spec" ]]; then
-    base="$(basename "$spec")"
-    base="${base%.paths}"
-    printf '%s' "$(cdx_sanitize_name "$base")"
-    return 0
-  fi
-  if ! cdx_validate_workspace_name "$spec"; then
-    return 1
-  fi
-  printf '%s' "$spec"
-}
-
-cdx_workspace_manifest_path() {
-  local spec="$1"
-  if [[ -f "$spec" ]]; then
-    cdx_abs_path "$spec"
-    return 0
-  fi
-  if ! cdx_validate_workspace_name "$spec"; then
-    echo "Invalid workspace name: $spec" >&2
-    return 1
-  fi
-  printf '%s/%s.paths' "$WORKSPACE_MANIFEST_ROOT" "$spec"
-}
-
-cdx_workspace_entries() {
-  local manifest="$1"
-  local manifest_dir raw resolved
-  manifest_dir="$(dirname "$manifest")"
-  while IFS= read -r raw || [[ -n "$raw" ]]; do
-    raw="${raw%$'\r'}"
-    [[ "$raw" =~ ^[[:space:]]*$ ]] && continue
-    [[ "$raw" =~ ^[[:space:]]*# ]] && continue
-    if [[ "$raw" = /* ]]; then
-      resolved="$(cdx_abs_path "$raw")"
-    else
-      resolved="$(cdx_abs_path "$manifest_dir/$raw")"
-    fi
-    printf '%s\t%s\n' "$resolved" "$raw"
-  done < "$manifest"
-}
-
-cdx_workspace_mirror_path() {
-  local spec="$1"
-  local name
-  name="$(cdx_workspace_name_from_spec "$spec")"
-  printf '%s/%s' "$WORKSPACE_MIRROR_ROOT" "$name"
-}
-
-cdx_need_dg() {
-  if command -v dg >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "ERROR: dg not found on PATH." >&2
-  echo >&2
-  echo "To inspect/install GrapeRoot/Dual-Graph safely:" >&2
-  echo "  cd /common/users/ss5772/codex_tools" >&2
-  echo "  git clone https://github.com/kunal12203/Codex-CLI-Compact.git" >&2
-  echo "  cd Codex-CLI-Compact" >&2
-  echo "  less README.md" >&2
-  echo "  less install.sh" >&2
-  echo "  find . -maxdepth 3 -type f | sort" >&2
-  echo >&2
-  echo "Do not run curl-pipe-bash. Install only after inspection." >&2
-  return 1
-}
-
-cdx_collect_runtime_skill_roots() {
-  local repo
-  repo="$(repo_root)"
-  printf '%s\n' \
-    "$TOOLS_SKILLS_ROOT" \
-    "$SKILLS_APPROVED_ROOT" \
-    "$SKILLS_CUSTOM_ROOT" \
-    "$USER_AGENTS_SKILLS_ROOT" \
-    "$repo/.agents/skills"
-}
-
-cdx_link_skill_root() {
-  local src_root="$1"
-  local dst_root="$2"
-  local skill_dir skill_name target existing
-  [[ -d "$src_root" ]] || return 0
-  while IFS= read -r -d '' skill_dir; do
-    skill_name="$(basename "$skill_dir")"
-    target="$dst_root/$skill_name"
-    if [[ -L "$target" ]]; then
-      existing="$(readlink -f "$target" || true)"
-      if [[ "$existing" == "$(readlink -f "$skill_dir")" ]]; then
-        continue
-      fi
-    fi
-    if [[ -e "$target" || -L "$target" ]]; then
-      backup_path "$target" >/dev/null || true
-      rm -rf "$target"
-    fi
-    ln -s "$skill_dir" "$target"
-  done < <(find "$src_root" -mindepth 1 -maxdepth 1 -type d -print0)
-}
-
-cdx_safe_remove_tree() {
-  local target="$1"
-  local resolved
-  resolved="$(cdx_abs_path "$target")"
-  case "$resolved" in
-    "$WORKSPACE_MIRROR_ROOT"/*)
-      ;;
-    *)
-      echo "Refusing to delete outside $WORKSPACE_MIRROR_ROOT: $resolved" >&2
-      return 1
-      ;;
-  esac
-  rm -rf -- "$resolved"
-}
-
-cdx_resolve_dg_root() {
-  local root="$1"
-  root="$(cdx_abs_path "$root")"
-  if [[ ! -d "$root" ]]; then
-    echo "DG root is not a directory: $root" >&2
-    return 1
-  fi
-  if is_home_like_dir "$root" && [[ "$FORCE_HOME_SCAN" -ne 1 ]]; then
-    echo "Refusing to run dg against a home-like directory: $root" >&2
-    echo "Use --force-home-scan only if you really intend that scan." >&2
-    return 1
-  fi
-  printf '%s' "$root"
-}
-
-cdx_dg_preflight() {
-  local mode="$1"
-  local root="$2"
-  local dg_bin
-  dg_bin="$(command -v dg 2>/dev/null || true)"
-  echo "MODE=$mode"
-  echo "REPO_ROOT=$root"
-  echo "DG_BIN=${dg_bin:-missing}"
-  echo "CODEX_HOME=$(current_codex_home)"
-}
-
-cdx_run_dg() {
-  local mode="$1"
-  local root="$2"
-  shift 2
-  local dg_bin
-  if ! cdx_need_dg; then
-    return 1
-  fi
-  dg_bin="$(command -v dg)"
-  cdx_dg_preflight "$mode" "$root"
-  if cdx_is_dry_run; then
-    printf 'DRY_RUN_COMMAND='
-    printf '%q ' "$dg_bin" "$root" "$@"
-    printf '\n'
-    return 0
-  fi
-  exec "$dg_bin" "$root" "$@"
-}
-
-cdx_run_dg_workspace() {
-  local mode="$1"
-  local spec="$2"
-  shift 2
-  local manifest name mirror_root
-  if ! cdx_need_dg; then
-    return 1
-  fi
-  manifest="$(cdx_workspace_manifest_path "$spec")"
-  name="$(cdx_workspace_name_from_spec "$spec")"
-  mirror_root="$(cdx_workspace_mirror_path "$spec")"
-  echo "MODE=$mode"
-  echo "WORKSPACE_NAME=$name"
-  echo "WORKSPACE_MANIFEST=$manifest"
-  echo "WORKSPACE_MIRROR=$mirror_root"
-  echo "CODEX_HOME=$(current_codex_home)"
-
-  local -a entries=()
-  local entry resolved raw link_name count
-  local -A seen_links=()
-  mapfile -t entries < <(cdx_workspace_entries "$manifest")
-  if [[ "${#entries[@]}" -eq 0 ]]; then
-    echo "Workspace manifest has no entries: $manifest" >&2
-    return 1
-  fi
-  for entry in "${entries[@]}"; do
-    resolved="${entry%%$'\t'*}"
-    raw="${entry#*$'\t'}"
-    if [[ ! -d "$resolved" ]]; then
-      echo "Workspace path is missing or not a directory: $resolved (from $raw)" >&2
-      return 1
-    fi
-    if is_home_like_dir "$resolved" && [[ "$FORCE_HOME_SCAN" -ne 1 ]]; then
-      echo "Refusing to scan a home-like workspace path: $resolved (from $raw)" >&2
-      echo "Use --force-home-scan only if you really intend that scan." >&2
-      return 1
-    fi
-  done
-
-  if cdx_is_dry_run; then
-    echo "DRY_RUN_MIRROR_CONTENTS:"
-    for entry in "${entries[@]}"; do
-      resolved="${entry%%$'\t'*}"
-      raw="${entry#*$'\t'}"
-      link_name="$(cdx_sanitize_name "$(basename "$resolved")")"
-      count="${seen_links[$link_name]:-0}"
-      if [[ "$count" -gt 0 ]]; then
-        link_name="${link_name}-$((count + 1))"
-      fi
-      seen_links["$(cdx_sanitize_name "$(basename "$resolved")")"]=$((count + 1))
-      printf '  %s -> %s (from %s)\n' "$link_name" "$resolved" "$raw"
-    done
-    printf 'DRY_RUN_COMMAND='
-    printf '%q ' "$(command -v dg)" "$mirror_root" "$@"
-    printf '\n'
-    return 0
-  fi
-
-  cdx_safe_remove_tree "$mirror_root" >/dev/null 2>&1 || true
-  mkdir -p "$mirror_root"
-  local index_file="$mirror_root/WORKSPACE_INDEX.md"
-  {
-    printf '# Workspace Index\n'
-    printf '\n'
-    printf '- Workspace: %s\n' "$name"
-    printf '- Manifest: %s\n' "$manifest"
-    printf '- Generated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-    printf '\n'
-    printf 'Warning: editing files through this mirror edits the original source paths.\n'
-    printf 'Map every change back to the original source path before editing.\n'
-    printf '\n'
-    printf '## Entries\n'
-  } > "$index_file"
-
-  for entry in "${entries[@]}"; do
-    resolved="${entry%%$'\t'*}"
-    raw="${entry#*$'\t'}"
-    link_name="$(cdx_sanitize_name "$(basename "$resolved")")"
-    count="${seen_links[$link_name]:-0}"
-    if [[ "$count" -gt 0 ]]; then
-      link_name="${link_name}-$((count + 1))"
-    fi
-    seen_links["$(cdx_sanitize_name "$(basename "$resolved")")"]=$((count + 1))
-    ln -s "$resolved" "$mirror_root/$link_name"
-    printf '- `%s` -> `%s` (from `%s`)\n' "$link_name" "$resolved" "$raw" >> "$index_file"
-  done
-
-  cdx_run_dg "$mode" "$mirror_root" "$@"
-}
-
-cdx_init_dg_workspace() {
-  local name="$1"
-  shift
-  local manifest="$WORKSPACE_MANIFEST_ROOT/$name.paths"
-  local -a paths=("$@")
-  local path resolved
-  if [[ "${#paths[@]}" -eq 0 ]]; then
-    echo "No directories provided for workspace init." >&2
-    return 1
-  fi
-  for path in "${paths[@]}"; do
-    if [[ ! -d "$path" ]]; then
-      echo "Workspace path is not a directory: $path" >&2
-      return 1
-    fi
-  done
-  if [[ -e "$manifest" && "$DG_WORKSPACE_FORCE" -ne 1 ]]; then
-    echo "Workspace manifest already exists: $manifest (use --force to overwrite)" >&2
-    return 1
-  fi
-  if cdx_is_dry_run; then
-    echo "MANIFEST=$manifest"
-    for path in "${paths[@]}"; do
-      resolved="$(cdx_abs_path "$path")"
-      printf '  %s\n' "$resolved"
-    done
-    return 0
-  fi
-  mkdir -p "$WORKSPACE_MANIFEST_ROOT"
-  if [[ -e "$manifest" ]]; then
-    backup_path "$manifest" >/dev/null || true
-  fi
-  : > "$manifest"
-  for path in "${paths[@]}"; do
-    resolved="$(cdx_abs_path "$path")"
-    printf '%s\n' "$resolved" >> "$manifest"
-  done
-  echo "Created workspace manifest: $manifest"
-}
-
-cdx_list_dg_workspaces() {
-  local found=0 manifest name
-  if [[ ! -d "$WORKSPACE_MANIFEST_ROOT" ]]; then
-    echo "No workspace manifests found in $WORKSPACE_MANIFEST_ROOT"
-    return 0
-  fi
-  while IFS= read -r manifest; do
-    [[ -n "$manifest" ]] || continue
-    name="$(basename "$manifest")"
-    name="${name%.paths}"
-    printf '%s -> %s\n' "$name" "$manifest"
-    found=1
-  done < <(find "$WORKSPACE_MANIFEST_ROOT" -maxdepth 1 -type f -name '*.paths' | sort)
-  if [[ "$found" -eq 0 ]]; then
-    echo "No workspace manifests found in $WORKSPACE_MANIFEST_ROOT"
-  fi
-}
-
-cdx_show_dg_workspace() {
-  local spec="$1"
-  local manifest
-  manifest="$(cdx_workspace_manifest_path "$spec")"
-  echo "MANIFEST=$manifest"
-  while IFS=$'\t' read -r resolved raw; do
-    if [[ -d "$resolved" ]]; then
-      printf 'present\t%s\t%s\n' "$resolved" "$raw"
-    else
-      printf 'missing\t%s\t%s\n' "$resolved" "$raw"
-    fi
-  done < <(cdx_workspace_entries "$manifest")
-}
-
-cdx_clean_dg_workspace() {
-  local spec="$1"
-  local mirror_root
-  mirror_root="$(cdx_workspace_mirror_path "$spec")"
-  if [[ ! -d "$mirror_root" ]]; then
-    echo "No generated mirror to remove: $mirror_root"
-    return 0
-  fi
-  cdx_safe_remove_tree "$mirror_root"
-  echo "Removed generated mirror: $mirror_root"
-}
-
-cdx_skill_root_status() {
-  local path="$1"
-  if [[ -d "$path" ]]; then
-    echo "present"
-  else
-    echo "missing"
-  fi
 }
 
 is_git_repo() {
@@ -535,24 +154,6 @@ runtime_codex_home() {
   printf '%s/codex_runtime/%s/%s/%s/%s' "$USER_ROOT" "$host" "$ENGINE" "$ACCESS_MODE" "$repo_slug_value"
 }
 
-legacy_shared_codex_home() {
-  # The pre-A1-fix shared path, kept only so doctor/usage-scanning code can
-  # still find and report on old runtime dirs from before this fix. Never
-  # used as an active runtime location anymore.
-  local repo_slug_value host
-  host="$(hostname_short)"
-  repo_slug_value="$(repo_slug)"
-  printf '%s/codex_runtime/%s/%s' "$USER_ROOT" "$host" "$repo_slug_value"
-}
-
-legacy_codex_home() {
-  local repo host safe_name
-  repo="$(pwd -P)"
-  host="$(hostname_short)"
-  safe_name="$(echo "$repo" | sed 's#/#__#g')"
-  printf '%s/codex_runtime_danger_auto/%s/%s' "$USER_ROOT" "$host" "$safe_name"
-}
-
 current_codex_home() {
   runtime_codex_home
 }
@@ -620,288 +221,6 @@ ensure_repo_graph_pythonpath() {
   printf '%s\n' "$expected" > "$SITE_PTH"
 }
 
-extract_user_model_setting() {
-  local key="$1"
-  local config="$ACCOUNT_HOME/.codex/config.toml"
-  if [[ -f "$config" ]]; then
-    grep -E "^${key} = " "$config" | head -n 1 || true
-  fi
-}
-
-ensure_runtime_config() {
-  local repo runtime config backup model_line reasoning_line
-  repo="$(repo_root)"
-  runtime="$(current_codex_home)"
-  config="$runtime/config.toml"
-  mkdir -p "$runtime"
-  if [[ -f "$config" ]]; then
-    return 0
-  fi
-  model_line="$(extract_user_model_setting "model")"
-  reasoning_line="$(extract_user_model_setting "model_reasoning_effort")"
-  if [[ -z "$model_line" ]]; then
-    model_line='model = "gpt-5.5"'
-  fi
-  if [[ -z "$reasoning_line" ]]; then
-    reasoning_line='model_reasoning_effort = "xhigh"'
-  fi
-  cat > "$config" <<EOF
-$model_line
-$reasoning_line
-
-[projects."$USER_ROOT"]
-trust_level = "trusted"
-
-[projects."$repo"]
-trust_level = "trusted"
-EOF
-}
-
-copy_auth_if_needed() {
-  local runtime auth_src auth_dst
-  runtime="$(current_codex_home)"
-  auth_src="$ACCOUNT_HOME/.codex/auth.json"
-  auth_dst="$runtime/auth.json"
-  mkdir -p "$runtime"
-  if [[ -f "$auth_src" && ! -f "$auth_dst" ]]; then
-    cp -p "$auth_src" "$auth_dst"
-  fi
-}
-
-ensure_runtime_agents() {
-  local runtime target tmp
-  runtime="$(current_codex_home)"
-  target="$runtime/AGENTS.md"
-  mkdir -p "$runtime"
-  tmp="$(mktemp)"
-  render_runtime_agents "$tmp"
-  if [[ -e "$target" ]]; then
-    if cmp -s "$tmp" "$target"; then
-      rm -f "$tmp"
-      return 0
-    fi
-    backup_path "$target" >/dev/null || true
-  fi
-  cp -p "$tmp" "$target"
-  rm -f "$tmp"
-}
-
-ensure_runtime_skills() {
-  local runtime skills_dir src_root
-  runtime="$(current_codex_home)"
-  skills_dir="$runtime/skills"
-  mkdir -p "$skills_dir"
-  while IFS= read -r src_root; do
-    [[ -n "$src_root" ]] || continue
-    cdx_link_skill_root "$src_root" "$skills_dir"
-  done < <(cdx_collect_runtime_skill_roots)
-}
-
-ensure_runtime_lock() {
-  local repo runtime lock
-  repo="$(repo_root)"
-  runtime="$(current_codex_home)"
-  lock="$runtime/.codex-session.lock"
-  mkdir -p "$runtime"
-  exec 9>"$lock"
-  if flock -n 9; then
-    return 0
-  fi
-
-  if ! cdx_handle_active_session_conflict "$repo" "$runtime"; then
-    return 1
-  fi
-
-  mkdir -p "$runtime"
-  exec 9>"$lock"
-  if flock -n 9; then
-    return 0
-  fi
-
-  echo "Another Codex session is still active for this repo:"
-  echo "$runtime"
-  return 1
-}
-
-cdx_list_matching_session_processes() {
-  local repo="${1:-}"
-  local runtime_dir="${2:-}"
-
-  if [[ -z "$repo" && -z "$runtime_dir" ]]; then
-    return 0
-  fi
-
-  ps -u "$USER" -o pid=,ppid=,stat=,etime=,command= \
-    | grep -Ei 'codex|cdx-agent' \
-    | grep -v grep \
-    | {
-        if [[ -n "$repo" && -n "$runtime_dir" ]]; then
-          grep -F -e "$repo" -e "$runtime_dir" || true
-        elif [[ -n "$repo" ]]; then
-          grep -F -e "$repo" || true
-        else
-          grep -F -e "$runtime_dir" || true
-        fi
-      } || true
-}
-
-cdx_print_active_session_diagnosis() {
-  local repo="$1"
-  local runtime_dir="$2"
-
-  echo
-  echo "Another Codex session is already active for this repo:"
-  echo "$runtime_dir"
-  echo
-
-  echo "Repo:"
-  echo "  $repo"
-
-  echo
-  echo "Runtime/session directory:"
-  if [[ -d "$runtime_dir" ]]; then
-    ls -ld "$runtime_dir" || true
-    echo
-    echo "Recent runtime files:"
-    find "$runtime_dir" -maxdepth 2 -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null \
-      | sort \
-      | tail -30 || true
-  else
-    echo "  Runtime dir does not exist anymore. This may be a stale pointer."
-  fi
-
-  echo
-  echo "Matching repo/session processes:"
-  local matches
-  matches="$(cdx_list_matching_session_processes "$repo" "$runtime_dir" || true)"
-  matches="$(printf '%s\n' "$matches" | awk -v self="$$" -v ppid="$PPID" 'NF && $1 != self && $1 != ppid')"
-  if [[ -n "$matches" ]]; then
-    printf '%s\n' "$matches"
-  else
-    echo "  No matching live Codex/cdx-agent processes found."
-    echo "  This likely means the runtime directory is stale."
-  fi
-
-  echo
-}
-
-cdx_cancel_active_session() {
-  local repo="$1"
-  local runtime_dir="$2"
-  local ts stale_dir pids remaining self_pid
-  ts="$(date +%Y%m%d_%H%M%S)"
-  self_pid="$$"
-
-  echo "Cancelling active/stale Codex session for repo:"
-  echo "  $repo"
-  echo "Runtime:"
-  echo "  $runtime_dir"
-  echo
-
-  pids="$(cdx_list_matching_session_processes "$repo" "$runtime_dir" \
-    | awk -v self="$$" -v ppid="$PPID" '$1 ~ /^[0-9]+$/ && $1 != self && $1 != ppid { print $1 }' \
-    | sort -u || true)"
-
-  if [[ -n "$pids" ]]; then
-    echo "Sending TERM to matching PIDs:"
-    echo "$pids"
-    while read -r pid; do
-      [[ -n "$pid" ]] || continue
-      [[ "$pid" == "$self_pid" ]] && continue
-      kill -TERM "$pid" 2>/dev/null || true
-    done <<EOF_PIDS
-$pids
-EOF_PIDS
-
-    sleep 1
-
-    remaining="$(cdx_list_matching_session_processes "$repo" "$runtime_dir" \
-      | awk -v self="$$" -v ppid="$PPID" '$1 ~ /^[0-9]+$/ && $1 != self && $1 != ppid { print $1 }' \
-      | sort -u || true)"
-
-    if [[ -n "$remaining" ]]; then
-      echo "Sending KILL to remaining matching PIDs:"
-      echo "$remaining"
-      while read -r pid; do
-        [[ -n "$pid" ]] || continue
-        [[ "$pid" == "$self_pid" ]] && continue
-        kill -KILL "$pid" 2>/dev/null || true
-      done <<EOF_PIDS
-$remaining
-EOF_PIDS
-    fi
-  else
-    echo "No matching live processes to kill."
-  fi
-
-  if [[ -d "$runtime_dir" ]]; then
-    stale_dir="${runtime_dir}.stale.${ts}"
-    if [[ -e "$stale_dir" ]]; then
-      stale_dir="${stale_dir}.$$"
-    fi
-    if ! mv "$runtime_dir" "$stale_dir"; then
-      echo "Failed to move runtime dir aside:"
-      echo "  $runtime_dir"
-      return 1
-    fi
-    echo "Moved runtime dir to:"
-    echo "  $stale_dir"
-  else
-    echo "Runtime dir already absent."
-  fi
-}
-
-cdx_handle_active_session_conflict() {
-  local repo="$1"
-  local runtime_dir="$2"
-
-  cdx_print_active_session_diagnosis "$repo" "$runtime_dir"
-
-  if [[ "${CANCEL_ACTIVE:-0}" == "1" || "${CDX_CANCEL_ACTIVE:-0}" == "1" || "${CDX_CANCEL_ACTIVE_SESSION:-0}" == "1" ]]; then
-    if ! cdx_cancel_active_session "$repo" "$runtime_dir"; then
-      return 1
-    fi
-    return 0
-  fi
-
-  if [[ "${NO_CANCEL_ACTIVE:-0}" == "1" || "${CDX_NO_CANCEL_ACTIVE:-0}" == "1" ]]; then
-    echo "Active-session cleanup disabled by CDX_NO_CANCEL_ACTIVE=1."
-    return 1
-  fi
-
-  if [[ -t 0 ]]; then
-    printf "Cancel this active/stale session and continue? [y/N] "
-    local ans
-    if ! read -r ans; then
-      echo
-      echo "No response read. Leaving active session untouched."
-      return 1
-    fi
-    case "$ans" in
-      y|Y|yes|YES|Yes)
-        if ! cdx_cancel_active_session "$repo" "$runtime_dir"; then
-          return 1
-        fi
-        return 0
-        ;;
-      *)
-        echo "Leaving active session untouched. Exiting."
-        return 1
-        ;;
-    esac
-  else
-    echo "Non-interactive shell. Not cancelling active session unless CDX_CANCEL_ACTIVE=1 is set."
-    return 1
-  fi
-}
-
-cdx_session_doctor() {
-  local repo runtime
-  repo="$(repo_root)"
-  runtime="$(current_codex_home)"
-  cdx_print_active_session_diagnosis "$repo" "$runtime"
-}
-
 launch_log_dir() {
   local stamp repo
   stamp="$(timestamp)"
@@ -947,118 +266,8 @@ write_token_saver_marker() {
   mkdir -p "$logdir/raw_outputs" "$logdir/compressed_outputs"
 }
 
-session_root_candidates() {
-  {
-    printf '%s\n' "$ACCOUNT_HOME/.codex"
-    printf '%s\n' "$(current_codex_home)"
-    printf '%s\n' "$(legacy_shared_codex_home)"
-    printf '%s\n' "$(legacy_codex_home)"
-    if [[ -n "${CODEX_HOME:-}" ]]; then
-      printf '%s\n' "$CODEX_HOME"
-    fi
-  } | awk 'NF && !seen[$0]++'
-}
-
-detected_session_dirs() {
-  while IFS= read -r root; do
-    [[ -n "$root" ]] || continue
-    [[ -d "$root/sessions" ]] && printf '%s\n' "$root/sessions"
-    [[ -d "$root/archived_sessions" ]] && printf '%s\n' "$root/archived_sessions"
-  done < <(session_root_candidates)
-}
-
-session_jsonl_files() {
-  while IFS= read -r root; do
-    [[ -d "$root" ]] || continue
-    find "$root" -maxdepth 8 -type f \( \
-      -path '*/sessions/*.jsonl' -o \
-      -path '*/sessions/*/*.jsonl' -o \
-      -path '*/sessions/*/*/*.jsonl' -o \
-      -path '*/sessions/*/*/*/*.jsonl' -o \
-      -path '*/archived_sessions/*.jsonl' -o \
-      -name 'history.jsonl' -o \
-      -name 'session_index.jsonl' \
-    \) 2>/dev/null
-  done < <(session_root_candidates) | sort -u
-}
-
-recent_session_jsonl_count() {
-  local now count=0
-  now="$(date +%s)"
-  while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    local mtime
-    mtime="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
-    if (( now - mtime <= 2592000 )); then
-      count=$((count + 1))
-    fi
-  done < <(session_jsonl_files)
-  printf '%s' "$count"
-}
-
-print_recent_session_file_table() {
-  local mode="${1:-mtime}"
-  local now
-  now="$(date +%s)"
-  if [[ "$mode" == "largest" ]]; then
-    while IFS= read -r file; do
-      [[ -n "$file" ]] || continue
-      local mtime size
-      mtime="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
-      size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
-      if (( now - mtime <= 2592000 )); then
-        printf '%s\t%s\n' "$size" "$file"
-      fi
-    done < <(session_jsonl_files) | sort -nr | head -n 10 | while IFS=$'\t' read -r size file; do
-      [[ -n "$file" ]] || continue
-      printf '%8s %s %s\n' "$(du -h "$file" | awk '{print $1}')" "$(date -d "@$(stat -c %Y "$file")" +%F 2>/dev/null || echo unknown)" "$file"
-    done
-    return 0
-  fi
-  while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    local mtime size lines
-    mtime="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
-    size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"
-    lines="$(wc -l < "$file" 2>/dev/null || echo 0)"
-    printf '%s\t%s\t%s\t%s\n' "$mtime" "$size" "$lines" "$file"
-  done < <(session_jsonl_files) | sort -nr | head -n 20 | while IFS=$'\t' read -r mtime size lines file; do
-    printf '%8s %8s %s %s\n' "$size" "$lines" "$(date -d "@$mtime" +%F_%T 2>/dev/null || echo unknown)" "$file"
-  done
-}
-
 token_tool_script() {
   printf '%s/%s' "$TOKEN_TOOLS_ROOT" "$1"
-}
-
-token_rules_present_in_file() {
-  local path="$1"
-  [[ -f "$path" ]] && grep -q "Token-saving rules" "$path"
-}
-
-skill_validation_summary() {
-  local output
-  if [[ -f "$SKILL_VALIDATOR_SCRIPT" ]]; then
-    output="$(python3 "$SKILL_VALIDATOR_SCRIPT" --summary 2>/dev/null || true)"
-    if [[ -n "$output" ]]; then
-      printf '%s' "$output"
-      return 0
-    fi
-  fi
-  printf 'unavailable'
-}
-
-render_runtime_agents() {
-  local target="$1"
-  if [[ "$TOKEN_SAVER" -eq 1 ]]; then
-    cp -p "$BASE_AGENTS_TEMPLATE" "$target"
-    return 0
-  fi
-  awk '
-    /<!-- TOKEN_SAVER_START -->/ {skip=1; next}
-    /<!-- TOKEN_SAVER_END -->/ {skip=0; next}
-    !skip {print}
-  ' "$BASE_AGENTS_TEMPLATE" > "$target"
 }
 
 record_usage_snapshot() {
@@ -1146,12 +355,6 @@ run_repo_graph_build() {
   PYTHONPATH="$REPO_GRAPH_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m repo_graph_agent build --repo "$repo" "$@"
 }
 
-run_repo_graph_context() {
-  local repo="$1"
-  local task="$2"
-  PYTHONPATH="$REPO_GRAPH_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m repo_graph_agent context --repo "$repo" --task "$task"
-}
-
 run_repo_graph_detect_deps() {
   local repo="$1"
   PYTHONPATH="$REPO_GRAPH_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m repo_graph_agent detect-deps --repo "$repo"
@@ -1201,228 +404,9 @@ write_repo_agents() {
   default_repo_agents_content "$repo_base" > "$target"
 }
 
-write_repo_hooks_json() {
-  local repo hooks_json
-  repo="$1"
-  hooks_json="$repo/.codex/hooks.json"
-  mkdir -p "$repo/.codex"
-  if [[ -e "$hooks_json" ]]; then
-    backup_path "$hooks_json" >/dev/null || true
-  fi
-  cat > "$hooks_json" <<EOF
-{
-  "PreToolUse": [
-    {
-      "matcher": "Bash|Edit|Write|apply_patch",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/usr/bin/python3 \"$repo/.codex/hooks/pre_tool_use_policy.py\"",
-          "timeout": 30,
-          "statusMessage": "Checking command or edit safety"
-        }
-      ]
-    }
-  ],
-  "PostToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/usr/bin/python3 \"$repo/.codex/hooks/post_tool_use_review.py\"",
-          "timeout": 30,
-          "statusMessage": "Reviewing Bash side effects"
-        }
-      ]
-    }
-  ],
-  "Stop": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/usr/bin/python3 \"$repo/.codex/hooks/stop_summary.py\"",
-          "timeout": 30,
-          "statusMessage": "Summarizing session changes"
-        }
-      ]
-    }
-  ]
-}
-EOF
-}
-
 install_repo_hooks() {
-  local repo hooks_dir script src target
-  repo="$1"
-  hooks_dir="$repo/.codex/hooks"
-  mkdir -p "$hooks_dir"
-  for script in pre_tool_use_policy.py post_tool_use_review.py stop_summary.py token_risk_warn.py; do
-    src="$HOOKS_ROOT/$script"
-    target="$hooks_dir/$script"
-    if [[ -e "$target" || -L "$target" ]]; then
-      local backup
-      backup_path "$target" >/dev/null || true
-      rm -rf "$target"
-    fi
-    ln -s "$src" "$target"
-  done
-  write_repo_hooks_json "$repo"
-}
-
-write_runtime_hooks_json() {
-  local runtime hooks_json
-  runtime="$(current_codex_home)"
-  hooks_json="$runtime/hooks.json"
-  mkdir -p "$runtime"
-  if [[ -e "$hooks_json" ]]; then
-    backup_path "$hooks_json" >/dev/null || true
-  fi
-  cat > "$hooks_json" <<EOF
-{
-  "PreToolUse": [
-    {
-      "matcher": "Bash|Edit|Write|apply_patch",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/usr/bin/python3 \"$runtime/hooks/pre_tool_use_policy.py\"",
-          "timeout": 30,
-          "statusMessage": "Checking command or edit safety"
-        }
-      ]
-    }
-  ],
-  "PostToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/usr/bin/python3 \"$runtime/hooks/post_tool_use_review.py\"",
-          "timeout": 30,
-          "statusMessage": "Reviewing Bash side effects"
-        }
-      ]
-    }
-  ],
-  "Stop": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "/usr/bin/python3 \"$runtime/hooks/stop_summary.py\"",
-          "timeout": 30,
-          "statusMessage": "Summarizing session changes"
-        }
-      ]
-    }
-  ]
-}
-EOF
-}
-
-install_runtime_hooks() {
-  local runtime hooks_dir script src target
-  runtime="$(current_codex_home)"
-  hooks_dir="$runtime/hooks"
-  mkdir -p "$hooks_dir"
-  for script in pre_tool_use_policy.py post_tool_use_review.py stop_summary.py token_risk_warn.py; do
-    src="$HOOKS_ROOT/$script"
-    target="$hooks_dir/$script"
-    if [[ -e "$target" || -L "$target" ]]; then
-      backup_path "$target" >/dev/null || true
-      rm -rf "$target"
-    fi
-    ln -s "$src" "$target"
-  done
-  write_runtime_hooks_json
-}
-
-print_doctor() {
-  local repo runtime legacy user_config repo_config repo_hooks runtime_hooks
-  repo="$(repo_root)"
-  runtime="$(current_codex_home)"
-  legacy="$(legacy_codex_home)"
-  user_config="$ACCOUNT_HOME/.codex/config.toml"
-  repo_config="$repo/.codex/config.toml"
-  repo_hooks="$repo/.codex/hooks.json"
-  runtime_hooks="$runtime/hooks.json"
-  echo "codex_version=$(codex --version 2>/dev/null || true)"
-  echo "cdx_agent_path=$SELF_PATH"
-  echo "legacy_wrapper_path=$LEGACY_WRAPPER"
-  echo "resolved_repo=$repo"
-  echo "repo_name=$(repo_name)"
-  echo "default_codex_home=$runtime"
-  echo "legacy_codex_home=$legacy"
-  echo "current_env_codex_home=${CODEX_HOME:-}"
-  echo "default_sandbox=$( [[ "$ACCESS_MODE" == "safe" ]] && echo workspace-write || echo danger-full-access )"
-  echo "default_approval=on-request"
-  echo "default_approvals_reviewer=auto_review"
-  echo "profiles=none"
-  echo "global_tools_root=$TOOLS_ROOT"
-  echo "repo_graph_pythonpath=$REPO_GRAPH_PYTHONPATH"
-  echo "active_config_user=$user_config $( [[ -f "$user_config" ]] && echo present || echo missing )"
-  echo "active_config_runtime=$runtime/config.toml $( [[ -f "$runtime/config.toml" ]] && echo present || echo missing )"
-  echo "active_config_repo=$repo_config $( [[ -f "$repo_config" ]] && echo present || echo missing )"
-  echo "runtime_agents=$runtime/AGENTS.md $( [[ -f "$runtime/AGENTS.md" ]] && echo present || echo missing )"
-  echo "repo_agents=$repo/AGENTS.md $( [[ -f "$repo/AGENTS.md" ]] && echo present || echo missing )"
-  echo "runtime_skills=$runtime/skills $( [[ -d "$runtime/skills" ]] && echo present || echo missing )"
-  echo "global_skills=$TOOLS_ROOT/skills $( [[ -d "$TOOLS_ROOT/skills" ]] && echo present || echo missing )"
-  echo "skills_approved=$TOOLS_ROOT/skills_approved $( [[ -d "$TOOLS_ROOT/skills_approved" ]] && echo present || echo missing )"
-  echo "skills_custom=$TOOLS_ROOT/skills_custom $( [[ -d "$TOOLS_ROOT/skills_custom" ]] && echo present || echo missing )"
-  echo "skills_quarantine=$TOOLS_ROOT/skills_quarantine $( [[ -d "$TOOLS_ROOT/skills_quarantine" ]] && echo present || echo missing )"
-  echo "user_agents_skills=$ACCOUNT_HOME/.agents/skills $( [[ -d "$ACCOUNT_HOME/.agents/skills" ]] && echo present || echo missing )"
-  echo "workspace_manifest_root=$WORKSPACE_MANIFEST_ROOT $( [[ -d "$WORKSPACE_MANIFEST_ROOT" ]] && echo present || echo missing )"
-  echo "workspace_mirror_root=$WORKSPACE_MIRROR_ROOT $( [[ -d "$WORKSPACE_MIRROR_ROOT" ]] && echo present || echo missing )"
-  echo "skills_validation=$(skill_validation_summary)"
-  echo "runtime_hooks=$runtime_hooks $( [[ -f "$runtime_hooks" ]] && echo present || echo missing )"
-  echo "repo_hooks=$repo_hooks $( [[ -f "$repo_hooks" ]] && echo present || echo missing )"
-  echo "repo_graph=$repo/.codex_graph/context_pack.md $( [[ -f "$repo/.codex_graph/context_pack.md" ]] && echo present || echo missing )"
-  echo "workspace_config=$repo/.codex_graph/workspace.yaml $( [[ -f "$repo/.codex_graph/workspace.yaml" ]] && echo present || echo missing )"
-  echo "workspace_graph=$repo/.codex_graph/workspace_context_pack.md $( [[ -f "$repo/.codex_graph/workspace_context_pack.md" ]] && echo present || echo missing )"
-  echo "pth_link=$SITE_PTH $( [[ -f "$SITE_PTH" ]] && echo present || echo missing )"
-  echo "token_tools_root=$TOKEN_TOOLS_ROOT $( [[ -d "$TOKEN_TOOLS_ROOT" ]] && echo present || echo missing )"
-  echo "token_saver_default=off"
-  # Codex binary/symlink, CLI version vs installed releases, configured + offload model in
-  # models_cache.json. Local files only: no network, never runs `codex update`.
-  cdx_agent_mod offload --doctor 2>&1 || echo "codex_checks=FAILED (python3 -m cdx_agent.offload --doctor)"
-}
-
-print_token_doctor() {
-  local repo runtime repo_hooks runtime_hooks runtime_agents
-  repo="$(repo_root)"
-  runtime="$(current_codex_home)"
-  repo_hooks="$repo/.codex/hooks.json"
-  runtime_hooks="$runtime/hooks.json"
-  runtime_agents="$runtime/AGENTS.md"
-  echo "rtk=$(have_cmd rtk && command -v rtk || echo missing)"
-  echo "ccusage=$(have_cmd ccusage && command -v ccusage || echo missing)"
-  echo "tokscale=$(have_cmd tokscale && command -v tokscale || echo missing)"
-  echo "repo=$repo"
-  echo "codex_home=$runtime"
-  echo "context_pack=$( [[ -f "$repo/.codex_graph/context_pack.md" ]] && echo present || echo missing )"
-  echo "skills_validation=$(skill_validation_summary)"
-  echo "base_agents_token_rules=$(token_rules_present_in_file "$BASE_AGENTS_TEMPLATE" && echo present || echo missing)"
-  echo "runtime_agents_token_rules=$(token_rules_present_in_file "$runtime_agents" && echo present || echo missing)"
-  echo "repo_hooks_token_warnings=$( [[ -f "$repo_hooks" ]] && grep -Eq 'pre_tool_use_policy.py|token_risk_warn.py' "$repo_hooks" && echo present || echo missing )"
-  echo "runtime_hooks_token_warnings=$( [[ -f "$runtime_hooks" ]] && grep -Eq 'pre_tool_use_policy.py|token_risk_warn.py' "$runtime_hooks" && echo present || echo missing )"
-  echo
-  echo "detected_session_dirs"
-  detected_session_dirs | sed 's/^/- /' || true
-  echo
-  echo "recent_session_jsonl_count_30d=$(recent_session_jsonl_count)"
-  echo "largest_recent_session_files"
-  if ! print_recent_session_file_table largest | sed 's/^/- /'; then
-    echo "- none"
-  fi
-  echo
-  echo "likely_token_risk_folders"
-  find "$repo" -maxdepth 3 -type d \( \
-    -name logs -o -name outputs -o -name checkpoints -o -name ckpts -o -name wandb -o -name runs -o \
-    -name data -o -name datasets -o -name videos -o -name media -o -name __pycache__ -o -name .git \
-  \) 2>/dev/null | sed 's/^/- /' || true
+  # One hook writer: the Python package (all six hooks, codex layout under <repo>/.codex).
+  cdx_agent_py install-hooks --repo "$1" --engine codex
 }
 
 tool_install_command() {
@@ -1431,8 +415,6 @@ tool_install_command() {
     rtk)
       if have_cmd cargo; then
         printf 'cargo install --root %q --git https://github.com/rtk-ai/rtk' "$ACCOUNT_HOME/.local"
-      elif have_cmd curl; then
-        printf 'curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh'
       fi
       ;;
     ccusage)
@@ -1466,6 +448,10 @@ install_one_token_tool() {
   cmd="$(tool_install_command "$tool")"
   if [[ -z "$cmd" ]]; then
     echo "$tool install skipped: no supported package manager detected."
+    case "$tool" in
+      rtk) echo "  manual install: git clone https://github.com/rtk-ai/rtk, read its install.sh, then build with cargo (cdx-agent never runs curl | sh)." ;;
+      *) echo "  manual install: install node/npm (or bun/pnpm), then run: npm install --prefix ~/.local $tool" ;;
+    esac
     return 0
   fi
   echo "install_command[$tool]=$cmd"
@@ -1485,30 +471,6 @@ install_token_tools() {
   echo
   echo "tokscale_status=$(have_cmd tokscale && echo installed || echo missing)"
   install_one_token_tool tokscale
-}
-
-run_validate_skills() {
-  if [[ ! -f "$SKILL_VALIDATOR_SCRIPT" ]]; then
-    echo "Skill validator missing: $SKILL_VALIDATOR_SCRIPT" >&2
-    exit 1
-  fi
-  python3 "$SKILL_VALIDATOR_SCRIPT"
-}
-
-run_skills_list() {
-  if [[ ! -f "$SKILL_VALIDATOR_SCRIPT" ]]; then
-    echo "Skill validator missing: $SKILL_VALIDATOR_SCRIPT" >&2
-    exit 1
-  fi
-  python3 "$SKILL_VALIDATOR_SCRIPT" --list
-}
-
-run_skills_audit() {
-  if [[ ! -f "$SKILL_VALIDATOR_SCRIPT" ]]; then
-    echo "Skill validator missing: $SKILL_VALIDATOR_SCRIPT" >&2
-    exit 1
-  fi
-  python3 "$SKILL_VALIDATOR_SCRIPT" --audit
 }
 
 should_use_rtk_for_command() {
@@ -1571,61 +533,6 @@ summarize_raw_output() {
     --command "$command_text" \
     --exit-code "$exit_code" \
     > "$summary_file"
-}
-
-run_usage_grouped_fallback() {
-  local fmt="$1"
-  local label="$2"
-  local runtime files
-  runtime="$(current_codex_home)"
-  files="$(session_jsonl_files || true)"
-  echo "ccusage unavailable; fallback $label report based on local session file mtimes."
-  while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    date -d "@$(stat -c %Y "$file" 2>/dev/null || echo 0)" +"$fmt" 2>/dev/null || true
-  done <<< "$files" | sort | uniq -c
-  if [[ -z "$files" ]]; then
-    echo "No session JSONL files detected under current Codex roots."
-  fi
-  echo "CODEX_HOME=$runtime"
-}
-
-run_usage_session_fallback() {
-  local runtime
-  runtime="$(current_codex_home)"
-  echo "ccusage unavailable or unsupported; fallback session file report."
-  print_recent_session_file_table mtime || true
-  echo "CODEX_HOME=$runtime"
-}
-
-run_usage_daily() {
-  if have_cmd ccusage; then
-    ccusage codex daily && return 0
-    echo "ccusage codex daily failed; falling back."
-  else
-    echo "ccusage is not installed. Suggestion: cdx-agent --install-token-tools"
-  fi
-  run_usage_grouped_fallback "%F" "daily"
-}
-
-run_usage_month() {
-  if have_cmd ccusage; then
-    ccusage codex monthly && return 0
-    echo "ccusage codex monthly failed; falling back."
-  else
-    echo "ccusage is not installed. Suggestion: cdx-agent --install-token-tools"
-  fi
-  run_usage_grouped_fallback "%Y-%m" "monthly"
-}
-
-run_usage_session() {
-  if have_cmd ccusage; then
-    ccusage codex session && return 0
-    echo "ccusage codex session failed; falling back."
-  else
-    echo "ccusage is not installed. Suggestion: cdx-agent --install-token-tools"
-  fi
-  run_usage_session_fallback
 }
 
 run_context_budget() {
@@ -1722,7 +629,7 @@ cdx_agent_py() {
   PYTHONPATH="$CDX_AGENT_PYTHONPATH" python3 -m cdx_agent "$@"
 }
 
-# Run one standalone cdx_agent module, e.g. `cdx_agent_mod offload --doctor`
+# Run one standalone cdx_agent module, e.g. `cdx_agent_mod offload --help`
 # (offload, notify, move_verify, gpu_lock, brief; each has its own --help).
 cdx_agent_mod() {
   local mod="$1"
@@ -1798,43 +705,14 @@ run_graph_only() {
   run_repo_graph_build "$repo"
 }
 
-run_install_hooks() {
-  local repo runtime
-  repo="$(repo_root)"
-  runtime="$(current_codex_home)"
-  case "$INSTALL_TARGET" in
-    auto)
-      if is_git_repo; then
-        confirm_or_die "Install repo-local hooks in $repo/.codex?"
-        install_repo_hooks "$repo"
-      else
-        install_runtime_hooks
-      fi
-      ;;
-    repo)
-      confirm_or_die "Install repo-local hooks in $repo/.codex?"
-      install_repo_hooks "$repo"
-      ;;
-    runtime)
-      install_runtime_hooks
-      ;;
-    *)
-      echo "Unknown install target: $INSTALL_TARGET"
-      exit 1
-    ;;
-  esac
-}
-
 print_usage() {
   cat <<'EOF'
 Usage:
-  cdx-agent [options] [--] [codex args...]
+  cdx-agent [options] [--] [engine args...]
 
 Modes:
-  --doctor              Print wrapper/runtime diagnostics.
-  --session-doctor      Diagnose active/stale Codex session state for the
+  --session-doctor      Diagnose active/stale session state for the
                         current repo without killing anything.
-  --token-doctor        Inspect token tools, sessions, and token-risk hints.
   --validate-skills     Validate discovered SKILL.md files across user, runtime,
                         repo-local, and managed skill roots.
   --skills-list         List discovered skills with roots, names, and descriptions.
@@ -1847,11 +725,9 @@ Modes:
   --workspace-graph     Build the workspace-level graph pack.
   --workspace-doctor    Inspect workspace graph/config status.
   --review              Show git diff/status plus risky-path warnings.
-  --usage               Show daily token usage.
-  --usage-session       Show session token usage.
-  --usage-month         Show monthly token usage.
-  --install-token-tools Install rtk, ccusage, and tokscale if available.
-  --install-hooks       Install repo-local or runtime hooks.
+  --install-token-tools Install rtk, ccusage, and tokscale via a detected package
+                        manager (no curl | sh; prints a manual hint otherwise).
+  --install-hooks       Install repo hooks (claude: .claude/settings.json; codex: .codex/hooks.json).
   --context-budget      Print a token/context budget report for the repo.
   --compress-output     Run the remaining argv as a command, capture it,
                         and summarize the output.
@@ -1907,7 +783,7 @@ Helpers (each consumes the rest of argv; `cdx-agent --<helper> --help` for detai
                         docs/runbooks + docs/status/*todo*, changed reports/** headlines,
                         base/brief_rules.md, output contract. Capped at ~4 chars/token.
 
-GrapeRoot / Dual-Graph:
+Jobs and helpers (more of the same family, each consumes the rest of argv):
   --cpu-job [--node N] [--threads 8] [--mem 16G] [--time 2:00:00] [--wait] [--dry-run] -- CMD
                         Run CPU-heavy work (tests, replays, data generation) on the ilab node (not rlab) with the
                         most idle CPUs (sinfo), thread limits set; sbatch by default (prints job/node/log),
@@ -1931,21 +807,11 @@ GrapeRoot / Dual-Graph:
                         report headlines, open items, agent notes, resume line) to restart a long main
                         session fresh at a breakpoint. Default out: docs/status/<date>_handoff_auto.md.
                         Slurm via squeue, else ssh $CDX_SLURM_HOST (default rlab1).
-  --dg [prompt...]                  Launch Codex through GrapeRoot/Dual-Graph on
-                                    the current repo root.
-  --graperoot [prompt...]           Alias for --dg.
-  --dg-root PATH [prompt...]        Launch GrapeRoot/Dual-Graph on an explicit
-                                    root directory.
-  --graperoot-root PATH [prompt...] Alias for --dg-root.
-  --dg-workspace NAME|MANIFEST [prompt...]
-                                    Launch Codex through a symlink mirror
-                                    workspace.
-  --dg-workspace-init NAME PATH... [--force]
-                                    Create or overwrite a multi-folder workspace
-                                    manifest.
-  --dg-workspace-list               List configured workspace manifests.
-  --dg-workspace-show NAME|MANIFEST  Show resolved workspace paths.
-  --dg-workspace-clean NAME|MANIFEST Remove only the generated mirror directory.
+
+  --run [--dry-run] ... -- CMD
+                        Place and run a command: a step inside your GPU hold, a Slurm job, a westeros GPU
+                        or locally. `cdx-agent --run --help` for the routing rules.
+  --suite [...]         Per-file pytest fan-out with the test-routing map. `cdx-agent --suite --help`.
 
 Skills:
   --validate-skills                 Validate SKILL.md metadata and warnings.
@@ -1953,8 +819,11 @@ Skills:
   --skills-audit                    Audit discovered skills for risky patterns.
 
 Wrapper flags:
-  --safe                Launch Codex with workspace-write sandbox.
-  --full                Launch Codex with danger-full-access sandbox.
+  --claude              Use the Claude engine (default).
+  --codex               Use the Codex engine.
+  --secondary           Start a secondary session next to the active one.
+  --safe                Launch with the workspace-write sandbox.
+  --full                Launch with full access (default).
   --token-saver         Enable token-saving wrapper behavior.
   --no-token-saver      Disable token-saving wrapper behavior.
   --repo PATH           Target PATH for graph/context operations.
@@ -1963,11 +832,11 @@ Wrapper flags:
   --runtime             Force --install-hooks to use runtime hooks.
   --yes                 Skip confirmation prompts used by init/install modes,
                         including --init-repo --yes.
-  --dry-run             Print the Codex command without executing it.
+  --dry-run             Print the engine command without executing it (modes that support it).
   -h, --help            Show this help and exit.
 
 Session cleanup:
-  --cancel-active       If this repo has an active/stale Codex session, kill
+  --cancel-active       If this repo has an active/stale session, kill
                         matching repo/session processes, move the runtime
                         aside, and continue
   --no-cancel-active    Do not prompt for active-session cleanup; exit on
@@ -1983,26 +852,18 @@ Session cleanup:
                         shells to stop writing output (default 0)
 
 Behavior:
-  - Default mode is launch: it prepares the repo/runtime layout and runs codex.
-  - Unrecognized arguments are forwarded to codex after wrapper parsing.
-    This includes codex subcommands such as resume.
+  - Default mode is launch: it prepares the repo/runtime layout and starts the selected engine.
+  - Unrecognized arguments are forwarded to the engine after wrapper parsing.
+    This includes engine subcommands such as resume.
   - --compress-output consumes the rest of argv as the wrapped command.
-  - --offload, --notify, --move-verify, --gpu-lock, --brief, --handoff, --cpu-job, --watch, --agent-usage, --gpu-pick, --coldbank, --hash-repro and --teardown also consume the rest of argv.
-  - GrapeRoot modes honor --dry-run or CDX_DRY_RUN=1.
+  - --offload, --notify, --move-verify, --gpu-lock, --brief, --handoff, --cpu-job, --watch, --agent-usage, --gpu-pick, --coldbank, --hash-repro, --teardown, --run and --suite also consume the rest of argv.
+  - Modes that support it honor --dry-run or CDX_DRY_RUN=1.
   - --token-saver can be combined with --full or --safe.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --doctor)
-      MODE="doctor"
-      shift
-      ;;
-    --token-doctor)
-      MODE="token-doctor"
-      shift
-      ;;
     --validate-skills)
       MODE="validate-skills"
       shift
@@ -2027,93 +888,6 @@ while [[ $# -gt 0 ]]; do
       MODE="session-doctor"
       shift
       ;;
-    --dg)
-      MODE="dg"
-      shift
-      ;;
-    --graperoot)
-      MODE="graperoot"
-      shift
-      ;;
-    --dg-root)
-      MODE="dg-root"
-      shift
-      DG_ROOT_OVERRIDE="${1:-}"
-      if [[ -z "$DG_ROOT_OVERRIDE" ]]; then
-        echo "Missing path for --dg-root" >&2
-        exit 1
-      fi
-      shift
-      ;;
-    --graperoot-root)
-      MODE="graperoot-root"
-      shift
-      DG_ROOT_OVERRIDE="${1:-}"
-      if [[ -z "$DG_ROOT_OVERRIDE" ]]; then
-        echo "Missing path for --graperoot-root" >&2
-        exit 1
-      fi
-      shift
-      ;;
-    --dg-workspace)
-      MODE="dg-workspace"
-      shift
-      DG_WORKSPACE_SPEC="${1:-}"
-      if [[ -z "$DG_WORKSPACE_SPEC" ]]; then
-        echo "Missing workspace spec for --dg-workspace" >&2
-        exit 1
-      fi
-      shift
-      ;;
-    --dg-workspace-init)
-      MODE="dg-workspace-init"
-      shift
-      DG_WORKSPACE_INIT_NAME="${1:-}"
-      if [[ -z "$DG_WORKSPACE_INIT_NAME" ]]; then
-        echo "Missing workspace name for --dg-workspace-init" >&2
-        exit 1
-      fi
-      shift
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --force)
-            DG_WORKSPACE_FORCE=1
-            ;;
-          --dry-run)
-            DRY_RUN=1
-            ;;
-          *)
-            DG_WORKSPACE_INIT_PATHS+=("$1")
-            ;;
-        esac
-        shift
-      done
-      break
-      ;;
-    --dg-workspace-list)
-      MODE="dg-workspace-list"
-      shift
-      ;;
-    --dg-workspace-show)
-      MODE="dg-workspace-show"
-      shift
-      DG_WORKSPACE_SPEC="${1:-}"
-      if [[ -z "$DG_WORKSPACE_SPEC" ]]; then
-        echo "Missing workspace spec for --dg-workspace-show" >&2
-        exit 1
-      fi
-      shift
-      ;;
-    --dg-workspace-clean)
-      MODE="dg-workspace-clean"
-      shift
-      DG_WORKSPACE_SPEC="${1:-}"
-      if [[ -z "$DG_WORKSPACE_SPEC" ]]; then
-        echo "Missing workspace spec for --dg-workspace-clean" >&2
-        exit 1
-      fi
-      shift
-      ;;
     --detect-deps)
       MODE="detect-deps"
       shift
@@ -2136,18 +910,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --review)
       MODE="review"
-      shift
-      ;;
-    --usage)
-      MODE="usage"
-      shift
-      ;;
-    --usage-session)
-      MODE="usage-session"
-      shift
-      ;;
-    --usage-month)
-      MODE="usage-month"
       shift
       ;;
     --install-token-tools)
@@ -2290,134 +1052,7 @@ if [[ "$MODE" != "launch" && "$MODE" != "help" ]] && cdx_is_dry_run; then
   fi
 fi
 
-run_hash_repro() {
-  local want="" tmo=1800 log="" cmd=() a
-  set -- "${MODULE_ARGS[@]}"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --want) want="${2:-}"; shift 2 ;;
-      --timeout) tmo="${2:-}"; shift 2 ;;
-      --log) log="${2:-}"; shift 2 ;;
-      --) shift; cmd=("$@"); break ;;
-      *) echo "hash-repro: unknown argument $1 (use -- before the command)" >&2; exit 2 ;;
-    esac
-  done
-  [[ -n "$want" && ${#cmd[@]} -gt 0 ]] || { echo "usage: cdx-agent --hash-repro --want sha256:<hex|prefix> [--timeout S] [--log FILE.jsonl] -- <command...>" >&2; exit 2; }
-  local out rc
-  out="$(mktemp "${TMPDIR:-/tmp}/hash_repro.XXXXXX")"
-  CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
-    PYTHONDONTWRITEBYTECODE=1 nice -n 15 timeout "$tmo" "${cmd[@]}" >"$out" 2>&1 && rc=0 || rc=$?
-  python3 - "$want" "$rc" "$out" "$log" "${cmd[@]}" <<'PY'
-import sys, re, json, time
-want, rc, out, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-cmd = sys.argv[5:]
-txt = open(out, errors="replace").read()
-got = []
-for h in re.findall(r"sha256:[0-9a-fA-F]{8,64}", txt):
-    h = h.lower()
-    if h not in got:
-        got.append(h)
-w = want.lower()
-if not w.startswith("sha256:"):
-    w = "sha256:" + w
-ok = any(h.startswith(w) for h in got)
-print("hash-repro %s want=%s got=%s exit=%d log=%s" % ("PASS" if ok else "FAIL", want, ",".join(got) or "-", rc, out))
-if log:
-    with open(log, "a") as f:
-        f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "want": want, "got": got, "pass": ok,
-                            "cmd": cmd, "exit": rc, "out": out}) + "\n")
-sys.exit(0 if ok else 1)
-PY
-}
-
-run_teardown() {
-  local spec="${MODULE_ARGS[0]:-}" outp="" i
-  [[ -n "$spec" && -f "$spec" ]] || { echo "usage: cdx-agent --teardown SPEC.json [--out SCRIPT.sh]" >&2; exit 2; }
-  for ((i = 1; i < ${#MODULE_ARGS[@]}; i++)); do
-    case "${MODULE_ARGS[i]}" in
-      --out) outp="${MODULE_ARGS[i+1]:-}"; i=$((i+1)) ;;
-      *) echo "teardown: unknown argument ${MODULE_ARGS[i]}" >&2; exit 2 ;;
-    esac
-  done
-  python3 - "$spec" "$outp" <<'PY'
-import sys, json, os, shlex, stat
-spec_path, outp = sys.argv[1], sys.argv[2]
-s = json.load(open(spec_path))
-name = s["name"]; sess = s["tmux_session"]
-groups = s["groups"]; expect = s.get("expect", {}); busy = [str(p) for p in s.get("busy_ports", [])]
-keep = [str(p) for p in s.get("keep_listening", [])]; log = s["log"]; after = s.get("after_cmd", "")
-if not outp:
-    outp = os.path.join(os.path.dirname(os.path.abspath(spec_path)), "stop_%s.sh" % name)
-q = shlex.quote
-wins = [w for g in groups for w in g]
-exp_lines = "\n".join("EXP[%s]=%s" % (q(w), q(expect[w])) for w in wins if w in expect)
-garr = "GRP=(%s)" % " ".join(q(" ".join(g)) for g in groups)
-sh = r'''#!/usr/bin/env bash
-# Generated by cdx-agent --teardown from __SPEC__ . DRY RUN by default.
-#   bash __BASE__            # checks only
-#   CONFIRM=1 bash __BASE__  # kills windows group by group (tmux kill-window only, never kill-session)
-set -uo pipefail
-NAME=__NAME__; S=__SESS__; LOG=__LOG__
-__GARR__
-PORTS=(__PORTS__); KEEP=(__KEEP__)
-declare -A EXP
-__EXP__
-AFTER=__AFTER__
-mkdir -p "$(dirname "$LOG")"
-ev() { printf '{"t": "%s", "kind": "%s", "text": "%s"}\n' "$(date -Is)" "$1" "$2" >> "$LOG"; }
-fail=0; ok() { echo "  ok   $*"; }; bad() { echo "  FAIL $*"; fail=1; }
-nconn() { ss -tnH state established "( dport = :$1 )" 2>/dev/null | wc -l; }
-echo "== identity: each window runs what we expect"
-for g in "${GRP[@]}"; do for w in $g; do
-  sc=$(tmux list-windows -t "$S" -F '#W|#{pane_start_command}' 2>/dev/null | awk -F'|' -v w="$w" '$1==w{print $2}')
-  [ -z "$sc" ] && { echo "  gone $w (already stopped)"; continue; }
-  if [ -n "${EXP[$w]:-}" ]; then
-    grep -qF -- "${EXP[$w]}" <<< "$sc" && ok "$w" || bad "$w start command does not contain '${EXP[$w]}'"
-  else ok "$w (no expect)"; fi
-done; done
-echo "== must keep listening"
-for p in "${KEEP[@]}"; do ss -ltn | awk '{print $4}' | grep -q ":$p\$" && ok ":$p listening" || bad ":$p not listening"; done
-echo "== no connection in flight"
-for p in "${PORTS[@]}"; do
-  n=$(nconn "$p"); [ "$n" -eq 0 ] && ok "no open conn to :$p" || bad "$n open conn(s) to :$p (episode in flight?)"
-done
-[ $fail = 0 ] || { echo "ABORT: checks failed; nothing stopped"; exit 1; }
-if [ "${CONFIRM:-0}" != 1 ]; then echo "dry run OK (CONFIRM=1 to stop: ${GRP[*]})"; exit 0; fi
-ev START "stop $NAME"
-first=1
-for g in "${GRP[@]}"; do
-  for w in $g; do tmux kill-window -t "$S:$w" 2>/dev/null && ev KILL "$w"; done
-  sleep 2
-  if [ $first = 1 ]; then
-    first=0
-    for p in "${PORTS[@]}"; do
-      n=$(nconn "$p")
-      [ "$n" -eq 0 ] || { ev ABORT "open conn :$p after first group"; echo "ABORT: conn on :$p appeared; first group stopped, rest still up"; exit 1; }
-    done
-  fi
-done
-[ -n "$AFTER" ] && { bash -c "$AFTER" && ev AFTER "ran after_cmd" || ev AFTER "after_cmd failed"; }
-ev DONE "stopped $NAME"
-echo "stopped $NAME. Check ports and public endpoints."
-'''
-rep = {"__SPEC__": spec_path, "__BASE__": os.path.basename(outp), "__NAME__": q(name), "__SESS__": q(sess),
-       "__LOG__": q(log), "__GARR__": garr, "__PORTS__": " ".join(busy), "__KEEP__": " ".join(keep),
-       "__EXP__": exp_lines, "__AFTER__": q(after)}
-for k, v in rep.items():
-    sh = sh.replace(k, v)
-open(outp, "w").write(sh)
-os.chmod(outp, os.stat(outp).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-print("wrote %s" % outp)
-PY
-}
-
 case "$MODE" in
-  doctor)
-    print_doctor
-    ;;
-  token-doctor)
-    print_token_doctor
-    ;;
   validate-skills)
     cdx_agent_py validate-skills --repo "$(current_dir)"
     ;;
@@ -2441,33 +1076,6 @@ case "$MODE" in
     ;;
   init-repo)
     run_init_repo
-    ;;
-  dg)
-    cdx_run_dg "dg" "$(guarded_graph_target_dir)" "${PASSTHROUGH[@]}"
-    ;;
-  graperoot)
-    cdx_run_dg "graperoot" "$(guarded_graph_target_dir)" "${PASSTHROUGH[@]}"
-    ;;
-  dg-root)
-    cdx_run_dg "dg-root" "$(cdx_resolve_dg_root "$DG_ROOT_OVERRIDE")" "${PASSTHROUGH[@]}"
-    ;;
-  graperoot-root)
-    cdx_run_dg "graperoot-root" "$(cdx_resolve_dg_root "$DG_ROOT_OVERRIDE")" "${PASSTHROUGH[@]}"
-    ;;
-  dg-workspace)
-    cdx_run_dg_workspace "dg-workspace" "$DG_WORKSPACE_SPEC" "${PASSTHROUGH[@]}"
-    ;;
-  dg-workspace-init)
-    cdx_init_dg_workspace "$DG_WORKSPACE_INIT_NAME" "${DG_WORKSPACE_INIT_PATHS[@]}"
-    ;;
-  dg-workspace-list)
-    cdx_list_dg_workspaces
-    ;;
-  dg-workspace-show)
-    cdx_show_dg_workspace "$DG_WORKSPACE_SPEC"
-    ;;
-  dg-workspace-clean)
-    cdx_clean_dg_workspace "$DG_WORKSPACE_SPEC"
     ;;
   detect-deps)
     run_repo_graph_detect_deps "$(guarded_graph_target_dir)"
@@ -2494,15 +1102,6 @@ case "$MODE" in
   review)
     review_repo
     ;;
-  usage)
-    run_usage_daily
-    ;;
-  usage-session)
-    run_usage_session
-    ;;
-  usage-month)
-    run_usage_month
-    ;;
   install-token-tools)
     install_token_tools
     ;;
@@ -2527,12 +1126,6 @@ case "$MODE" in
     ;;
   notify)
     cdx_agent_mod notify "${MODULE_ARGS[@]}"
-    ;;
-  hash-repro)
-    run_hash_repro
-    ;;
-  teardown)
-    run_teardown
     ;;
   move-verify)
     cdx_agent_mod move_verify "${MODULE_ARGS[@]}"
@@ -2609,6 +1202,12 @@ case "$MODE" in
     else
       cdx_agent_mod gpu_lock "${MODULE_ARGS[@]}"
     fi
+    ;;
+  hash-repro)
+    cdx_agent_mod hash_repro "${MODULE_ARGS[@]}"
+    ;;
+  teardown)
+    cdx_agent_mod teardown "${MODULE_ARGS[@]}"
     ;;
   launch)
     launch_codex
