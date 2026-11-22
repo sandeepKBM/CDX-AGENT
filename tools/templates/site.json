@@ -1,0 +1,19 @@
+{
+  "user": "ss5772",
+  "user_root": "/common/users/ss5772",
+  "account_home": "/common/home/ss5772",
+  "hosts": {
+    "gateway": "rlab1",
+    "workstations": ["westeros", "arrakis"],
+    "slurm_prefixes": ["ilab", "rlab"]
+  },
+  "westeros_gpu_split": {},
+  "lock_dir": "/freespace/local/ss5772/gpu_locks",
+  "trash_roots": [
+    "/data/local/ss5772/trash",
+    "/freespace/local/ss5772/trash",
+    "/common/users/ss5772/.cdx/trash_staging",
+    "/common/home/ss5772/.cdx/trash_staging"
+  ],
+  "quota_paths": ["/common/home/ss5772", "/common/users/ss5772"]
+}
