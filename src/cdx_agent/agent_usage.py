@@ -154,6 +154,7 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
     last_tool = "-"
     last_tool_name = ""
     last_tool_command = ""
+    last_tool_key = ""
     pending_tools: Set[str] = set()
     last_record_was_tool_use = False
     anonymous_tool_pending = False
@@ -205,9 +206,11 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
                         tool_id = _tool_id(block)
                         if tool_id:
                             pending_tools.add(tool_id)
+                            last_tool_key = tool_id
                         else:
                             anonymous_tool_number += 1
-                            pending_tools.add(f"__anonymous_{anonymous_tool_number}")
+                            last_tool_key = f"__anonymous_{anonymous_tool_number}"
+                            pending_tools.add(last_tool_key)
                             anonymous_tool_pending = True
                         last_tool_name = str(block.get("name", "tool"))
                         last_tool_command = _tool_text(block)
@@ -230,7 +233,9 @@ def parse_transcript(path: Path, *, now: Optional[float] = None, idle_min: float
 
     current = time.time() if now is None else now
     minutes = max(0.0, (current - mtime) / 60.0) if mtime else 0.0
-    is_bash_wait = last_tool_name.lower() == "bash" and bool(WAIT_COMMAND.search(last_tool_command))
+    # F17: only the LAST tool use decides, and only while it has not returned (a finished sleep is not a wait).
+    is_bash_wait = (last_tool_name.lower() == "bash" and bool(WAIT_COMMAND.search(last_tool_command))
+                    and last_tool_key in pending_tools)
     no_result_wait = last_record_was_tool_use and bool(pending_tools)
     waiting = is_bash_wait or (minutes >= idle_min and no_result_wait)
     flags: List[str] = []

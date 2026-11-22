@@ -205,6 +205,29 @@ def _large_output_first_time(session_id: str) -> bool:
     return True
 
 
+def _last_context_tokens(transcript: Path) -> int | None:
+    """input + cache tokens of the last assistant message's `usage` in the transcript tail, or None."""
+    try:
+        with transcript.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 262144))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            message = json.loads(line).get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            total = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if total > 0:
+            return total
+    return None
+
+
 def _restart_nudge(payload: dict[str, Any], session_id: str) -> str | None:
     transcript_value = payload.get("transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
@@ -233,9 +256,10 @@ def _restart_nudge(payload: dict[str, Any], session_id: str) -> str | None:
     state[session_id] = level
     _write_json(path, state)
     size_mb = size / (1024 * 1024)
-    tokens = max(1, size // 4)
+    last = _last_context_tokens(transcript)
+    tokens = f"{last} tokens" if last else f"~{max(1, size // 4)} tokens"
     return (
-        f"This session's transcript is ~{size_mb:.1f} MB (~{tokens} tokens): at the next natural breakpoint "
+        f"This session's transcript is ~{size_mb:.1f} MB ({tokens}): at the next natural breakpoint "
         "write `cdx-agent --handoff --notes NOTES.md` and continue in a fresh session "
         "(every turn re-sends the whole context)."
     )

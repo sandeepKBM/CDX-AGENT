@@ -13,6 +13,12 @@ Reasoning effort (policy types[t].effort = {default, max}, order low<medium<high
 gets the type default injected through hookSpecificOutput.updatedInput (needs permissionDecision "allow", so a launch that was
 "no decision" becomes an explicit allow; "ask" keeps asking with the injected input); an `effort` above the type max is an
 override and asks like a model override; an unknown value is denied.
+Subagent types (policy types[t].subagent_types, list; built-in defaults when absent: search -> Explore, claude-code-guide,
+web-fetch; run -> runner; wait -> none; other types unrestricted): a launch whose subagent_type is not allowed for its declared
+type is denied with the allowed list.
+Concurrency: running agents per session are tracked in .agent_gate_state.json beside this hook ({session_id: {key: {desc, started}}}).
+PreToolUse Agent adds an entry; entries expire after 6 h (no PostToolUse removal is wired for this hook; expiry by age only).
+With >= 4 running the launch asks (CDX_ENGINE=codex has no "ask": deny).
 Every launch is appended to ~/.claude/agent_launch_log.jsonl (machine log; AGENT_GATE_LOG overrides the path).
 """
 from __future__ import annotations
@@ -28,6 +34,10 @@ POLICY = Path(os.environ.get("AGENT_POLICY_FILE", "/common/users/ss5772/codex_to
 LOG = Path(os.environ.get("AGENT_GATE_LOG", str(Path.home() / ".claude" / "agent_launch_log.jsonl")))
 HEADER = re.compile(r"^\s*AGENT:\s*type=(?P<type>[\w-]+)\s+model=(?P<model>[\w.-]+)\s+why=(?P<why>.+?)\s*$", re.M)
 MIN_WHY = 15
+STATE = Path(__file__).resolve().with_name(".agent_gate_state.json")
+MAX_RUNNING = 4
+STATE_TTL_S = 6 * 3600
+DEFAULT_SUBAGENT_TYPES = {"search": ["Explore", "claude-code-guide", "web-fetch"], "run": ["runner"], "wait": []}
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 
@@ -81,6 +91,9 @@ def decide(payload: dict, pol: dict) -> tuple[str | None, str, dict]:
         return "deny", (f"Set the Agent `model` parameter to {model!r} (got {param!r}); without it the agent inherits the parent's model."), info
     if len(why) < MIN_WHY:
         return "deny", f"why= too short ({len(why)} chars): say why this model fits this task.", info
+    allowed_sub = types[t].get("subagent_types", DEFAULT_SUBAGENT_TYPES.get(t))
+    if isinstance(allowed_sub, list) and sub not in allowed_sub:
+        return "deny", f"subagent_type {sub!r} is not allowed for task type {t!r}; allowed: {allowed_sub}.", info
     if model not in types[t]["allowed"]:
         return _effort(types[t], ti, info, "ask", (f"OVERRIDE: type {t!r} allows {types[t]['allowed']} (default {types[t]['default']}); "
                                                    f"requested {model!r}. why: {why}"))
@@ -108,6 +121,32 @@ def _effort(spec: dict, ti: dict, info: dict, decision: str | None, reason: str)
     return decision, reason, info
 
 
+def _concurrency(payload: dict, now: float | None = None) -> int:
+    """Record this launch in the state file; return the number of agents already running in this session (before this one)."""
+    now = time.time() if now is None else now
+    sid = str(payload.get("session_id") or "unknown")
+    try:
+        state = json.loads(STATE.read_text())
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    for k in list(state):
+        entries = state[k] if isinstance(state[k], dict) else {}
+        state[k] = {e: v for e, v in entries.items() if isinstance(v, dict) and now - float(v.get("started", 0)) < STATE_TTL_S}
+        if not state[k]:
+            del state[k]
+    ti = payload.get("tool_input") or {}
+    running = len(state.get(sid, {}))
+    key = str(payload.get("tool_use_id") or f"{ti.get('description')}@{now:.3f}")
+    state.setdefault(sid, {})[key] = {"desc": str(ti.get("description") or "")[:80], "started": now}
+    try:
+        STATE.write_text(json.dumps(state))
+    except OSError:
+        pass
+    return running
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -121,6 +160,11 @@ def main() -> int:
         _out("ask", f"agent policy unreadable ({e}); approve this launch manually.")
         return 0
     decision, reason, info = decide(payload, pol)
+    if decision != "deny":
+        running = _concurrency(payload)
+        if running >= MAX_RUNNING:
+            decision = "deny" if os.environ.get("CDX_ENGINE") == "codex" else "ask"
+            reason = f"{running} agents already running in this session (limit {MAX_RUNNING}); wait for some to finish. " + reason
     _log(dict(ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"), session=payload.get("session_id"), cwd=payload.get("cwd"),
               decision=decision or "allow", reason=reason[:300], **info))
     if info.get("effort_injected") and decision != "deny":
@@ -132,4 +176,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        sys.exit(0)   # a crashing hook stalls the tool loop
