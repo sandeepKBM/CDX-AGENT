@@ -1,0 +1,1 @@
+PLAN class=slurm-step hold=700001 node=rlab4 cpus=48 gpus=0 mem=64G time=2h

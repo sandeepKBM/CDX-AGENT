@@ -1,0 +1,3 @@
+rlab2 gpu:a4000:4 gpu:a4000:1 mixed
+rlab4 gpu:a4000:4 gpu:a4000:4 allocated
+ilab1 gpu:a4000:2 gpu:a4000:0 idle

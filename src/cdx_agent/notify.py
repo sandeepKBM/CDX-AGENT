@@ -2,13 +2,15 @@
 
     python -m cdx_agent.notify EVENTS.jsonl [--routine REGEX_FILE] [--settle S] [--stale S]
         [--done-kinds END,EMPTY] [--alive FILE] [--then "CMD"] [--poll S] [--max-wait S]
+        [--from-start | --from-offset N] [--grace-s S]
 
-Starts at the current end of EVENTS and exits (printing why) on the first of:
+Starts at the current end of EVENTS (--from-start: byte 0, --from-offset N: byte N, so an END written before the
+watcher started is still seen) and exits (printing why) on the first of:
   ANOMALY      an event whose "KIND text" line matches none of the routine regexes
                (re.match, i.e. anchored at the start; done-kind events are never anomalies);
   DONE         a done-kind event was seen and SETTLE seconds passed since the first one;
-  LOGGER DOWN  the heartbeat file (default EVENTS + ".alive") is missing or older than STALE s
-               (--stale 0 disables the check);
+  LOGGER DOWN  the heartbeat file (default EVENTS + ".alive") is older than STALE s, or still missing after the
+               --grace-s grace period (default 90; NFS can show a new file late; --stale 0 disables the check);
   TIMEOUT      --max-wait seconds passed (default 0 = wait forever).
 Then it runs --then CMD (bash -c) and prints its output. It only ever opens EVENTS read-only.
 
@@ -25,6 +27,8 @@ import subprocess
 import sys
 import time
 from typing import Callable, List, Optional, Pattern, Tuple
+
+from cdx_agent import nfs
 
 EXIT_DONE, EXIT_ANOMALY, EXIT_STALE, EXIT_TIMEOUT = 0, 2, 3, 4
 
@@ -57,9 +61,9 @@ def is_routine(line: str, routine: List[Pattern[str]]) -> bool:
 class Tail:
     """Reads complete new lines appended to a file, starting at its end when created."""
 
-    def __init__(self, path: str, from_start: bool = False) -> None:
+    def __init__(self, path: str, from_start: bool = False, offset: Optional[int] = None) -> None:
         self.path = path
-        self.offset = 0 if from_start else os.path.getsize(path)
+        self.offset = max(0, offset) if offset is not None else (0 if from_start else os.path.getsize(path))
         self.truncations = 0
 
     def read_lines(self) -> List[str]:
@@ -98,10 +102,15 @@ def watch(
     max_wait: float = 0.0,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    from_start: bool = False,
+    from_offset: Optional[int] = None,
+    grace_s: float = 0.0,
 ) -> Tuple[int, str]:
-    """Blocks until a stop condition; returns (exit_code, reason)."""
+    """Blocks until a stop condition; returns (exit_code, reason).
+
+    ``grace_s``: how long a missing heartbeat file is waited for (nfs.wait_visible) before LOGGER DOWN."""
     alive = alive or events + ".alive"
-    tail = Tail(events)
+    tail = Tail(events, from_start=from_start, offset=from_offset)
     start = clock()
     first_done: Optional[float] = None
     n_done = 0
@@ -128,8 +137,11 @@ def watch(
         if stale > 0:
             age = heartbeat_age(alive, now)
             if age is None:
-                return EXIT_STALE, f"LOGGER DOWN: heartbeat {alive} missing"
-            if age > stale:
+                left = max(0.0, grace_s - (now - start))
+                if not nfs.wait_visible(alive, left, min(poll, 1.0) if poll > 0 else 1.0, clock=clock, sleep=sleep):
+                    return EXIT_STALE, f"LOGGER DOWN: heartbeat {alive} missing (waited {grace_s:.0f} s)"
+                age = heartbeat_age(alive, clock())
+            if age is not None and age > stale:
                 return EXIT_STALE, f"LOGGER DOWN: heartbeat {alive} stale ({age:.0f} s > {stale:.0f} s)"
         if first_done is not None and now - first_done >= settle:
             return EXIT_DONE, (
@@ -170,13 +182,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--then-timeout", type=float, default=300.0, help="timeout for --then in s (default 300)")
     p.add_argument("--poll", type=float, default=20.0, help="poll interval in s (default 20)")
     p.add_argument("--max-wait", type=float, default=0.0, help="give up after S seconds (default 0 = never)")
+    where = p.add_mutually_exclusive_group()
+    where.add_argument("--from-start", action="store_true", help="read EVENTS from byte 0 instead of its current end")
+    where.add_argument("--from-offset", type=int, default=None, metavar="N", help="read EVENTS from byte N")
+    p.add_argument("--grace-s", type=float, default=90.0,
+                   help="wait up to S s for EVENTS / the heartbeat to appear (NFS visibility lag; default 90)")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    if not os.path.isfile(args.events):
-        print(f"events file not found: {args.events}", file=sys.stderr)
+    if not (nfs.wait_visible(args.events, args.grace_s, min(args.poll, 1.0)) and os.path.isfile(args.events)):
+        print(f"events file not found: {args.events} (waited {args.grace_s:.0f} s)", file=sys.stderr)
         return 1
     try:
         routine = load_routine(args.routine)
@@ -188,6 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rc, why = watch(
             args.events, routine, done_kinds=done_kinds, settle=args.settle, stale=args.stale,
             alive=args.alive, poll=args.poll, max_wait=args.max_wait,
+            from_start=args.from_start, from_offset=args.from_offset, grace_s=args.grace_s,
         )
     except KeyboardInterrupt:
         print("interrupted")

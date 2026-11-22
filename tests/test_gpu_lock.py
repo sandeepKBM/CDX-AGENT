@@ -230,8 +230,8 @@ def test_dry_run_prints_srun_inside_hold_and_never_execs(tmp_path, monkeypatch, 
     assert rc == 0
     line = capsys.readouterr().out.splitlines()[0]
     argv = shlex.split(line)
-    assert argv[:4] == ["ssh", "-o", "BatchMode=yes", "rlab1"]
-    remote = shlex.split(argv[4])
+    assert argv[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "rlab1"]
+    remote = shlex.split(argv[6])
     assert remote[:7] == ["srun", "--jobid=526576", "--overlap", "--gres=gpu:a100:4", "--mem=16G", "-t", "90"]
     assert remote[7:10] == ["python3", str(WRAPPER), "node-run"]
     i = remote.index("--")
@@ -245,7 +245,7 @@ def test_dry_run_specific_gpus(monkeypatch, capsys):
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("dry-run must not exec"))
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no ssh/squeue when --gres is given"))
     assert gl.main(["526576", "--gpu", "3,1", "--gres", "gpu:a100:4", "--who", "t", "--dry-run", "--", "true"]) == 0
-    remote = shlex.split(shlex.split(capsys.readouterr().out.splitlines()[0])[4])
+    remote = shlex.split(shlex.split(capsys.readouterr().out.splitlines()[0])[6])
     opts = remote[remote.index("node-run") + 1:remote.index("--")]
     assert opts[opts.index("--gpus") + 1] == "1,3" and opts[opts.index("--n") + 1] == "2"
     for bad in (["--gpu", "4"], ["--gpu", "1,1"], ["--gpu", "x"], ["--gpu", "1,2", "--n", "3"]):
@@ -256,3 +256,52 @@ def test_submit_usage_errors(capsys):
     assert gl.main(["526576", "--gres", "gpu:a100:4", "--dry-run"]) == gl.EXIT_USAGE      # no CMD
     assert gl.main(["abc", "--gres", "gpu:4", "--dry-run", "--", "true"]) == gl.EXIT_USAGE  # bad job id
     assert gl.main(["1", "--gres", "gpu:2", "--n", "3", "--dry-run", "--", "true"]) == gl.EXIT_USAGE
+
+
+# ----------------------------------------------------------------------------------------- WP1 additions
+def test_n0_dry_run_has_no_gres_and_carries_chdir_env_loglevel(monkeypatch, capsys):
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("dry-run must not exec"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no squeue for --n 0 with --gres absent"))
+    rc = gl.main(["526576", "--n", "0", "--who", "t", "--chdir", "/work/x", "--env", "A=1", "--env", "B=two words",
+                  "--dry-run", "--", "true"])
+    assert rc == 0
+    argv = shlex.split(capsys.readouterr().out.splitlines()[0])
+    assert argv[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "rlab1"]
+    remote = shlex.split(argv[6])
+    assert remote[:3] == ["srun", "--jobid=526576", "--overlap"] and not any(a.startswith("--gres") for a in remote)
+    opts = remote[remote.index("node-run") + 1:remote.index("--")]
+    assert opts[opts.index("--n") + 1] == "0" and opts[opts.index("--chdir") + 1] == "/work/x"
+    assert [opts[i + 1] for i, o in enumerate(opts) if o == "--env"] == ["A=1", "B=two words"]
+    assert gl.main(["1", "--n", "-1", "--gres", "gpu:2", "--dry-run", "--", "true"]) == gl.EXIT_USAGE
+    assert gl.main(["1", "--n", "0", "--gpu", "1", "--dry-run", "--", "true"]) == gl.EXIT_USAGE
+
+
+def test_node_run_n0_takes_no_lock_and_applies_chdir_env(tmp_path):
+    locks = tmp_path / "locks"
+    h = Holder(_mk(locks, 0))
+    work = tmp_path / "work"
+    work.mkdir()
+    try:
+        p = _node_run(locks, "--gpus", "0-1", "--n", "0", "--chdir", str(work), "--env", "K=v1", cmd=[
+            "bash", "-c", 'echo "cwd=$PWD cvd=[$CUDA_VISIBLE_DEVICES] k=$K"; exit 4'])
+        out, err = p.communicate(timeout=60)
+    finally:
+        h.close()
+    assert p.returncode == 4, err
+    assert f"cwd={work} cvd=[] k=v1" in out
+    assert not list(locks.glob("*.owner")) and "CPU-only step" in err
+
+
+def test_status_node_comes_from_live_hold_not_rlab2(tmp_path, monkeypatch):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    ssh = fake / "ssh"
+    ssh.write_text('#!/bin/bash\necho "rlab4"\n')
+    ssh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("CDX_GPU_LOCK_NODE", raising=False)
+    assert gl.status_node("rlab1") == "rlab4"
+    ssh.write_text("#!/bin/bash\nexit 0\n")
+    assert gl.status_node("rlab1") == "rlab2"       # last resort, with a printed note
+    monkeypatch.setenv("CDX_GPU_LOCK_NODE", "rlab9")
+    assert gl.status_node("rlab1") == "rlab9"
