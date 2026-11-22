@@ -153,3 +153,10 @@ def test_mixed_targets_strictest_wins(real_policy):
     (real_policy / "keep").mkdir()
     v = dg.check("rm -rf __pycache__ keep", str(real_policy))
     assert v.action == "deny" and "tier b" in v.reason
+
+
+def test_own_session_scratch_is_tier_a(real_policy, tmp_path):
+    scratch = tmp_path / "sess-123" / "scratchpad"
+    (scratch / "junk").mkdir(parents=True)
+    assert dg.check(f"rm -r {scratch}/junk", str(real_policy), session_id="sess-123").action == "allow"
+    assert dg.check(f"rm -r {scratch}/junk", str(real_policy), session_id="other").action == "deny"

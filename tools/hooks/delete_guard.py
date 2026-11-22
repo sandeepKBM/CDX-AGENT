@@ -220,6 +220,18 @@ def audit(action: str, path: str, **fields) -> None:
         pass
 
 
+def _session_scratch(raw_paths: list[str], base: Path, session_id: str) -> Optional[Path]:
+    """This session's own scratchpad: Claude Code puts it at .../<session_id>/scratchpad."""
+    if not session_id:
+        return None
+    for raw in raw_paths:
+        p = Path(os.path.abspath(os.path.expanduser(raw) if os.path.isabs(os.path.expanduser(raw)) else base / raw))
+        for anc in [p, *p.parents]:
+            if anc.name == "scratchpad" and anc.parent.name == session_id:
+                return anc
+    return None
+
+
 def check(command: str, cwd: Optional[str] = None, session_id: str = "", agent_id: str = "") -> Optional[Verdict]:
     parsed = parse(command)
     if not (parsed.paths or parsed.unparsable or parsed.git_worktree):
@@ -233,7 +245,8 @@ def check(command: str, cwd: Optional[str] = None, session_id: str = "", agent_i
                                f"`{RM_HINT} PATH...` (trash, restorable), or `{RM_HINT} --dry-run PATH...` to see tiers.")
     try:
         delete_policy, inuse = _load_policy_module()
-        ctx = delete_policy.default_ctx(base, in_use=lambda p: inuse.in_use(p, local_only=True))
+        ctx = delete_policy.default_ctx(base, in_use=lambda p: inuse.in_use(p, local_only=True),
+                                        session_scratch=_session_scratch(parsed.paths, base, session_id))
     except Exception as e:  # fail closed for deletes only
         audit("denied", "", tier="?", rule_id="classifier_unavailable", reason=repr(e)[:200], **log)
         return Verdict("deny", f"cdx-agent delete policy: classifier unavailable ({type(e).__name__}); "
