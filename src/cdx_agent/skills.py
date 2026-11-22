@@ -28,7 +28,7 @@ from typing import Literal
 from .config import Config, backup_path, load_config, repo_root
 
 DEFAULT_DESC_MIN_WORDS = 6
-DEFAULT_DESC_MAX_CHARS = 220
+DEFAULT_DESC_MAX_CHARS = 1024  # spec 8.1: hard limit is a reason in _spec_checks
 AUDIT_CACHE_FILENAME = "skill_audit_cache.json"
 
 AUDIT_RULES: tuple[tuple[str, str, str, re.Pattern], ...] = (
@@ -381,7 +381,60 @@ def parse_skill_frontmatter(path: Path) -> SkillMeta:
         if len(description) > DEFAULT_DESC_MAX_CHARS:
             warnings.append("description is long; consider tightening it")
 
+    _spec_checks(path, text, name, description, reasons, warnings)
     return SkillMeta(name=name, description=description, reasons=reasons, warnings=warnings)
+
+
+NAME_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+FLAG_RE = re.compile(r"cdx-agent\s+(--[a-z][a-z0-9-]*)")
+ABS_PATH_RE = re.compile(r"(?<![\w.~$<{])(/(?:common|data|filer)/[\w./-]+)")
+TIME_FACT_RES = (re.compile(r"~?\d+ ?(?:GB|G) free"), re.compile(r"\d+-GPU cap"), re.compile(r"verified 20\d\d-"))
+
+
+def _spec_checks(path: Path, text: str, name: str, description: str, reasons: list[str], warnings: list[str]) -> None:
+    """Spec 2026-11-20 section 8.1 item 2 (validator). Reasons fail validation; warnings are printed."""
+    if name and not NAME_RE.match(name):
+        reasons.append("name must be <= 64 chars of lowercase letters, digits, hyphens")
+    if len(description) > 1024:
+        reasons.append(f"description is {len(description)} chars (> 1024)")
+    if description and not re.search(r"\bUse (when|before)\b", description):
+        warnings.append("description has no 'Use when' / 'Use before' trigger")
+    n_lines = text.count("\n") + 1
+    if n_lines >= 500:
+        reasons.append(f"SKILL.md has {n_lines} lines (>= 500): move details to references/")
+    try:
+        baks = sorted(q.name for q in path.parent.rglob("*") if ".bak" in q.name)
+    except OSError:
+        baks = []
+    if baks:
+        warnings.append(f".bak files in the skill dir: {', '.join(baks[:3])}")
+    try:
+        from . import modes
+        unknown = sorted({f for f in FLAG_RE.findall(text) if modes.lookup(f) is None})
+    except Exception:
+        unknown = []
+    if unknown:
+        reasons.append(f"unknown cdx-agent flags: {', '.join(unknown)}")
+    missing = []
+    for raw in sorted(set(ABS_PATH_RE.findall(text))):
+        cand = raw.rstrip(".,;:)`'\"")
+        if any(ch in cand for ch in "*<>") or "$" in cand:
+            continue
+        if not os.path.exists(cand):
+            missing.append(cand)
+    if missing:
+        warnings.append(f"paths that do not exist: {', '.join(missing[:4])}" + (" ..." if len(missing) > 4 else ""))
+    for rx in TIME_FACT_RES:
+        m = rx.search(text)
+        if m:
+            warnings.append(f"time-dependent fact '{m.group(0)}': use !`cdx-agent --site-facts || true`")
+
+
+def check_duplicate_names(discovered: list) -> dict[str, list[str]]:
+    by: dict[str, list[str]] = {}
+    for sk in discovered:
+        by.setdefault(sk.name, []).append(str(sk.canonical_path))
+    return {k: v for k, v in by.items() if len(v) > 1}
 
 
 # --- root discovery + linking (A4 enforced-audit gate) ----------------------------------
@@ -575,10 +628,15 @@ def command_validate_skills(args) -> int:
     repo = repo_root(Path(args.repo)) if getattr(args, "repo", None) else None
     discovered = discover_skills(cfg, repo=repo)
     invalid = [skill for skill in discovered if not skill.meta.is_valid]
+    dups = check_duplicate_names(discovered)
     for skill in discovered:
         status = "valid" if skill.meta.is_valid else f"invalid ({', '.join(skill.meta.reasons)})"
         print(f"{skill.name} :: {status}")
-    return 1 if invalid else 0
+        for w in skill.meta.warnings:
+            print(f"  warning: {w}")
+    for name, paths in sorted(dups.items()):
+        print(f"{name} :: invalid (duplicate name across roots: {', '.join(paths)})")
+    return 1 if invalid or dups else 0
 
 
 __all__ = [

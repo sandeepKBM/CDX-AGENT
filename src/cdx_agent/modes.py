@@ -41,6 +41,7 @@ MODES: List[Mode] = [
     _m("--session-doctor", "report session/runtime state for this repo", "diagnostics", "python", "cli"),
     _m("--workspace-doctor", "workspace graph checks", "diagnostics"),
     _m("--validate-skills", "validate skills", "skills"),
+    _m("--skills-eval", "list each skill's eval cases (the owner runs them)", "skills", "python", "skills_eval"),
     _m("--skills-list", "list skills", "skills"),
     _m("--skills-audit", "audit skills against waivers", "skills"),
     # setup
