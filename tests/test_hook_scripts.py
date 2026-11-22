@@ -290,6 +290,7 @@ def _agent_payload(prompt: str, model=None, sub=None, tool_name: str = "Agent") 
 def _gate_out(tmp_path, monkeypatch, payload):
     script = _script_copy(tmp_path, "agent_model_gate.py")
     monkeypatch.setenv("AGENT_GATE_LOG", str(tmp_path / "launch.jsonl"))
+    monkeypatch.setenv("AGENT_POLICY_FILE", str(HOOKS_DIR.parent / "templates" / "agent_policy.json"))  # not the live file
     r = _run_hook(script, payload)
     assert r.returncode == 0, r.stderr
     out = r.stdout.strip()

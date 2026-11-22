@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "updated": "2026-11-22",
+  "approved_by_user": true,
+  "approved": "2026-10-17 (user); safety-review type 2026-11-22 (user ruling Q9)",
+  "header": "First line of every Agent prompt: AGENT: type=<type> model=<model> why=<one-line justification>. The Agent tool's `model` parameter must be set to the same model (agents inherit the parent's Opus otherwise).",
+  "override": "A model outside `allowed` for the type is an override: the hook asks the user (permission prompt). Forks always ask.",
+  "models_by_cost": [
+    "haiku",
+    "sonnet",
+    "opus",
+    "fable"
+  ],
+  "types": {
+    "search": {
+      "allowed": [
+        "haiku",
+        "sonnet"
+      ],
+      "default": "haiku",
+      "use_for": "find files / symbols / usages, read-only sweeps (single lookups: Grep/Read directly, no agent)",
+      "effort": {
+        "default": "low",
+        "max": "medium"
+      }
+    },
+    "run": {
+      "allowed": [
+        "haiku",
+        "sonnet"
+      ],
+      "default": "haiku",
+      "use_for": "launch or queue jobs from a written recipe, regenerate reports from data, collect results",
+      "effort": {
+        "default": "low",
+        "max": "medium"
+      }
+    },
+    "report": {
+      "allowed": [
+        "haiku",
+        "sonnet"
+      ],
+      "default": "sonnet",
+      "use_for": "summarise finished results into tables / notes (Codex luna via cdx-agent --offload is cheaper)",
+      "effort": {
+        "default": "low",
+        "max": "medium"
+      }
+    },
+    "code-fix": {
+      "allowed": [
+        "sonnet"
+      ],
+      "default": "sonnet",
+      "use_for": "well-specified change, files and tests known (Codex luna via cdx-agent is the cheaper first choice)",
+      "effort": {
+        "default": "medium",
+        "max": "high"
+      }
+    },
+    "implement": {
+      "allowed": [
+        "sonnet"
+      ],
+      "default": "sonnet",
+      "use_for": "new flag / feature / script over a few files, with tests",
+      "effort": {
+        "default": "medium",
+        "max": "high"
+      }
+    },
+    "debug": {
+      "allowed": [
+        "sonnet"
+      ],
+      "default": "sonnet",
+      "use_for": "find the cause of a failure from logs / data / code",
+      "effort": {
+        "default": "medium",
+        "max": "high"
+      }
+    },
+    "review": {
+      "allowed": [
+        "sonnet"
+      ],
+      "default": "sonnet",
+      "use_for": "review a diff (not Codex)",
+      "effort": {
+        "default": "medium",
+        "max": "high"
+      }
+    },
+    "research": {
+      "allowed": [
+        "sonnet"
+      ],
+      "default": "sonnet",
+      "use_for": "web / literature search and summary",
+      "effort": {
+        "default": "medium",
+        "max": "high"
+      }
+    },
+    "design": {
+      "allowed": [
+        "sonnet",
+        "opus"
+      ],
+      "default": "opus",
+      "use_for": "architecture, experiment design, plans with trade-offs",
+      "effort": {
+        "default": "high",
+        "max": "xhigh"
+      }
+    },
+    "wait": {
+      "allowed": [],
+      "default": null,
+      "use_for": "never an agent: run_in_background shell loop, then cdx-agent --offload for the summary"
+    },
+    "safety-review": {
+      "allowed": [
+        "opus",
+        "sonnet"
+      ],
+      "default": "opus",
+      "use_for": "independent re-derivation of safety/dynamics math (constraints, bounds, certificates); seed with `cdx-agent --brief TARGET --focus safety-math`, never with the author's conclusions; no forks",
+      "effort": {
+        "default": "high",
+        "max": "xhigh"
+      }
+    }
+  },
+  "efforts": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+  ],
+  "effort_note": "The Agent tool's `effort` parameter: when omitted the gate sets the type default (updatedInput); above the type max it asks the user (override), like models."
+}

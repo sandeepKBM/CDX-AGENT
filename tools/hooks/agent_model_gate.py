@@ -30,7 +30,18 @@ import sys
 import time
 from pathlib import Path
 
-POLICY = Path(os.environ.get("AGENT_POLICY_FILE", "/common/users/ss5772/codex_tools/base/agent_policy.json"))
+def _policy_path() -> Path:
+    """AGENT_POLICY_FILE, else the live policy, else the repo template beside this hook (a fresh checkout or CI)."""
+    env = os.environ.get("AGENT_POLICY_FILE")
+    if env:
+        return Path(env)
+    live = Path("/common/users/ss5772/codex_tools/base/agent_policy.json")
+    if live.is_file():
+        return live
+    return Path(os.path.realpath(__file__)).parent.parent / "templates" / "agent_policy.json"
+
+
+POLICY = _policy_path()
 LOG = Path(os.environ.get("AGENT_GATE_LOG", str(Path.home() / ".claude" / "agent_launch_log.jsonl")))
 HEADER = re.compile(r"^\s*AGENT:\s*type=(?P<type>[\w-]+)\s+model=(?P<model>[\w.-]+)\s+why=(?P<why>.+?)\s*$", re.M)
 MIN_WHY = 15

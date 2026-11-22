@@ -79,7 +79,7 @@ def test_resolve_worktree(repo):
 
 
 def test_prepare_launch_adds_stale_line_and_filters_sections(repo, tmp_path, capsys):
-    from tests.test_launch import _cfg  # type: ignore
+    from test_launch import _cfg  # type: ignore  (tests/ is on sys.path; the repo root is not under plain `pytest`)
     cfg = _cfg(tmp_path)
     (cfg.tools_root / "base").mkdir(parents=True)
     (cfg.tools_root / "base" / "AGENTS.md").write_text("# Keep\nk\n# Served deployments\ndrop\n")
