@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -102,23 +103,75 @@ class AuditResult:
         return "clean"
 
 
-_NEGATION_RE = re.compile(r"\b(?:do\s+not|don'?t|never|avoid|not)\b[^.]*$", re.IGNORECASE)
+# Words that make a prose mention a *description* of a rule rather than an
+# instruction to run it ("the hook blocks `rm -rf`", "never run pip install").
+_NEGATION_RE = re.compile(
+    r"\b(?:block|blocks|blocked|denied|deny|refuse|hook|never|not|don'?t|do\s+not|instead\s+of|avoid)\b",
+    re.IGNORECASE,
+)
+_URL_HOST_RE = re.compile(r"https?://([^/\s'\"`)]+)", re.IGNORECASE)
+_LOCAL_HOST_RE = re.compile(r"^(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\$\{?\w+\}?)(?::[^/]*)?$", re.IGNORECASE)
+_DOWNLOAD_RULES = {"curl download", "wget download"}
+DEFAULT_WAIVERS_PATH = Path("/common/users/ss5772/codex_tools/base/skill_waivers.json")
 
 
-def audit_skill_text(path: Path, text: str) -> AuditResult:
+def _only_local_urls(line: str) -> bool:
+    hosts = _URL_HOST_RE.findall(line)
+    return bool(hosts) and all(_LOCAL_HOST_RE.match(h) for h in hosts)
+
+
+def load_skill_waivers() -> list[dict]:
+    """Waivers: env CDX_SKILL_WAIVERS, else DEFAULT_WAIVERS_PATH, else none.
+
+    JSON list of objects, e.g.::
+
+        [{"skill": "my-skill", "rule": "pip install",
+          "line_sha256": "<sha256 of the stripped line>",
+          "approved_by": "ss5772", "date": "2026-11-22"}]
+
+    A finding is dropped when skill name, rule id and line hash all match, so
+    editing the line invalidates the waiver.
+    """
+    env = os.environ.get("CDX_SKILL_WAIVERS")
+    path = Path(env) if env else DEFAULT_WAIVERS_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [w for w in data if isinstance(w, dict)] if isinstance(data, list) else []
+
+
+def _waiver_signature() -> str:
+    return _content_hash(json.dumps(load_skill_waivers(), sort_keys=True))
+
+
+def audit_skill_text(path: Path | None, text: str, skill: str | None = None) -> AuditResult:
+    if skill is None:
+        skill = path.parent.name if path is not None and path.name == "SKILL.md" else ""
+    waived = {(w.get("skill"), w.get("rule"), w.get("line_sha256")) for w in load_skill_waivers()}
     findings = []
+    in_fence = False
     for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
         for severity, rule_name, message, pattern in AUDIT_RULES:
             match = pattern.search(line)
             if not match:
                 continue
+            if rule_name in _DOWNLOAD_RULES and _only_local_urls(line):
+                continue  # readiness probe against a local/variable host, not a download
             effective = severity
-            if severity == "critical" and _NEGATION_RE.search(line[: match.start()]):
-                # Cautionary prose ("do NOT run pip install") is guidance, not
-                # an instruction to execute -- hard-blocking it would punish
-                # exactly the skills that warn against the dangerous pattern.
+            runs_it = in_fence or stripped.startswith(("$ ", "! "))
+            if severity == "critical" and not runs_it and _NEGATION_RE.search(line):
+                # Prose describing or warning against a rule ("the hook blocks
+                # `rm -rf`", "do NOT run pip install") is guidance, not an
+                # instruction to execute.
                 effective = "warning"
-            findings.append(AuditFinding(effective, rule_name, message, line_no, line.strip()))
+            if (skill, rule_name, hashlib.sha256(stripped.encode("utf-8")).hexdigest()) in waived:
+                continue
+            findings.append(AuditFinding(effective, rule_name, message, line_no, stripped))
     return AuditResult(path=path, findings=tuple(findings))
 
 
@@ -157,13 +210,13 @@ def _save_cache(config: Config, cache: dict) -> None:
     path.write_text(json.dumps(cache, indent=2, sort_keys=True))
 
 
-def audit_skill_cached(config: Config, path: Path) -> AuditResult:
+def audit_skill_cached(config: Config, path: Path, skill: str | None = None) -> AuditResult:
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError as exc:
         return AuditResult(path=path, findings=(AuditFinding("critical", "unreadable", str(exc), 0, ""),))
 
-    digest = _content_hash(text)
+    digest = _content_hash(text + "\0" + _waiver_signature() + "\0" + (skill or ""))
     cache = _load_cache(config)
     key = str(path)
     entry = cache.get(key)
@@ -171,7 +224,7 @@ def audit_skill_cached(config: Config, path: Path) -> AuditResult:
         findings = tuple(AuditFinding(**f) for f in entry.get("findings", []))
         return AuditResult(path=path, findings=findings)
 
-    result = audit_skill_text(path, text)
+    result = audit_skill_text(path, text) if skill is None else audit_skill_text(path, text, skill=skill)
     cache[key] = {
         "hash": digest,
         "findings": [
@@ -211,7 +264,7 @@ def audit_skill_dir(config: Config, skill_dir: Path) -> AuditResult:
     for candidate in candidates:
         if not candidate.is_file():
             continue
-        result = audit_skill_cached(config, candidate)
+        result = audit_skill_cached(config, candidate, skill=skill_dir.name)
         rel = str(candidate.relative_to(skill_dir))
         for finding in result.findings:
             findings.append(

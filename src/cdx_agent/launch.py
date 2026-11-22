@@ -237,6 +237,15 @@ def prepare_launch(
                 config, resolved_repo, rctx.skills_dir, allowlist=skill_allowlist, engine=engine
             )
         )
+        for decision in link_decisions:
+            if decision.action != "blocked" or decision.audit is None:
+                continue
+            crit = next((f for f in decision.audit.findings if f.severity == "critical"), None)
+            if crit is not None:
+                print(
+                    f"cdx-agent: blocked skill {decision.skill_name} ({crit.rule_name} line {crit.line_no})",
+                    file=sys.stderr,
+                )
         working_rules = context_docs.load_working_rules_template(config)
         rendered_rules = context_docs.render_working_rules(working_rules, token_saver=token_saver)
         rendered_rules = context_docs.filter_global_sections(
@@ -279,6 +288,31 @@ class LaunchOutcome:
     exit_code: int | None
 
 
+def start_trash_maintenance(popen=subprocess.Popen) -> bool:
+    """Decision Q2 (2026-11-20): drain staging and purge expired, non-critical trash at each launch, detached.
+
+    Critical (protected-origin) entries are never auto-purged. Skipped when CDX_TRASH_AUTO=0 or when no trash index
+    exists yet. Output goes to <index dir>/maintenance.log; failures never affect the launch.
+    """
+    if os.environ.get("CDX_TRASH_AUTO", "1") == "0":
+        return False
+    try:
+        from cdx_agent import trash
+        index = Path(trash.index_path())
+        if not index.is_file():
+            return False
+        log = open(index.parent / "maintenance.log", "a")
+        script = ("import sys; from cdx_agent import trash; "
+                  "print('purged', trash.purge()); "
+                  "import os; d=trash.DEFAULT_DEST; print('drained', trash.drain(d) if os.path.isdir(d) else 'skip')")
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+        popen([sys.executable, "-c", script], stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+              start_new_session=True, env=env)
+        return True
+    except Exception:
+        return False
+
+
 def launch(
     config: Config,
     repo: Path,
@@ -307,6 +341,7 @@ def launch(
         return LaunchOutcome(prepare=prepare, exit_code=0)
 
     env = {**os.environ, **prepare.plan.env_overrides}
+    start_trash_maintenance()
     try:
         result = subprocess.run(list(prepare.plan.command), cwd=str(prepare.plan.cwd), env=env)
         exit_code = result.returncode

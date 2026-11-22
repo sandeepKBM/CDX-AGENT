@@ -9,9 +9,9 @@
 3. Verifies with `rsync -a --checksum --dry-run --itemize-changes SRC/ DST/` (must list nothing) AND equal
    file-only byte totals plus file / symlink / directory / other counts (st_size of regular files only;
    `du --apparent-size` is NOT used: directory sizes differ across NFS/ext4).
-4. On success prints VERIFIED and the exact line for the user to run, e.g.
-       ! rm -rf SRC && ln -s DST SRC
-   (a PreToolUse hook blocks agents' recursive deletes). It never deletes anything itself.
+4. On success prints VERIFIED. With --finish it then moves SRC to the trash (`cdx-agent --rm --verified-copy`:
+   a protected source becomes tier b after a verified copy, decision Q1 2026-11-22; restorable for trash.ttl_days)
+   and creates the symlink SRC -> DST. Without --finish nothing is deleted and the --finish line is printed.
 Exit codes: 0 verified, 1 copy/verify failure, 2 refused.
 """
 from __future__ import annotations
@@ -156,6 +156,26 @@ def checksum_command(src: str, dst: str) -> List[str]:
                             src.rstrip("/") + "/", dst.rstrip("/") + "/"]
 
 
+def finish_line(src: str, dst: str) -> str:
+    s = os.path.abspath(src.rstrip("/") or "/")
+    d = os.path.abspath(dst.rstrip("/") or "/")
+    return f"cdx-agent --move-verify {shlex.quote(s)} {shlex.quote(d)} --verify-only --finish"
+
+
+def finish(src: str, dst: str) -> int:
+    """Trash the verified source, then link it to the copy. Refusals keep SRC in place."""
+    from cdx_agent import trash
+    s = os.path.abspath(src.rstrip("/") or "/")
+    d = os.path.abspath(dst.rstrip("/") or "/")
+    rc = trash.rm([s], verified_copy=True)
+    if rc != 0 or os.path.lexists(s):
+        print(f"NOT FINISHED: {s} was not trashed (see above); the copy at {d} is verified and kept")
+        return EXIT_REFUSED
+    os.symlink(d, s)
+    print(f"FINISHED: {s} -> {d} (source in trash: cdx-agent --trash list)")
+    return EXIT_OK
+
+
 def user_line(src: str, dst: str) -> str:
     s = os.path.abspath(src.rstrip("/") or "/")
     d = os.path.abspath(dst.rstrip("/") or "/")
@@ -196,6 +216,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--bwlimit", type=int, help="rsync --bwlimit in KB/s")
     p.add_argument("--no-lsof", action="store_true", help="skip the open-files check under SRC")
     p.add_argument("--verify-only", action="store_true", help="skip the copy; only verify an earlier one")
+    p.add_argument("--finish", action="store_true", help="after VERIFIED: trash SRC and symlink SRC -> DST")
     args = p.parse_args(argv)
     if not shutil.which("rsync"):
         print("REFUSED: rsync not found on PATH", file=sys.stderr)
@@ -234,9 +255,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(m)
         return EXIT_FAIL
     print(f"VERIFIED {src} -> {dst}: {msgs[-1]}")
-    print("Nothing was deleted. To finish the move, the USER runs (agents' recursive deletes are hook-blocked):")
-    print(user_line(src, dst))
-    return EXIT_OK
+    if not args.finish:
+        print("Nothing was deleted. To finish (trash SRC, restorable; symlink SRC -> DST):")
+        print(finish_line(src, dst))
+        return EXIT_OK
+    return finish(src, dst)
 
 
 if __name__ == "__main__":

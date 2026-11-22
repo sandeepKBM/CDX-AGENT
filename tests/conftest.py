@@ -18,3 +18,13 @@ def _isolate_home_root(monkeypatch, tmp_path_factory):
     sentinel = tmp_path_factory.mktemp("unrelated-home-sentinel")
     monkeypatch.setattr(graph_mod, "HOME_ROOT", sentinel)
     monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: sentinel))
+
+
+@pytest.fixture(autouse=True)
+def _no_live_state(monkeypatch, tmp_path_factory):
+    """Never let a test start trash maintenance, write the live audit log, or read/append the live values ledger."""
+    root = tmp_path_factory.mktemp("cdx-state")
+    monkeypatch.setenv("CDX_TRASH_AUTO", "0")
+    monkeypatch.setenv("CDX_AUDIT_DIR", str(root / "audit"))
+    monkeypatch.setenv("CDX_TRASH_INDEX", str(root / "trash" / "index.jsonl"))
+    monkeypatch.setenv("CDX_VALUES_FILE", str(root / "values.jsonl"))

@@ -40,3 +40,4 @@ Thumbs.db
 /site/
 *.bak-*
 *.bak.*
+/.claude/worktrees/

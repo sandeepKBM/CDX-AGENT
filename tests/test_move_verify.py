@@ -32,8 +32,7 @@ def test_happy_path_prints_verified_and_user_line(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == mv.EXIT_OK, out
     assert "VERIFIED" in out and "2 files, 4102 bytes" in out and "1 symlinks" in out
-    expected = f"! rm -rf {shlex.quote(str(src))} && ln -s {shlex.quote(str(dst))} {shlex.quote(str(src))}"
-    assert out.rstrip().splitlines()[-1] == expected
+    assert out.rstrip().splitlines()[-1] == mv.finish_line(str(src), str(dst))
     assert (src / "a" / "f1.txt").exists()  # nothing deleted
     assert (dst / "a" / "b" / "f2.bin").read_bytes() == (src / "a" / "b" / "f2.bin").read_bytes()
     assert os.readlink(dst / "link") == "a/f1.txt"
@@ -96,3 +95,39 @@ def test_copy_command_uses_idle_priority_and_bwlimit():
     cmd = mv.copy_command("/x/src/", "/y/dst", 5000)
     assert cmd[-4:] == ["-a", "--bwlimit=5000", "/x/src/", "/y/dst/"]
     assert "rsync" in cmd and "--delete" not in " ".join(cmd)
+
+
+def test_finish_trashes_source_and_links(tmp_path, monkeypatch, capsys):
+    import sys
+    import types
+    src = _tree(tmp_path / "src")
+    dst = tmp_path / "new" / "dst"
+    (tmp_path / "new").mkdir()
+    calls = []
+
+    def fake_rm(paths, verified_copy=False, **kw):
+        calls.append((paths, verified_copy))
+        os.rename(paths[0], str(tmp_path / "trashed"))
+        return 0
+    monkeypatch.setitem(sys.modules, "cdx_agent.trash", types.SimpleNamespace(rm=fake_rm))
+    import cdx_agent
+    monkeypatch.setattr(cdx_agent, "trash", sys.modules["cdx_agent.trash"], raising=False)
+    rc = mv.main([str(src), str(dst), "--no-lsof", "--finish"])
+    out = capsys.readouterr().out
+    assert rc == mv.EXIT_OK, out
+    assert calls == [([str(src)], True)]
+    assert os.readlink(src) == str(dst) and "FINISHED" in out
+
+
+def test_finish_refused_keeps_source(tmp_path, monkeypatch, capsys):
+    import sys
+    import types
+    src = _tree(tmp_path / "src")
+    dst = tmp_path / "new" / "dst"
+    (tmp_path / "new").mkdir()
+    monkeypatch.setitem(sys.modules, "cdx_agent.trash", types.SimpleNamespace(rm=lambda paths, **kw: 2))
+    import cdx_agent
+    monkeypatch.setattr(cdx_agent, "trash", sys.modules["cdx_agent.trash"], raising=False)
+    rc = mv.main([str(src), str(dst), "--no-lsof", "--finish"])
+    assert rc == mv.EXIT_REFUSED
+    assert src.is_dir() and not src.is_symlink()

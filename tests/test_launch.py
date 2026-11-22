@@ -534,3 +534,18 @@ def test_cancel_relaunch_forwards_token_saver(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert calls[0]["token_saver"] is True
     assert calls[1]["token_saver"] is True  # was silently False before the fix
+
+
+def test_trash_maintenance_detached_when_index_exists(tmp_path, monkeypatch):
+    from cdx_agent import launch as launch_mod
+    idx = tmp_path / "trash" / "index.jsonl"
+    idx.parent.mkdir()
+    monkeypatch.setenv("CDX_TRASH_INDEX", str(idx))
+    monkeypatch.setenv("CDX_TRASH_AUTO", "1")
+    calls = []
+    assert launch_mod.start_trash_maintenance(popen=lambda *a, **k: calls.append((a, k))) is False  # no index yet
+    idx.write_text("")
+    assert launch_mod.start_trash_maintenance(popen=lambda *a, **k: calls.append((a, k))) is True
+    assert calls and calls[0][1]["start_new_session"] is True and "trash.purge()" in calls[0][0][0][-1]
+    monkeypatch.setenv("CDX_TRASH_AUTO", "0")
+    assert launch_mod.start_trash_maintenance(popen=lambda *a, **k: calls.append((a, k))) is False
