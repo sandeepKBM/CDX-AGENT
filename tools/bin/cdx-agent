@@ -18,7 +18,7 @@ SITE_PTH="$ACCOUNT_HOME/.local/lib/python3.12/site-packages/codex_tools_repo_gra
 # CDX-AGENT Python package (the revamp: safety-hardened runtime/session/skills/hooks
 # provisioning, plus Claude Code launch support). Same PYTHONPATH-injection pattern as
 # REPO_GRAPH_PYTHONPATH above, so no pip install is required for bash to delegate to it.
-CDX_AGENT_PYTHONPATH="$ACCOUNT_HOME/CDX-AGENT/src"
+CDX_AGENT_PYTHONPATH="${CDX_AGENT_PYTHONPATH:-$ACCOUNT_HOME/CDX-AGENT/src}"
 DISABLED_MCP_FRAGMENT="$TOOLS_ROOT/base/mcp.repo_graph.example.toml.disabled"
 TOOLS_SKILLS_ROOT="$TOOLS_ROOT/skills"
 SKILLS_APPROVED_ROOT="$TOOLS_ROOT/skills_approved"
@@ -40,6 +40,7 @@ SECONDARY=0
 TOKEN_SAVER=0
 YES=0
 DRY_RUN=0
+SEEN_SEPARATOR=0
 DG_WORKSPACE_FORCE=0
 CANCEL_ACTIVE=0
 NO_CANCEL_ACTIVE=0
@@ -1675,7 +1676,7 @@ run_compress_output() {
   echo "summary_output=$summary_file"
   echo "exit_code=$exit_code"
   if [[ "$exit_code" -ne 0 ]]; then
-    echo "Rerun without compression if needed: cdx-agent --no-token-saver ${command_text}"
+    echo "Rerun the command directly if needed: ${command_text}"
   fi
   return "$exit_code"
 }
@@ -2159,7 +2160,7 @@ while [[ $# -gt 0 ]]; do
       COMPRESS_COMMAND=("$@")
       break
       ;;
-    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse)
+    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse|--site-facts)
       MODE="${1#--}"
       shift
       MODULE_ARGS=("$@")
@@ -2267,11 +2268,27 @@ while [[ $# -gt 0 ]]; do
       break
       ;;
     *)
+      if [[ "$1" == "--" ]]; then
+        SEEN_SEPARATOR=1
+      elif [[ "$SEEN_SEPARATOR" -eq 0 && "$1" == --* ]]; then
+        # Unknown --flag before "--": ask the mode registry for the nearest flag and stop (F13).
+        PYTHONPATH="$CDX_AGENT_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m cdx_agent.modes --check-flag "$1" || exit 2
+      fi
       PASSTHROUGH+=("$1")
       shift
       ;;
   esac
 done
+
+# Dry-run contract (F3): a mode that does not support --dry-run refuses it instead of running for real.
+if [[ "$MODE" != "launch" && "$MODE" != "help" ]] && cdx_is_dry_run; then
+  dry_rc=0
+  PYTHONPATH="$CDX_AGENT_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" python3 -m cdx_agent.modes --supports-dry-run "--$MODE" || dry_rc=$?
+  if [[ "$dry_rc" -eq 3 ]]; then
+    echo "cdx-agent: --$MODE has no dry run" >&2
+    exit 2
+  fi
+fi
 
 run_hash_repro() {
   local want="" tmo=1800 log="" cmd=() a
@@ -2544,6 +2561,9 @@ case "$MODE" in
     ;;
   inuse)
     cdx_agent_mod inuse "${MODULE_ARGS[@]}"
+    ;;
+  site-facts)
+    cdx_agent_mod site_facts "${MODULE_ARGS[@]}"
     ;;
   cpu-job)
     cdx_agent_mod cpu_job "${MODULE_ARGS[@]}"
