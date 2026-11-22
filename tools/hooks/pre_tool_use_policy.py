@@ -95,8 +95,42 @@ def _risky_targets_text(command: str) -> str | None:
 # Waiting in a foreground shell burns an LLM turn for nothing (2026-10-17: an agent's `until ! pgrep -f "pytest..."` matched
 # itself and looped 7 min). Background runs (run_in_background) notify on exit and are free, so only foreground waits are denied.
 WAIT_PID = re.compile(r"\btail\s+(-\S+\s+)*--pid[=\s]+\S|(^|[;&|]\s*)wait\s+(%\d+|\$\{?\w+\}?|\d+)(\s|;|$)|(^|[;&|]\s*)inotifywait\b")   # foreground wait on another process
-WAIT_LOOP = re.compile(r"\b(until|while)\b[^\n]*?;\s*do\b[^\n]*?\bsleep\b", re.S)
-SELF_MATCH_PGREP = re.compile(r"\bp(grep|kill)\s+(-\w+\s+)*-f\w*\s+(['\"])(?!\[)[^'\"]*\.\*[^'\"]*\3")
+LOOP = re.compile(r"\b(?P<kw>until|while)\b(?P<cond>.*?)[;\n]\s*do\b(?P<body>.*?)\bdone\b", re.S)   # single- or multi-line
+POLL_COND = re.compile(r"\b(test|grep\s+-\w*q|pgrep|kill\s+-0|ls|stat|squeue|sacct|curl|true)\b|\[|(^|\s):(\s|$)")
+BOUNDED_PREFIX = re.compile(r"\btimeout\s+(?:-\S+\s+)*(\d+)([smh]?)\s+(?:bash|sh)\s+-c\s+['\"]\s*$")
+PGREP_F = re.compile(r"\bp(?:grep|kill)\s+((?:-\S+\s+)*)(?:(['\"])(.*?)\2|(\S+))")
+MAX_BOUNDED_WAIT_S = 120
+
+
+def _foreground_wait_loop(command: str) -> bool:
+    for m in LOOP.finditer(command):
+        if not re.search(r"\bsleep\b", m["body"]) or not POLL_COND.search(m["cond"]):
+            continue
+        bound = BOUNDED_PREFIX.search(command[:m.start()])
+        if bound and int(bound[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[bound[2]] <= MAX_BOUNDED_WAIT_S:
+            continue
+        return True
+    return False
+
+
+def _self_matching_pgrep(command: str) -> bool:
+    """`pgrep/pkill -f PAT` where PAT (as a regex) matches the command text: it also matches the shell running this command."""
+    blanked = _strip_nonexecuted_quotes(command)  # same length; quoted prose (commit messages, echo) is blanked
+    heredocs = [h.span() for h in HEREDOC.finditer(command)]
+    for m in PGREP_F.finditer(command):
+        word = m.start() + len(m[0]) - len(m[0].lstrip())
+        if not blanked[word:word + 1].strip() or any(a <= word < b for a, b in heredocs):
+            continue
+        if not any(f.startswith("-") and not f.startswith("--") and "f" in f for f in m[1].split()):
+            continue
+        pat = m[3] if m[2] else m[4]
+        try:
+            if re.search(pat, command):
+                return True
+        except re.error:
+            if pat in command:
+                return True
+    return False
 
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(\n|$)", re.S)
@@ -224,10 +258,10 @@ def _strip_heredocs(command: str) -> str:
 
 def poll_guard(command: str, background: bool) -> str | None:
     """Reason to deny, or None. Foreground wait loops, and pgrep/pkill -f regexes that can match their own command line."""
-    if SELF_MATCH_PGREP.search(command):
-        return ("Blocked by cdx-agent hook: `pgrep/pkill -f '<regex>'` can match its own command line (it did, looping forever). "
+    if _self_matching_pgrep(command):
+        return ("Blocked by cdx-agent hook: `pgrep/pkill -f '<pattern>'` matches its own command line / the shell running it (it did, looping forever). "
                 "Use the bracket trick (pgrep -f '[p]ytest ...') or a PID.")
-    if not background and (WAIT_LOOP.search(_strip_heredocs(command)) or WAIT_PID.search(_strip_heredocs(command))):
+    if not background and (_foreground_wait_loop(_strip_heredocs(command)) or WAIT_PID.search(_strip_heredocs(command))):
         return ("Blocked by cdx-agent hook: foreground wait/poll loop. Run the job in the foreground with a timeout and read its output, "
                 "or launch it detached and hand the waiting back (main session: run_in_background shell watcher; agents: report and stop).")
     return None
@@ -624,6 +658,18 @@ def _token_risk_warnings(command: str) -> list[str]:
     return warnings
 
 
+def _slurm_verdict(command: str) -> str | None:
+    """Raw sbatch/srun deny (slurm_guard.py, user ruling Q6). An import failure allows (advisory-level rule)."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import slurm_guard
+        return slurm_guard.check(command)
+    except Exception:
+        return None
+
+
 def _delete_verdict(command: str, payload: dict[str, Any]):
     """Deletion tiers (delete_guard.py beside this file's real path). An import failure denies deletes only."""
     here = os.path.dirname(os.path.realpath(__file__))
@@ -661,6 +707,9 @@ def main() -> int:
         verdict = _delete_verdict(command, payload)
         if verdict is not None and verdict.action == "deny":
             return _deny(verdict.reason)
+        slurm = _slurm_verdict(command)
+        if slurm:
+            return _deny(slurm)
 
     ti = payload.get("tool_input") or {}
     poll = poll_guard(command, bool(ti.get("run_in_background")) if isinstance(ti, dict) else False)

@@ -43,9 +43,15 @@ import sys
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
+try:  # also runs as a standalone snapshot on a node (stdlib only): site facts are optional there
+    from cdx_agent import site as _site
+    _site_get = _site.get
+except ImportError:
+    def _site_get(key, default=None):
+        return default
 
-DEFAULT_LOCK_DIR = "/freespace/local/ss5772/gpu_locks"
-DEFAULT_HOST = "rlab1"
+DEFAULT_LOCK_DIR = _site_get("lock_dir", "/freespace/local/ss5772/gpu_locks")
+DEFAULT_HOST = _site_get("hosts.gateway", "rlab1")
 FALLBACK_STATUS_NODE = "rlab2"
 SHELLS = ("bash", "sh", "dash", "zsh", "ksh")
 EXIT_USAGE, EXIT_NO_LOCK, EXIT_BUSY = 2, 3, 4

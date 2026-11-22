@@ -29,17 +29,18 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from cdx_agent import site as _site
 from cdx_agent.gpu_pick import (
     _state_blocked, parse_mem_mb, parse_scontrol, parse_squeue, read_grptres, run_command, running_nodes,
 )
 
-FOOTPRINTS = "/common/users/ss5772/codex_tools/base/footprints.json"
+FOOTPRINTS = _site.get("footprints", "/common/users/ss5772/codex_tools/base/footprints.json")
 DEFAULT_UNREADABLE = ("/data/local",)
 THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "TORCH_NUM_THREADS")
 
 
 def _slurm(cmd: str, host: Optional[str]) -> list[str]:
-    host = host or os.environ.get("CDX_SLURM_HOST", "rlab1")
+    host = host or os.environ.get("CDX_SLURM_HOST", _site.get("hosts.gateway", "rlab1"))
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, cmd]
 
 
