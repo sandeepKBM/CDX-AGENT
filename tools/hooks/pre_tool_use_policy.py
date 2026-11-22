@@ -115,7 +115,12 @@ def _foreground_wait_loop(command: str) -> bool:
 
 def _self_matching_pgrep(command: str) -> bool:
     """`pgrep/pkill -f PAT` where PAT (as a regex) matches the command text: it also matches the shell running this command."""
+    blanked = _strip_nonexecuted_quotes(command)  # same length; quoted prose (commit messages, echo) is blanked
+    heredocs = [h.span() for h in HEREDOC.finditer(command)]
     for m in PGREP_F.finditer(command):
+        word = m.start() + len(m[0]) - len(m[0].lstrip())
+        if not blanked[word:word + 1].strip() or any(a <= word < b for a, b in heredocs):
+            continue
         if not any(f.startswith("-") and not f.startswith("--") and "f" in f for f in m[1].split()):
             continue
         pat = m[3] if m[2] else m[4]

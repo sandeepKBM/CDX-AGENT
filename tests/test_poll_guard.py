@@ -32,3 +32,9 @@ CASES = [
 @pytest.mark.parametrize("name,cmd,background,denied", CASES, ids=[c[0] for c in CASES])
 def test_poll_guard_table(name, cmd, background, denied):
     assert (policy.poll_guard(cmd, background) is not None) == denied
+
+
+def test_pkill_text_in_commit_message_or_heredoc_allowed():
+    assert policy.poll_guard('git commit -m "use pkill -f pytest to stop it"', False) is None
+    assert policy.poll_guard("cat > n.md <<'X'\npkill -f pytest\nX\n", False) is None
+    assert policy.poll_guard('pkill -f "pkill"', False) is not None
