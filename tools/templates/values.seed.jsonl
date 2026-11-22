@@ -1,0 +1,9 @@
+{"key": "trash.ttl_days", "value": 7, "unit": "days", "tag": "USER", "reason": "user ruling 2026-11-20", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "trash.nfs_staging_cap_gb", "value": 10, "unit": "GB", "tag": "ASSUMED", "reason": "initial cap; not measured", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "junk.scratch_age_days", "value": 14, "unit": "days", "tag": "ASSUMED", "reason": "from resource_plan R10", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "junk.bak_keep", "value": 3, "unit": "files", "tag": "ASSUMED", "reason": "initial value; not measured", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "junk.worktree_age_days", "value": 30, "unit": "days", "tag": "ASSUMED", "reason": "not chosen by user yet; placeholder", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "output_cap.lines", "value": 80, "unit": "lines", "tag": "ASSUMED", "reason": "today's value", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "output_cap.bytes", "value": 8192, "unit": "bytes", "tag": "ASSUMED", "reason": "today's value", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "output_cap.head", "value": 30, "unit": "lines", "tag": "ASSUMED", "reason": "today's value", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
+{"key": "output_cap.tail", "value": 30, "unit": "lines", "tag": "ASSUMED", "reason": "today's value", "source": "2026-11-20 cdx-agent spec", "by": "seed"}
