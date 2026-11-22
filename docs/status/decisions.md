@@ -10,6 +10,7 @@ plan: `~/.claude/plans/silly-zooming-crab-of-b4a98a3b-56de-4a81-a10e-acad1dddbb3
 ## Rulings
 | Date | # | Ruling (user's words where given) | Replaces |
 |---|---|---|---|
+| 2026-11-22 | Q4 | `--safe` sandbox enabled after the live test (results in `site/base/claude_sandbox_safe.json` `_comment`), with the base-rule line: in `--safe`, run ssh/srun/sbatch/cdx-agent as plain commands. | Q4 "ships disabled until live test" |
 | 2026-11-22 | scope | Implement all phases (0-4) of the spec, in order. | - |
 | 2026-11-22 | Q9 | Safety-math verifier runs on Opus: new agent type `safety-review` {opus, sonnet}; `review` stays Sonnet. | N7 model open |
 | 2026-11-22 | Q8 | Retire `openpi-training-diagnosis` (both copies), `repo-impact-analysis`, `checkpoint-selection` (via `--rm`). | - |
@@ -22,4 +23,3 @@ plan: `~/.claude/plans/silly-zooming-crab-of-b4a98a3b-56de-4a81-a10e-acad1dddbb3
 | 2026-11-20 | Q5 | Remove Codex-only modes and the 9 `dg` modes (+ `multi-root-context-map`). | - |
 | 2026-11-20 | Q6 | Raw `sbatch`/`srun` becomes a deny once standard launchers exist. | advisory |
 | 2026-11-20 | WP3 | Deletion tiers (a) allow-list delete+log, (b) trash, (c) user only; trash TTL 7 days. | literal `rm -rf` block |
-| 2026-11-22 | Q4 | `--safe` sandbox enabled after the live test (results in `site/base/claude_sandbox_safe.json` `_comment`), with the base-rule line: in `--safe`, run ssh/srun/sbatch/cdx-agent as plain commands. | Q4 "ships disabled until live test" |
