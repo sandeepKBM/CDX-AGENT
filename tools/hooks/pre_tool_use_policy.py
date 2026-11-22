@@ -624,6 +624,18 @@ def _token_risk_warnings(command: str) -> list[str]:
     return warnings
 
 
+def _slurm_verdict(command: str) -> str | None:
+    """Raw sbatch/srun deny (slurm_guard.py, user ruling Q6). An import failure allows (advisory-level rule)."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import slurm_guard
+        return slurm_guard.check(command)
+    except Exception:
+        return None
+
+
 def _delete_verdict(command: str, payload: dict[str, Any]):
     """Deletion tiers (delete_guard.py beside this file's real path). An import failure denies deletes only."""
     here = os.path.dirname(os.path.realpath(__file__))
@@ -661,6 +673,9 @@ def main() -> int:
         verdict = _delete_verdict(command, payload)
         if verdict is not None and verdict.action == "deny":
             return _deny(verdict.reason)
+        slurm = _slurm_verdict(command)
+        if slurm:
+            return _deny(slurm)
 
     ti = payload.get("tool_input") or {}
     poll = poll_guard(command, bool(ti.get("run_in_background")) if isinstance(ti, dict) else False)
