@@ -88,6 +88,8 @@ MODES: List[Mode] = [
     # data
     _m("--coldbank", "cold bank and per-host caches", "data", "python", "coldbank", writes=True),
     _m("--hygiene", "repo/runtime hygiene check", "data", "python", "hygiene"),
+    _m("--junk", "read-only junk scan by delete tier; apply sends rows to --rm", "data", "python", "junk", writes=True),
+    _m("--node", "node-local storage setup/status/release from .cdx/node_env.yaml", "data", "python", "node", writes=True),
     _m("--deploy", "deploy tools to the live root", "data", "python", "deploy", dry=True, writes=True),
     _m("--value", "value records", "data", "python", "values", writes=True),
     _m("--rm", "move files to trash instead of deleting", "data", "python", "trash", dry=True, writes=True),
