@@ -1,0 +1,17 @@
+# .cdx/node_env.yaml: what a node-local run needs, and what to bring back. Used by `cdx_agent.node setup|status|release`.
+project: myproject            # node root: /freespace/local/$USER/myproject (override with --root)
+items:
+  - name: py-env              # reused when <dest>/.entry.json matches
+    source: coldbank:py311-torch-env
+    dest: env/py311
+    # sha256: <tree digest>   # optional; sha256 of the sorted "<sha256>  <relpath>" manifest
+  - name: demo-dataset
+    source: /common/users/ss5772/datasets/demo
+    dest: data/demo
+env:                          # extra exports for env.sh ($ROOT = node root)
+  PROJECT_SCRATCH: $ROOT/scratch
+outputs:
+  - name: eval-results
+    path: out/eval            # relative to the node root
+    dest: /common/users/ss5772/myproject/results/eval
+    keep: true                # copied back, verified, MANIFEST.sha256 written, then node copy removed
