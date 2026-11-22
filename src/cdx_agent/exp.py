@@ -421,13 +421,29 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- export / archive
+def _hidden_destination(dest: str) -> bool:
+    """True when the resolved destination has a hidden component (`.claude`, `.tmp`, worktrees ...).
+
+    CDX_EXPORT_TRUSTED_PREFIX (tests only) exempts the components of that prefix itself.
+    """
+    real = os.path.realpath(dest)
+    trusted = os.environ.get("CDX_EXPORT_TRUSTED_PREFIX")
+    if trusted:
+        t = os.path.realpath(trusted)
+        if real == t or real.startswith(t + os.sep):
+            real = real[len(t):]
+    return any(part.startswith(".") for part in real.split(os.sep) if part)
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     run_dir = os.path.abspath(args.run)
     m = _man(run_dir)
     name = _slug(m.get("name") or os.path.basename(run_dir))
-    dest = args.to or os.path.join(DEFAULT_EXPORT_ROOT, "experiments", f"{time.strftime('%Y-%m-%d')}_{name}")
-    if any(p.startswith(".") and p != "." for p in dest.split(os.sep) if p):  # as given, not abspath'd
-        print(f"exp export: refusing hidden destination {dest}", file=sys.stderr)
+    project = os.path.basename(str((m.get("code") or {}).get("repo") or "").rstrip("/")) or "experiments"
+    dest = args.to or os.path.join(DEFAULT_EXPORT_ROOT, project, f"{time.strftime('%Y-%m-%d')}_{name}")
+    if _hidden_destination(dest):
+        print(f"exp export: refusing hidden destination {dest} (user downloads go to visible folders only)",
+              file=sys.stderr)
         return EXIT_REFUSED
     files: list[str] = []
     outs = [o.get("path") if isinstance(o, dict) else o for o in (m.get("outputs") or [])]

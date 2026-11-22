@@ -105,6 +105,7 @@ def test_diff(tmp_path, capsys):
 
 def test_export_numbered_and_verifies(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CDX_EXPORT_TRUSTED_PREFIX", str(tmp_path))
     a = tmp_path / "a"
     _mk_run(a, "h1", [{"success": True}])
     (a / "logs").mkdir()
@@ -118,6 +119,10 @@ def test_export_numbered_and_verifies(tmp_path, monkeypatch):
         digest, name = ln.split("  ")
         assert hashlib.sha256((dest / name).read_bytes()).hexdigest() == digest
     assert exp.main(["export", str(a), "--to", ".hid/x"]) == 2
+    (tmp_path / ".hidden_real").mkdir()
+    (tmp_path / "visible").symlink_to(tmp_path / ".hidden_real")
+    assert exp.main(["export", str(a), "--to", "visible/x"]) == 2  # checked on the resolved path
+
 
 
 def test_prereg_no_overwrite(tmp_path):
