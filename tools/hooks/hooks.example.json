@@ -1,0 +1,68 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash|Edit|Write|apply_patch",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py\"",
+          "timeout": 30,
+          "statusMessage": "Checking command or edit safety"
+        },
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/token_risk_warn.py\"",
+          "timeout": 30,
+          "statusMessage": "Checking token-risk command patterns"
+        }
+      ]
+    },
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/output_filter.py\"",
+          "timeout": 30,
+          "statusMessage": "Trimming test output"
+        }
+      ]
+    },
+    {
+      "matcher": "Agent|Task",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/agent_model_gate.py\"",
+          "timeout": 30,
+          "statusMessage": "Checking agent model policy"
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/post_tool_use_review.py\"",
+          "timeout": 30,
+          "statusMessage": "Reviewing Bash side effects"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/stop_summary.py\"",
+          "timeout": 30,
+          "statusMessage": "Summarizing session changes"
+        }
+      ]
+    }
+  ]
+}
