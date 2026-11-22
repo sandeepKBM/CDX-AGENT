@@ -1,0 +1,4 @@
+# First matching route wins; files matching none use `default`.
+routes:
+  - {glob: "world_model/v2/**/test_*cold*.py", host_class: [westeros], reason: "reads /data/local"}
+default: {host_class: [slurm-step, slurm-job, local]}

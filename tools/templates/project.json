@@ -1,0 +1,8 @@
+{
+  "entry": "scripts/run.py",
+  "python": "/path/to/env/bin/python",
+  "ledger": "docs/LEDGER.md",
+  "docs_index": "docs/README.md",
+  "result_roots": ["results"],
+  "limit_sources": ["docs/LIMITS.md"]
+}
