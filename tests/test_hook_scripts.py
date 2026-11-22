@@ -367,84 +367,18 @@ def test_agent_gate_old_task_tool_name_is_gated(tmp_path, monkeypatch):
     assert _gate(tmp_path, monkeypatch, _agent_payload("no header", tool_name="Task")) == "deny"
 
 
-# --- output_filter.py: bare pytest runs are cut to the tail; every other foreground command is capped ------------------------
-@pytest.mark.parametrize("cmd,rewritten", [
-    ("pytest -q tests/x.py", True),
-    ("PYTHONPATH=src timeout 600 /x/bin/python -m pytest -q tests", True),
-    ("pytest tests | tail -3", False),
-    ("CDX_RAW=1 pytest -q", False),
+# --- output_filter.py: retired PreToolUse hook; it must make no decision and print nothing ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "pytest -q tests/x.py",
+    "seq 1 300",
+    "CDX_RAW=1 pytest -q",
+    "cat <<'EOF'\nx\nEOF",
 ])
-def test_output_filter_rewrites_bare_pytest_to_tail(tmp_path, cmd, rewritten):
+def test_output_filter_is_silent(tmp_path, cmd):
     script = _script_copy(tmp_path, "output_filter.py")
     r = _run_hook(script, {"tool_name": "Bash", "tool_input": {"command": cmd}})
-    assert r.returncode == 0
-    if rewritten:
-        new = json.loads(r.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
-        assert new.startswith("set -o pipefail; (") and new.endswith("| tail -n 60") and cmd in new
-    else:
-        assert "tail -n 60" not in r.stdout
-
-
-def _capped(tmp_path, cmd, **extra):
-    """Run the hook on `cmd`; execute the rewritten command in bash. -> (rewritten?, returncode, stdout)."""
-    script = _script_copy(tmp_path, "output_filter.py")
-    r = _run_hook(script, {"tool_name": "Bash", "tool_input": {"command": cmd, **extra}})
-    assert r.returncode == 0, r.stderr
-    if not r.stdout.strip():
-        return False, None, None
-    new = json.loads(r.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
-    p = subprocess.run(["bash", "-c", new], capture_output=True, text=True, cwd=tmp_path)
-    return True, p.returncode, p.stdout
-
-
-def test_output_filter_cuts_long_output_keeps_head_tail_errors_and_exit_code(tmp_path):
-    cmd = "seq 1 300; echo 'ERROR: boom'; echo 'ERROR: boom'; echo 'a Traceback here'; seq 1000 1100; false"
-    wrapped, rc, out = _capped(tmp_path, cmd)
-    assert wrapped and rc == 1                       # exit status of the command is kept
-    lines = out.splitlines()
-    assert lines[0] == "1" and lines[29] == "30" and lines[-1] == "1100" and "1071" in lines
-    assert lines.count("ERROR: boom") == 1 and "a Traceback here" in lines   # deduplicated, matching lines kept
-    assert any(l.startswith("[cdx: ") and "lines cut; CDX_RAW=1 for full]" in l for l in lines)
-    assert "150" not in lines and len(lines) < 80
-
-
-def test_output_filter_short_output_untouched_and_state_kept(tmp_path):
-    wrapped, rc, out = _capped(tmp_path, "mkdir -p sub && cd sub && pwd; seq 1 50")
-    assert wrapped and rc == 0 and out.splitlines()[1:] == [str(i) for i in range(1, 51)] and "[cdx" not in out
-
-
-def test_output_filter_heredoc_and_quotes_survive(tmp_path):
-    body = "\n".join(f"it's \"line\" $HOME {i}" for i in range(200))
-    wrapped, rc, out = _capped(tmp_path, f"cat <<'EOF'\n{body}\nEOF")
-    assert wrapped and rc == 0
-    assert out.splitlines()[0] == "it's \"line\" $HOME 0" and out.splitlines()[-1] == "it's \"line\" $HOME 199"
-    assert "lines cut" in out
-
-
-def test_output_filter_long_single_line_is_clipped(tmp_path):
-    wrapped, rc, out = _capped(tmp_path, "python3 -c \"print('x' * 20000)\"")
-    assert wrapped and rc == 0 and len(out) < 1000 and "clipped" in out
-
-
-@pytest.mark.parametrize("cmd,extra", [
-    ("CDX_RAW=1 seq 1 300", {}),
-    ("seq 1 300", {"run_in_background": True}),
-    ("seq 1 300 | tail -n 100", {}),
-    ("seq 1 300 | wc -l", {}),
-    ("grep -c x file", {}),
-    ("sleep 1 & echo started", {}),
-    ("echo a; exit 3", {}),
-])
-def test_output_filter_opt_outs_leave_command_alone(tmp_path, cmd, extra):
-    wrapped, _, _ = _capped(tmp_path, cmd, **extra)
-    assert not wrapped
-
-
-def test_output_filter_raw_env_and_global_switch(tmp_path, monkeypatch):
-    for k, v in (("CDX_RAW", "1"), ("CDX_OUTPUT_FILTER", "0")):
-        monkeypatch.setenv(k, v)
-        assert not _capped(tmp_path, "seq 1 300")[0]
-        monkeypatch.delenv(k)
+    assert r.returncode == 0 and r.stdout == ""
+    assert _run_hook(script, "not json").stdout == ""
 
 
 # --- pre_tool_use_policy.py poll guard: no foreground wait loops, no self-matching pgrep/pkill -f regexes ---------------------
