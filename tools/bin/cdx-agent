@@ -2160,7 +2160,7 @@ while [[ $# -gt 0 ]]; do
       COMPRESS_COMMAND=("$@")
       break
       ;;
-    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse|--site-facts|--verify-log|--suite|--check)
+    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse|--site-facts|--verify-log|--suite|--check|--run)
       MODE="${1#--}"
       shift
       MODULE_ARGS=("$@")
@@ -2567,6 +2567,9 @@ case "$MODE" in
     ;;
   suite)
     cdx_agent_mod suite "${MODULE_ARGS[@]}"
+    ;;
+  run)
+    if cdx_is_dry_run; then cdx_agent_mod run --dry-run "${MODULE_ARGS[@]}"; else cdx_agent_mod run "${MODULE_ARGS[@]}"; fi
     ;;
   check)
     cdx_agent_mod check "${MODULE_ARGS[@]}"
