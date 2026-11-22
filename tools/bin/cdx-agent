@@ -811,7 +811,10 @@ Jobs and helpers (more of the same family, each consumes the rest of argv):
   --run [--dry-run] ... -- CMD
                         Place and run a command: a step inside your GPU hold, a Slurm job, a westeros GPU
                         or locally. `cdx-agent --run --help` for the routing rules.
+  --node [...]          Node-local storage setup/status/release from .cdx/node_env.yaml. `cdx-agent --node --help`.
   --suite [...]         Per-file pytest fan-out with the test-routing map. `cdx-agent --suite --help`.
+  --exp [...]          Experiment runs: wrap, run, prereg, compare, diff, export, archive. `cdx-agent --exp --help`.
+  --junk [...]         Read-only junk scan by delete tier; apply sends rows to --rm. `cdx-agent --junk --help`.
 
 Skills:
   --validate-skills                 Validate SKILL.md metadata and warnings.
@@ -856,7 +859,7 @@ Behavior:
   - Unrecognized arguments are forwarded to the engine after wrapper parsing.
     This includes engine subcommands such as resume.
   - --compress-output consumes the rest of argv as the wrapped command.
-  - --offload, --notify, --move-verify, --gpu-lock, --brief, --handoff, --cpu-job, --watch, --agent-usage, --gpu-pick, --coldbank, --hash-repro, --teardown, --run and --suite also consume the rest of argv.
+  - --offload, --notify, --move-verify, --gpu-lock, --brief, --handoff, --cpu-job, --watch, --agent-usage, --gpu-pick, --coldbank, --hash-repro, --teardown, --run, --suite, --node, --exp and --junk also consume the rest of argv.
   - Modes that support it honor --dry-run or CDX_DRY_RUN=1.
   - --token-saver can be combined with --full or --safe.
 EOF

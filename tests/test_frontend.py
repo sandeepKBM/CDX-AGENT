@@ -113,7 +113,7 @@ def test_bash_help_has_no_removed_modes_and_new_headings(env):
     assert "GrapeRoot" not in res.stdout and "Dual-Graph" not in res.stdout
     assert "runs codex" not in res.stdout
     assert "Jobs and helpers" in res.stdout
-    for flag in ("--cpu-job", "--watch", "--gpu-pick", "--handoff", "--run", "--suite", "--claude", "--codex", "--secondary"):
+    for flag in ("--cpu-job", "--watch", "--gpu-pick", "--handoff", "--run", "--node", "--exp", "--junk", "--suite", "--claude", "--codex", "--secondary"):
         assert flag in words, flag
     jobs = res.stdout.index("Jobs and helpers")
     for flag in ("--cpu-job", "--watch", "--gpu-pick", "--handoff", "--run", "--suite"):
