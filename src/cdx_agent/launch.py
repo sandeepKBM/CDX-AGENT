@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import context_docs, hooks, hygiene, session, skills
+from . import context_docs, hooks, hygiene, project, session, skills
 from .config import Config, load_config, repo_root
 from .runtime import AccessMode, Engine, RuntimeContext, provision_runtime
 
@@ -153,6 +153,15 @@ def env_overrides(engine: Engine, rctx: RuntimeContext) -> dict[str, str]:
     return {}
 
 
+def _project_sandbox_write(repo: Path) -> list[str]:
+    """`.cdx/project.json` "sandbox_write": extra absolute write roots for --safe Claude sessions (project data dirs)."""
+    try:
+        v = project.load_project(repo).get("sandbox_write")
+    except (OSError, ValueError):
+        return []
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
 @dataclass(frozen=True)
 class LaunchPlan:
     engine: Engine
@@ -254,7 +263,8 @@ def prepare_launch(
         if stale:
             rendered_rules = rendered_rules.rstrip("\n") + "\n\n" + hygiene.stale_warning_line(list(stale)) + "\n"
         doc_sync = context_docs.sync_runtime_docs(rctx.runtime_dir, rendered_rules, engine=engine)
-        hook_install = hooks.install_hooks_for_runtime(config, rctx.runtime_dir, engine=engine, access_mode=access_mode)
+        hook_install = hooks.install_hooks_for_runtime(config, rctx.runtime_dir, engine=engine, access_mode=access_mode,
+                                                    sandbox_write=_project_sandbox_write(resolved_repo))
 
     plan = None
     if plan_allowed:

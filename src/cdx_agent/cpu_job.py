@@ -207,10 +207,20 @@ def find_unreadable(cmd: Sequence[str], cwd: str, prefixes: Sequence[str] = DEFA
     return found
 
 
+def log_dir(cwd: str) -> str:
+    """Default log directory: NFS under the runtime root (node-readable), never inside the repo/worktree.
+    Override with env CDX_CPU_JOB_LOG_DIR (or --log for one sbatch job)."""
+    env = os.environ.get("CDX_CPU_JOB_LOG_DIR")
+    if env:
+        return env
+    root = _site.get("user_root", default="/common/users/ss5772")
+    return os.path.join(root, "codex_runtime", "cpu_jobs", os.path.basename(os.path.abspath(cwd)) or "root")
+
+
 def local_command(cmd: Sequence[str], cwd: str, name: str = "cpujob", timeout: int = 3600, threads: int = 2) -> str:
     """The exact command to run a CPU job on this machine in the background without hurting other users."""
     env = " ".join(f"{v}={threads}" for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"))
-    log = os.path.join(cwd, "logs", "cpu_jobs", f"local_{name}.log")
+    log = os.path.join(log_dir(cwd), f"local_{name}.log")
     return (f"mkdir -p {shlex.quote(os.path.dirname(log))} && cd {shlex.quote(cwd)} && {env} CUDA_VISIBLE_DEVICES= "
             f"nohup nice -n 10 timeout {timeout} {shlex.join(cmd)} > {shlex.quote(log)} 2>&1 &")
 
@@ -236,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="with --node: submit even if the node fails the memory/CPU/state check")
     p.add_argument("--time", default="2:00:00")
     p.add_argument("--name", default="cpujob")
-    p.add_argument("--log", default=None, help="sbatch log (default: <cwd>/logs/cpu_jobs/<name>_%%j.log)")
+    p.add_argument("--log", default=None, help="sbatch log (default: <runtime root>/cpu_jobs/<repo>/<name>_%%j.log, outside the repo; env CDX_CPU_JOB_LOG_DIR overrides the dir)")
     p.add_argument("--wait", action="store_true", help="srun in the foreground (with --timeout) instead of sbatch")
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--cwd", default=None)
@@ -265,6 +275,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  {label} -> {real}", file=sys.stderr)
         print("Run it on this machine instead (background, niced, threads capped; do not wait on it):\n  "
               + local_command(cmd, cwd, a.name, a.timeout), file=sys.stderr)
+        print(f"(local log: {os.path.join(log_dir(cwd), f'local_{a.name}.log')})", file=sys.stderr)
         print("(override: --allow-local-data)", file=sys.stderr)
         return 2
     mem = a.mem
@@ -307,7 +318,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if a.wait:
         remote = f"timeout {a.timeout} srun -w {node} --mem={a.mem} -t {a.time} -J {shlex.quote(a.name)} bash -c {shlex.quote(script)}"
     else:
-        log = a.log or os.path.join(cwd, "logs", "cpu_jobs", f"{a.name}_%j.log")
+        log = a.log or os.path.join(log_dir(cwd), f"{a.name}_%j.log")
         os.makedirs(os.path.dirname(log), exist_ok=True)
         remote = (f"sbatch --parsable -w {node} --mem={a.mem} -t {a.time} -J {shlex.quote(a.name)} -o {shlex.quote(log)} "
                   f"--wrap {shlex.quote(script)}")

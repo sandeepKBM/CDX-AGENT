@@ -4,7 +4,7 @@
 Tool output is re-sent every turn, so a long output is replaced (via updatedToolOutput) by head lines + a marker +
 error-looking lines from the cut middle + tail lines. The full output is saved to a log file named in the marker.
 No permission decision is ever printed. Opt-outs: run_in_background, image output, CDX_OUTPUT_FILTER=0, CDX_RAW=1 in
-the env or in the command text. Limits come from the values ledger (output_cap.lines/bytes/head/tail), default 80/8192/30/30.
+the env or in the command text, and `cdx-agent ... --help|-h` commands. Limits come from the values ledger (output_cap.lines/bytes/head/tail), default 80/8192/30/30.
 Standalone: stdlib only. Any failure exits 0 silently.
 """
 from __future__ import annotations
@@ -24,6 +24,8 @@ PYTEST = re.compile(
     r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:timeout\s+\d+[smh]?\s+)?(?:uv\s+run\s+)?(?:\S*python[\d.]*\s+-m\s+)?pytest(?:\s|$)")
 PYTEST_SUMMARY = re.compile(r"^(?:FAILED|ERROR)\b|^=+ .*(?:passed|failed|error|no tests ran).* =+$|^\d+ (?:passed|failed)")
 RAW = re.compile(r"(^|\s)CDX_RAW=1(\s|$)")
+# `cdx-agent ... --help` / `-h` prints its own manual; capping it hides the usage the caller asked for.
+HELP = re.compile(r"(^|[\s;&|(])(?:\S*/)?cdx-agent\b[^|;&]*\s(?:--help|-h)(?:\s|$)")
 
 
 def limits() -> dict:
@@ -103,7 +105,7 @@ def run() -> int:
     if payload.get("tool_name") != "Bash" or ti.get("run_in_background") or not isinstance(resp, dict):
         return 0
     cmd = str(ti.get("command") or "")
-    if resp.get("isImage") or RAW.search(cmd):
+    if resp.get("isImage") or RAW.search(cmd) or HELP.search(cmd):
         return 0
     stdout, stderr = str(resp.get("stdout") or ""), str(resp.get("stderr") or "")
     lim = limits()

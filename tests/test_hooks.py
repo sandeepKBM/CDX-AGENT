@@ -244,6 +244,18 @@ def test_safe_sandbox_block_only_when_enabled(tmp_path, monkeypatch):
     assert "sandbox" not in _h.build_claude_settings_payload(tmp_path, None, None, None)
 
 
+def test_project_sandbox_write_roots_are_added_and_filtered(tmp_path, monkeypatch):
+    import json as _json
+    from cdx_agent import hooks as _h
+    f = tmp_path / "sb.json"
+    f.write_text(_json.dumps({"enabled": True, "filesystem": {"allowWrite": ["/a"], "denyWrite": ["/d"]}}))
+    monkeypatch.delenv("CDX_SAFE_SANDBOX", raising=False)
+    extra = ["/data/proj", "/a", "rel/path", "~/.ssh", "/", 7, os.path.expanduser("~/.bashrc")]
+    fs = _h.build_claude_settings_payload(tmp_path, None, None, f, extra)["sandbox"]["filesystem"]
+    assert fs["allowWrite"] == ["/a", "/data/proj"] and fs["denyWrite"] == ["/d"]
+    assert _h.build_claude_settings_payload(tmp_path, None, None, None, extra).get("sandbox") is None
+
+
 def test_pretooluse_matcher_skips_edit_write(tmp_path):
     from cdx_agent import hooks as _h
     pre = _h.build_hooks_payload(tmp_path)["PreToolUse"]

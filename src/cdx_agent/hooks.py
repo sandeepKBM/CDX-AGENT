@@ -24,7 +24,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from .config import Config, backup_path, load_config, repo_root
 
@@ -167,7 +167,7 @@ def write_hooks_json(hooks_dir: Path, hooks_json_path: Path) -> None:
 
 
 def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | None = None, env_file: Path | None = None,
-                                  sandbox_file: Path | None = None) -> dict:
+                                  sandbox_file: Path | None = None, extra_write: Sequence[str] = ()) -> dict:
     """Claude Code loads hooks from a settings file's top-level "hooks" key
     (confirmed empirically: `claude --settings <path>` with
     `{"hooks": {...}}` fires the configured hooks) -- unlike Codex, which
@@ -184,13 +184,32 @@ def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | No
     env_defaults = load_env_defaults(env_file)
     if env_defaults:
         payload["env"] = {**env_defaults, **(payload.get("env") or {})}       # the user's own env wins
-    sandbox = load_sandbox(sandbox_file)
+    sandbox = load_sandbox(sandbox_file, extra_write)
     if sandbox:
         payload["sandbox"] = {**(payload.get("sandbox") or {}), **sandbox}    # ours wins: it is the --safe guard
     return payload
 
 
-def load_sandbox(sandbox_file: Path | None) -> dict:
+# Never added to allowWrite through a project's "sandbox_write" list: credentials and shell startup files.
+_NEVER_WRITABLE = ("~/.ssh", "~/.gnupg", "~/.aws", "~/.bashrc", "~/.bash_profile", "~/.profile", "~/.zshrc", "~/.netrc")
+
+
+def project_write_paths(paths: Sequence[str] | None) -> list[str]:
+    """Absolute, non-credential paths from `.cdx/project.json` "sandbox_write"; anything else is dropped."""
+    out: list[str] = []
+    for raw in paths or ():
+        if not isinstance(raw, str) or not raw.startswith("/"):
+            continue
+        p = os.path.normpath(raw)
+        bad = [os.path.normpath(os.path.expanduser(x)) for x in _NEVER_WRITABLE]
+        if p == "/" or any(p == b or p.startswith(b + "/") or b.startswith(p + "/") for b in bad):
+            continue
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def load_sandbox(sandbox_file: Path | None, extra_write: Sequence[str] = ()) -> dict:
     """--safe sandbox block (user ruling Q4, 2026-11-20) from tools_root/base/claude_sandbox_safe.json.
 
     Keys starting with '_' are comments. The file's "enabled" decides; CDX_SAFE_SANDBOX=1/0 overrides it (for the live
@@ -208,6 +227,11 @@ def load_sandbox(sandbox_file: Path | None) -> dict:
     if not enabled:
         return {}
     data["enabled"] = True
+    extra = project_write_paths(extra_write)
+    if extra:   # per-project write roots (data dirs); the denyWrite list still wins inside them
+        fs = dict(data.get("filesystem") or {})
+        fs["allowWrite"] = list(dict.fromkeys([*(fs.get("allowWrite") or []), *extra]))
+        data["filesystem"] = fs
     return data
 
 
@@ -253,8 +277,8 @@ def claude_settings_path_for_runtime(runtime_dir: Path) -> Path:
 
 
 def write_claude_settings(hooks_dir: Path, base_settings_path: Path | None, output_path: Path, env_file: Path | None = None,
-                          sandbox_file: Path | None = None) -> None:
-    payload = build_claude_settings_payload(hooks_dir, base_settings_path, env_file, sandbox_file)
+                          sandbox_file: Path | None = None, extra_write: Sequence[str] = ()) -> None:
+    payload = build_claude_settings_payload(hooks_dir, base_settings_path, env_file, sandbox_file, extra_write)
     rendered = json.dumps(payload, indent=2) + "\n"
     if output_path.exists():
         if output_path.read_text(errors="ignore") == rendered:
@@ -326,7 +350,7 @@ def install_hooks_for_repo(config: Config, repo: Path, engine: Engine = "codex")
 
 
 def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine = "codex",
-                              access_mode: str = "full") -> HookInstallResult:
+                              access_mode: str = "full", sandbox_write: Sequence[str] = ()) -> HookInstallResult:
     hooks_dir, hooks_json_path = hooks_locations_for_runtime(runtime_dir)
     linked = install_hook_scripts(config.tools_root / "hooks", hooks_dir)
     write_hooks_json(hooks_dir, hooks_json_path)
@@ -336,7 +360,7 @@ def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine 
         base_settings_path = runtime_dir / "claude_settings.json"
         sandbox_file = config.tools_root / "base" / "claude_sandbox_safe.json" if access_mode == "safe" else None
         write_claude_settings(hooks_dir, base_settings_path, claude_settings_path, config.tools_root / "base" / "claude_env.json",
-                              sandbox_file)
+                              sandbox_file, sandbox_write)
         install_agent_defs(config.tools_root / "base" / "claude_agents", Path.home() / ".claude" / "agents")
     return HookInstallResult(
         hooks_dir=hooks_dir,

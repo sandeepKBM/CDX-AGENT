@@ -13,7 +13,8 @@ from typing import Any
 
 import yaml
 
-PROJECT_KEYS = ("entry", "python", "ledger", "docs_index", "result_roots", "limit_sources")
+PROJECT_KEYS = ("entry", "python", "ledger", "docs_index", "result_roots", "limit_sources",
+                "sandbox_write", "graph_exclude")
 DEFAULT_ROUTE = {"host_class": ["slurm-step", "slurm-job", "local"]}
 
 

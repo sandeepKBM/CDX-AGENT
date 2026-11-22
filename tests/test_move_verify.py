@@ -117,6 +117,25 @@ def test_finish_trashes_source_and_links(tmp_path, monkeypatch, capsys):
     assert os.readlink(src) == str(dst) and "FINISHED" in out
 
 
+def test_finish_no_symlink_leaves_nothing_at_src(tmp_path, monkeypatch, capsys):
+    import sys
+    import types
+    src = _tree(tmp_path / "src")
+    dst = tmp_path / "new" / "dst"
+    (tmp_path / "new").mkdir()
+
+    def fake_rm(paths, verified_copy=False, **kw):
+        os.rename(paths[0], str(tmp_path / "trashed"))
+        return 0
+    monkeypatch.setitem(sys.modules, "cdx_agent.trash", types.SimpleNamespace(rm=fake_rm))
+    import cdx_agent
+    monkeypatch.setattr(cdx_agent, "trash", sys.modules["cdx_agent.trash"], raising=False)
+    rc = mv.main([str(src), str(dst), "--no-lsof", "--finish", "--no-symlink"])
+    out = capsys.readouterr().out
+    assert rc == mv.EXIT_OK, out
+    assert not os.path.lexists(src) and (tmp_path / "trashed").is_dir() and "no symlink" in out
+
+
 def test_finish_refused_keeps_source(tmp_path, monkeypatch, capsys):
     import sys
     import types

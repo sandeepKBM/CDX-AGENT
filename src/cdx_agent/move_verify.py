@@ -162,8 +162,8 @@ def finish_line(src: str, dst: str) -> str:
     return f"cdx-agent --move-verify {shlex.quote(s)} {shlex.quote(d)} --verify-only --finish"
 
 
-def finish(src: str, dst: str) -> int:
-    """Trash the verified source, then link it to the copy. Refusals keep SRC in place."""
+def finish(src: str, dst: str, symlink: bool = True) -> int:
+    """Trash the verified source, then (symlink=True) link it to the copy. Refusals keep SRC in place."""
     from cdx_agent import trash
     s = os.path.abspath(src.rstrip("/") or "/")
     d = os.path.abspath(dst.rstrip("/") or "/")
@@ -171,6 +171,9 @@ def finish(src: str, dst: str) -> int:
     if rc != 0 or os.path.lexists(s):
         print(f"NOT FINISHED: {s} was not trashed (see above); the copy at {d} is verified and kept")
         return EXIT_REFUSED
+    if not symlink:
+        print(f"FINISHED: {s} moved to {d}, no symlink left (source in trash: cdx-agent --trash list)")
+        return EXIT_OK
     os.symlink(d, s)
     print(f"FINISHED: {s} -> {d} (source in trash: cdx-agent --trash list)")
     return EXIT_OK
@@ -225,6 +228,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--no-lsof", action="store_true", help="skip the open-files check under SRC")
     p.add_argument("--verify-only", action="store_true", help="skip the copy; only verify an earlier one")
     p.add_argument("--finish", action="store_true", help="after VERIFIED: trash SRC and symlink SRC -> DST")
+    p.add_argument("--no-symlink", action="store_true", help="with --finish: trash SRC (restorable) and leave no symlink (e.g. cleaning a worktree)")
     args = p.parse_args(argv)
     if not shutil.which("rsync"):
         print("REFUSED: rsync not found on PATH", file=sys.stderr)
@@ -267,7 +271,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Nothing was deleted. To finish (trash SRC, restorable; symlink SRC -> DST):")
         print(finish_line(src, dst))
         return EXIT_OK
-    return finish(src, dst)
+    return finish(src, dst, symlink=not args.no_symlink)
 
 
 if __name__ == "__main__":

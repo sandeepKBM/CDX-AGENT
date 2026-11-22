@@ -163,3 +163,17 @@ def test_hold_state_reads_grptres_and_running_nodes(monkeypatch):
     monkeypatch.setattr(cpu_job, "run_command", lambda cmd: subprocess.CompletedProcess(
         cmd, 0, "7|hold|rlab4|gres/gpu:a4000:4|RUNNING|None\n8|q|ilab1|N/A|PENDING|Resources\n", ""))
     assert REAL_HOLD_STATE(None, "u") == (1, {"rlab4"})
+
+
+def test_default_log_dir_is_outside_the_repo(monkeypatch, capsys, tmp_path):
+    monkeypatch.delenv("CDX_CPU_JOB_LOG_DIR", raising=False)
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    d = cpu_job.log_dir(str(repo))
+    assert not d.startswith(str(repo)) and d.endswith("/cpu_jobs/wt")
+    assert str(repo) not in cpu_job.local_command(["true"], str(repo), "n").split(" > ")[-1]
+    monkeypatch.setenv("CDX_CPU_JOB_LOG_DIR", str(tmp_path / "ovr"))
+    assert cpu_job.log_dir(str(repo)) == str(tmp_path / "ovr")
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
+    assert cpu_job.main(["--dry-run", "--cwd", str(repo), "--", "true"]) == 0
+    assert str(tmp_path / "ovr") in capsys.readouterr().out and not (repo / "logs").exists()

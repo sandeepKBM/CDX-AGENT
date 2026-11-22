@@ -77,6 +77,16 @@ def test_opt_outs_are_silent(tmp_path):
         assert r.returncode == 0 and r.stdout == ""
 
 
+def test_cdx_agent_help_is_not_capped(tmp_path):
+    big = _seq(500)
+    for cmd in ("cdx-agent --help", "cdx-agent --run --help", "/common/users/ss5772/bin/cdx-agent --suite -h"):
+        r = _run(tmp_path, _payload(big, cmd=cmd))
+        assert r.returncode == 0 and r.stdout == "", cmd
+    # other commands (even ones mentioning -h) are still capped
+    assert _run(tmp_path, _payload(big, cmd="ls -h")).stdout != ""
+    assert _run(tmp_path, _payload(big, cmd="cdx-agent --graph")).stdout != ""
+
+
 def test_ledger_overrides_limits_latest_row_wins(tmp_path):
     ledger = tmp_path / "values.jsonl"
     ledger.write_text("\n".join([
