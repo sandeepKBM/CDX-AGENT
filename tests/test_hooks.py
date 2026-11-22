@@ -183,12 +183,12 @@ def test_install_hook_scripts_still_replaces_wrong_symlink(tmp_path):
     dst.mkdir(parents=True)
     wrong_src = tmp_path / "elsewhere.py"
     wrong_src.write_text("wrong\n")
-    (dst / "stop_summary.py").symlink_to(wrong_src)
+    (dst / "token_risk_warn.py").symlink_to(wrong_src)
 
     hooks.install_hook_scripts(cfg.tools_root / "hooks", dst)
-    target = dst / "stop_summary.py"
-    assert target.readlink() == cfg.tools_root / "hooks" / "stop_summary.py"
-    assert len(list(dst.glob("stop_summary.py.bak.*"))) == 1
+    target = dst / "token_risk_warn.py"
+    assert target.readlink() == cfg.tools_root / "hooks" / "token_risk_warn.py"
+    assert len(list(dst.glob("token_risk_warn.py.bak.*"))) == 1
 
 
 def test_write_hooks_json_unchanged_content_no_bak(tmp_path):

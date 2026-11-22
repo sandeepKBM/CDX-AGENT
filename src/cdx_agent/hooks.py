@@ -30,8 +30,8 @@ from .config import Config, backup_path, load_config, repo_root
 HOOK_SCRIPTS: tuple[str, ...] = (
     "pre_tool_use_policy.py",
     "post_tool_use_review.py",
-    "stop_summary.py",
     "token_risk_warn.py",
+    "subagent_claims.py",
     "agent_model_gate.py",
     "output_cap.py",
 )
@@ -97,14 +97,14 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
                 ],
             },
         ],
-        "Stop": [
+        # stop_summary.py (disabled by the user 2026-08-13) is no longer wired; the file stays for old runtimes.
+        "SubagentStop": [
             {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f'/usr/bin/python3 "{hooks_dir / "stop_summary.py"}"',
-                        "timeout": 30,
-                        "statusMessage": "Summarizing session changes",
+                        "command": f'/usr/bin/python3 "{hooks_dir / "subagent_claims.py"}"',
+                        "timeout": 15,
                     }
                 ]
             }

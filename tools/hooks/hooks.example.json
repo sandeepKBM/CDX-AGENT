@@ -53,14 +53,13 @@
       ]
     }
   ],
-  "Stop": [
+  "SubagentStop": [
     {
       "hooks": [
         {
           "type": "command",
-          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/stop_summary.py\"",
-          "timeout": 30,
-          "statusMessage": "Summarizing session changes"
+          "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/subagent_claims.py\"",
+          "timeout": 15
         }
       ]
     }
