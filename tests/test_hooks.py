@@ -27,7 +27,7 @@ def test_build_hooks_payload_wires_all_four_scripts(tmp_path):
 def test_generated_hooks_json_matches_example_template_script_set(tmp_path):
     example_path = os.environ.get(
         "CDX_AGENT_HOOKS_EXAMPLE_JSON",
-        "/common/users/ss5772/codex_tools/hooks/hooks.example.json",
+        str(Path(__file__).resolve().parents[1] / "tools" / "hooks" / "hooks.example.json"),
     )
     example = Path(example_path)
     if not example.is_file():

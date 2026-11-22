@@ -25,7 +25,8 @@ from pathlib import Path
 
 import pytest
 
-HOOKS_DIR = Path(os.environ.get("CDX_AGENT_HOOKS_DIR", "/common/users/ss5772/codex_tools/hooks"))
+# F22: test the repo copies (tools/hooks), never the live deployed files.
+HOOKS_DIR = Path(os.environ.get("CDX_AGENT_HOOKS_DIR", str(Path(__file__).resolve().parents[1] / "tools" / "hooks")))
 
 pytestmark = pytest.mark.skipif(
     not HOOKS_DIR.is_dir(), reason=f"deployed hooks dir not available: {HOOKS_DIR}"
@@ -110,35 +111,14 @@ def test_stop_summary_silent_outside_git(tmp_path):
     assert proc.stdout.strip() == ""
 
 
-def test_stop_summary_emits_once_then_dedupes_same_session(tmp_path):
+def test_stop_summary_disabled_emits_nothing_on_dirty_tree(tmp_path):
+    # stop_summary.py is a no-op at the user's request (2026-08-13); it is removed in WP10.
     script = _script_copy(tmp_path, "stop_summary.py")
     repo = _git_repo(tmp_path)
     (repo / "dirty.txt").write_text("x\n")
-
-    first = _run_hook(script, _stop_payload(repo))
-    assert first.returncode == 0
-    emitted = json.loads(first.stdout)
-    context = emitted["hookSpecificOutput"]["additionalContext"]
-    assert emitted["hookSpecificOutput"]["hookEventName"] == "Stop"
-    assert "dirty.txt" in context
-
-    second = _run_hook(script, _stop_payload(repo))
-    assert second.returncode == 0
-    assert second.stdout.strip() == ""
-
-    (repo / "more.txt").write_text("y\n")
-    third = _run_hook(script, _stop_payload(repo))
-    assert third.returncode == 0
-    assert "more.txt" in json.loads(third.stdout)["hookSpecificOutput"]["additionalContext"]
-
-
-def test_stop_summary_new_session_emits_even_if_tree_unchanged(tmp_path):
-    script = _script_copy(tmp_path, "stop_summary.py")
-    repo = _git_repo(tmp_path)
-    (repo / "dirty.txt").write_text("x\n")
-    assert _run_hook(script, _stop_payload(repo, session_id="a")).stdout.strip() != ""
-    assert _run_hook(script, _stop_payload(repo, session_id="a")).stdout.strip() == ""
-    assert _run_hook(script, _stop_payload(repo, session_id="b")).stdout.strip() != ""
+    proc = _run_hook(script, _stop_payload(repo))
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == ""
 
 
 def test_stop_summary_tolerates_malformed_stdin(tmp_path):
