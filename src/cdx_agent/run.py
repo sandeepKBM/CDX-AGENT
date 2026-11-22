@@ -51,9 +51,10 @@ SITE_DEFAULTS: dict[str, Any] = {
     "westeros_gpus": "0-3",
     "lock_dir": gpu_lock.DEFAULT_LOCK_DIR,
     "node_scratch_root": "/freespace/local/$USER/jobs",
-    "local_scratch_root": "/tmp/$USER/jobs",
+    # HOT tier = the host's local disk (resource plan): westeros /data/local/$USER, else /tmp/$USER; resolved in the job
+    "local_scratch_root": '$([ -w "/data/local/$USER" ] && echo "/data/local/$USER" || echo "/tmp/$USER")/jobs',
     "node_snapshot_root": "/freespace/local/$USER/snapshots",
-    "local_snapshot_root": "/tmp/$USER/snapshots",
+    "local_snapshot_root": '$([ -w "/data/local/$USER" ] && echo "/data/local/$USER" || echo "/tmp/$USER")/snapshots',
     "node_prefixes": ["ilab"],
     "gpu_prefixes": ["rlab", "ilab"],
     "python": "python3",
@@ -425,7 +426,8 @@ def wrap(p: Placement, req: Request, run_dir: str, job_id: str, repo: str, state
     q = shlex.quote
     tpp = str(max(1, req.threads_per_proc))
     L = ["#!/bin/bash", f"# cdx-agent --run job {job_id} (placement {p.cls})", "set +e", f"RUN_DIR={q(run_dir)}",
-         f'JOBDIR="{scratch_root}/{job_id}"', 'mkdir -p "$JOBDIR"', "("]
+         f'JOBDIR="{scratch_root}/{job_id}"', 'mkdir -p "$JOBDIR/tmp"',
+         'export CDX_JOB_SCRATCH="$JOBDIR" TMPDIR="$JOBDIR/tmp"', "("]
     rel = os.path.relpath(req.cwd, repo) if req.cwd.startswith(repo) else "."
     if req.snapshot and state is not None:
         key = snapshot_key(state)
