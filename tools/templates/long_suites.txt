@@ -1,0 +1,6 @@
+# One glob per line (relative to the repo root). Optional trailing tag `local-only`
+# marks suites whose data is not readable from Slurm nodes (the hook then refuses ssh/srun/--cpu-job).
+#   path/or/glob
+#   path/or/glob local-only
+tests/test_slow_*.py
+tests/test_needs_local_data.py local-only

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from fnmatch import fnmatchcase
@@ -251,6 +252,22 @@ def _repo_root(cwd_value: Any) -> Path | None:
     return None
 
 
+def _common_cdx_dir(root: Path) -> Path:
+    """The main checkout's .cdx/ (via `git rev-parse --git-common-dir`), for worktrees that have none. Falls back to <root>/.cdx."""
+    try:
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=2, check=False)
+        text = result.stdout.strip()
+        if result.returncode == 0 and text:
+            common = Path(text)
+            if not common.is_absolute():
+                common = root / common
+            return common.resolve().parent / ".cdx"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return root / ".cdx"
+
+
 LONG_SUITE_TAGS = {"local-only"}   # `tests/test_x.py local-only`: needs workstation-local data, never send it to Slurm
 
 
@@ -258,6 +275,8 @@ def _long_suite_patterns(root: Path) -> list[tuple[str, bool]]:
     """-> [(glob, local_only)] from <repo>/.cdx/long_suites.txt (one glob per line, optional trailing tag `local-only`)."""
     path = root / ".cdx" / "long_suites.txt"
     try:
+        if not path.is_file():
+            path = _common_cdx_dir(root) / "long_suites.txt"
         if not path.is_file():
             return []
         patterns = []
@@ -351,6 +370,30 @@ def _path_matches_pattern(root: Path, path_text: str, pattern: str) -> bool:
     return False
 
 
+def _remote_long_suite_guard(command: str, root: Path, patterns: list[tuple[str, bool]]) -> str | None:
+    """pytest inside `ssh HOST ...` / `srun ...`: deny only for local-only suites (plain long suites are fine remotely)."""
+    local_patterns = [item for item in patterns if item[1]]
+    if not local_patterns:
+        return None
+    for match in re.finditer(r"\bpytest\b", command):
+        tail = re.split(r"[;&|\n]", command[match.end():], maxsplit=1)[0]
+        tokens = [token.strip("'\"") for token in tail.split()]
+        paths = _pytest_paths([token for token in tokens if token])
+        candidates = paths or ["."]
+        for path in candidates:
+            for pattern, _local in local_patterns:
+                if path == "." and _pattern_matches_repo(root, pattern):
+                    return _remote_local_only_message(pattern)
+                if path != "." and _path_matches_pattern(root, path, pattern):
+                    return _remote_local_only_message(path)
+    return None
+
+
+def _remote_local_only_message(label: str) -> str:
+    return (f"Long test suite {label} is tagged local-only (its data is not readable from the remote host), so it must not run via ssh/srun: "
+            "run it on this machine in the background, niced with capped threads, or prefix CDX_ALLOW_LONG_SUITE=1 if you must.")
+
+
 def _long_suite_guard(command: str, cwd_value: Any) -> str | None:
     if re.search(r"\bcdx-agent\s+--cpu-job\b", command):
         return None
@@ -358,14 +401,14 @@ def _long_suite_guard(command: str, cwd_value: Any) -> str | None:
         return None
     if re.search(r"(?<!\w)CDX_ALLOW_LONG_SUITE=1(?!\w)", command):
         return None
-    if re.search(r"\bssh\s+\S+[\s\S]*?\bpytest\b", command) or re.search(r"\bsrun\b[\s\S]*?\bpytest\b", command):
-        return None
     root = _repo_root(cwd_value)
     if root is None:
         return None
     patterns = _long_suite_patterns(root)
     if not patterns:
         return None
+    if re.search(r"\bssh\s+\S+[\s\S]*?\bpytest\b", command) or re.search(r"\bsrun\b[\s\S]*?\bpytest\b", command):
+        return _remote_long_suite_guard(command, root, patterns)
     for _executable, arguments in _pytest_invocations(command):
         if "--version" in arguments or "-V" in arguments:
             continue
