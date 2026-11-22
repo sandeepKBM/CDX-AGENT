@@ -33,7 +33,7 @@ HOOK_SCRIPTS: tuple[str, ...] = (
     "stop_summary.py",
     "token_risk_warn.py",
     "agent_model_gate.py",
-    "output_filter.py",
+    "output_cap.py",
 )
 
 Engine = Literal["codex", "claude"]
@@ -61,17 +61,6 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
                     },
                 ],
             },
-            {   # plain pytest runs: output cut to the tail, exit status kept (CDX_RAW=1 / CDX_OUTPUT_FILTER=0 opt out)
-                "matcher": "Bash",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": f'/usr/bin/python3 "{hooks_dir / "output_filter.py"}"',
-                        "timeout": 30,
-                        "statusMessage": "Trimming test output",
-                    }
-                ],
-            },
             {   # every subagent names type / model / why; overrides of codex_tools/base/agent_policy.json ask the user
                 "matcher": "Agent|Task",
                 "hooks": [
@@ -95,7 +84,18 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
                         "statusMessage": "Reviewing Bash side effects",
                     }
                 ],
-            }
+            },
+            {   # long Bash output: full text saved to a file, the context gets head + errors + tail (CDX_RAW=1 opts out)
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'/usr/bin/python3 "{hooks_dir / "output_cap.py"}"',
+                        "timeout": 30,
+                        "statusMessage": "Capping long output",
+                    }
+                ],
+            },
         ],
         "Stop": [
             {
