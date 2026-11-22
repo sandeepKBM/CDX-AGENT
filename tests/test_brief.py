@@ -152,3 +152,65 @@ def test_cli_errors_and_output(repo, rules):
     assert ok.returncode == 0 and ok.stdout.startswith("# Brief: feat")
     missing = brief.build_brief("feat", repo=str(repo), rules_path=str(repo / "nope.md"))
     assert "(rules file missing:" in missing
+
+
+def _safety_repo(tmp_path: Path, with_sources: bool = True) -> Path:
+    repo = tmp_path / "srepo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _commit(repo, "config.py", "TAU_MAX = 87.0\nOTHER = 3\n", "config")
+    _commit(repo, "ctl.py", "X = 1\n", "init ctl")
+    if with_sources:
+        (repo / ".cdx").mkdir()
+        (repo / ".cdx" / "project.json").write_text('{"limit_sources": ["config.py"]}')
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _commit(repo, "ctl.py", (
+        "X = 1\n\n\n"
+        "def clearance_ok(d, margin):\n"
+        '    """d in m, world frame."""\n'
+        "    # verified correct by author\n"
+        "    # torque in N·m\n"
+        "    return d >= margin and TAU_MAX > 0\n\n\n"
+        "def unrelated():\n    return 1\n"), "verified safe")
+    _commit(repo, "tests/test_ctl.py", "def test_x():\n    assert clearance_ok(1.0, 0.5) is True\n", "t")
+    _commit(repo, "docs/note.md", "this is proven safe, torque limit\n", "doc")
+    _git(repo, "checkout", "-q", "main")
+    return repo
+
+
+def test_safety_math_focus(tmp_path):
+    repo = _safety_repo(tmp_path)
+    text = brief.build_safety_brief("feat", base="main", repo=str(repo))
+    assert text.startswith("# Safety-math brief: feat\n")
+    assert "def clearance_ok(d, margin):" in text and "return d >= margin" in text
+    assert "unrelated" not in text
+    assert "config.py:1: TAU_MAX = 87.0" in text and "OTHER" not in text
+    assert "Units and frames" in text and "torque in N·m" in text and "d in m, world frame" in text
+    assert "assert clearance_ok(1.0, 0.5)" in text and "tests/test_ctl.py:2" in text
+    assert "Safety-math verification" not in text and "which side is conservative" in text.lower()
+    assert "verified safe" not in text and "verified correct" not in text and "proven" not in text
+    assert "docs/note.md" not in text
+    assert "1 author-conclusion lines excluded" in text
+    order = [text.index(k) for k in ("## Checklist", "## Code under review", "## Limit sources",
+                                     "## Units and frames", "## Reference values", "## Excluded")]
+    assert order == sorted(order)
+    assert brief.build_safety_brief("feat", base="main", repo=str(repo)) == text
+
+
+def test_safety_math_no_limit_sources_and_cap(tmp_path):
+    repo = _safety_repo(tmp_path, with_sources=False)
+    text = brief.build_safety_brief("feat", base="main", repo=str(repo))
+    assert "(no limit_sources declared)" in text
+    small = brief.build_safety_brief("feat", base="main", repo=str(repo), max_tokens=200)
+    assert len(small) <= 200 * brief.CHARS_PER_TOKEN
+
+
+def test_safety_math_cli_and_default_unchanged(tmp_path, repo, rules):
+    srepo = _safety_repo(tmp_path)
+    env = dict(os.environ, PYTHONPATH=SRC)
+    ok = subprocess.run([sys.executable, "-m", "cdx_agent.brief", "feat", "--base", "main", "--repo",
+                         str(srepo), "--focus", "safety-math"], env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert ok.returncode == 0 and "def clearance_ok" in ok.stdout
+    plain = brief.build_brief("feat", repo=str(repo), rules_path=rules)
+    assert "Safety-math" not in plain and "## Commits since base" in plain

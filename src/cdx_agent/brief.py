@@ -1,7 +1,7 @@
 """Deterministic, no-LLM context brief for seeding a fresh subagent or Codex worker.
 
     python -m cdx_agent.brief <WORKTREE_DIR | BRANCH> [--base B] [--max-tokens 3000]
-        [--repo DIR] [--rules FILE]
+        [--repo DIR] [--rules FILE] [--focus safety-math]
 
 Prints a Markdown brief (instead of forking or resuming a long session):
   - branch, HEAD, base and merge-base (base: --base, else the reflog's
@@ -17,15 +17,26 @@ Total output is capped at --max-tokens (~4 chars/token); the variable sections
 share the budget fairly and are truncated from their tails with a marker.
 Same repo state -> byte-identical output (no timestamps, fixed git options).
 Exit codes: 0 ok, 2 bad target/base.
+
+--focus safety-math replaces the brief with a verifier hand-off: header, the checklist
+(tools/templates/safety_math_checklist.md), the full text of changed functions that hold
+comparisons / limit words / math calls, limit definitions from .cdx/project.json
+`limit_sources`, unit/frame lines, reference values from changed tests, and a count of
+excluded author-conclusion lines. Commit messages, docs/**, reports/**, *.md and comments
+saying verified/proven/correct/safe/"guarantee holds" are never included.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
+import io
+import json
 import os
 import re
 import subprocess
 import sys
+import tokenize
 from collections import Counter
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -356,6 +367,241 @@ def build_brief(target: str, base: Optional[str] = None, max_tokens: int = 3000,
     return text
 
 
+# ---------------------------------------------------------------- safety-math focus
+CHECKLIST_PATH = Path(__file__).resolve().parents[2] / "tools" / "templates" / "safety_math_checklist.md"
+MATH_WORDS = re.compile(
+    r"(constraint|bound|limit|clip|clamp|margin|slack|tau|torque|force|velocity|accel|horizon|cert"
+    r"|admit|feasib)|(?<![A-Za-z])dt(?![a-z])|\b(?:np|math|jnp|torch)\.", re.IGNORECASE)
+UNIT_WORDS = re.compile(
+    r"(?<![\w'])(?:rad|deg|m/s|N·m|Nm|N|kg|s|ms|Hz)(?![\w'])"
+    r"|(?i:(?<![\w'])(?:frame|world|base|body|quat|euler|joint)(?![\w']))")
+AUTHOR_WORDS = re.compile(r"\b(verified|proven|correct|safe|guarantee holds)\b", re.IGNORECASE)
+EXCLUDED_PATHS = ("docs/*", "reports/*", "*.md")
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+NUMBER = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w.])")
+
+
+def _is_test_path(path: str) -> bool:
+    return path.startswith("tests/") or "test" in os.path.basename(path).lower()
+
+
+def _diff_hunks(repo: str, mb: str, tip: str, paths: List[str]) -> dict:
+    """{path: ([(start, end)] new-side ranges, [(lineno, text)] added lines)} from -U0."""
+    out: dict = {}
+    if not paths:
+        return out
+    cur = None
+    lineno = 0
+    for line in _git(repo, "diff", "-U0", "--no-renames", mb, tip, "--", *paths).splitlines():
+        if line.startswith("+++ "):
+            name = line[4:]
+            cur = name[2:] if name.startswith("b/") else None
+            if cur:
+                out[cur] = ([], [])
+            continue
+        match = HUNK.match(line)
+        if match and cur:
+            start = int(match.group(1))
+            count = 1 if match.group(2) is None else int(match.group(2))
+            out[cur][0].append((start, start + max(count, 1) - 1))
+            lineno = start
+        elif cur and line.startswith("+") and not line.startswith("+++"):
+            out[cur][1].append((lineno, line[1:]))
+            lineno += 1
+    return out
+
+
+def _comment_texts(source: str) -> dict:
+    """lineno -> comment text (without '#') for every comment in `source`."""
+    found: dict = {}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                found[tok.start[0]] = tok.string.lstrip("#").strip()
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass
+    return found
+
+
+def _py_functions(source: str, ranges: List[Tuple[int, int]]) -> list:
+    """Changed functions/methods as [(start, end, node)], outermost only."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    hit = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        end = node.end_lineno or node.lineno
+        if any(a <= end and b >= start for a, b in ranges):
+            hit.append((start, end, node))
+    return [h for h in hit if not any(o is not h and o[0] <= h[0] and h[1] <= o[1] for o in hit)]
+
+
+def _is_mathy(node: ast.AST, text: str) -> bool:
+    return any(isinstance(n, ast.Compare) for n in ast.walk(node)) or bool(MATH_WORDS.search(text))
+
+
+def _project_limit_paths(top: str) -> Optional[List[str]]:
+    """limit_sources from <repo>/.cdx/project.json, else the git common dir's checkout."""
+    roots = [top]
+    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if common:
+        roots.append(str(Path(common).parent))
+    for root in roots:
+        try:
+            data = json.loads((Path(root) / ".cdx" / "project.json").read_text())
+        except (OSError, ValueError):
+            continue
+        value = data.get("limit_sources") if isinstance(data, dict) else None
+        if isinstance(value, list):
+            return [str(v) for v in value]
+    return None
+
+
+def _module_defs(text: str) -> dict:
+    """identifier -> [(lineno, line text)] for module-level assignments."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {}
+    lines = text.splitlines()
+    defs: dict = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        end = node.end_lineno or node.lineno
+        for name in names:
+            defs[name] = [(n, lines[n - 1]) for n in range(node.lineno, end + 1)]
+    return defs
+
+
+def _py_code(path: str, source: str, ranges: List[Tuple[int, int]], code: List[str],
+             units: List[str], idents: set, excluded: set) -> None:
+    lines = source.splitlines()
+    comments = _comment_texts(source)
+    for start, end, node in _py_functions(source, ranges):
+        if not _is_mathy(node, "\n".join(lines[start - 1:end])):
+            continue
+        code.append(f"### {path}:{start}-{end} {node.name}")
+        doc_span: set = set()
+        first = node.body[0] if node.body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            doc_span = set(range(first.lineno, (first.end_lineno or first.lineno) + 1))
+        for n in range(start, end + 1):
+            raw = lines[n - 1]
+            comment = comments.get(n)
+            if comment is not None and AUTHOR_WORDS.search(comment):
+                excluded.add((path, n))
+                raw = raw.split("#", 1)[0].rstrip()
+                if not raw.strip():
+                    continue
+                comment = None
+            elif n in doc_span and AUTHOR_WORDS.search(raw):
+                excluded.add((path, n))
+                continue
+            code.append(f"{n:5d}| {raw}")
+            note = comment if comment is not None else (raw.strip() if n in doc_span else "")
+            if note and UNIT_WORDS.search(note):
+                units.append(_clip(f"{path}:{n}: {note}"))
+        idents.update(x.id for x in ast.walk(node) if isinstance(x, ast.Name))
+        idents.update(x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute))
+
+
+def build_safety_brief(target: str, base: Optional[str] = None, max_tokens: int = 3000,
+                       repo: Optional[str] = None) -> str:
+    top, branch, tip, _worktree = resolve_target(target, repo)
+    base_rev, how = resolve_base(top, branch, tip, base)
+    mb = _git(top, "merge-base", base_rev, tip, check=False)
+    if not mb:
+        raise BriefError(f"no merge-base between {base_rev} and {branch}")
+    paths = [p for p in changed_paths(top, mb, tip) if not any(_matches(p, g) for g in EXCLUDED_PATHS)]
+    hunks = _diff_hunks(top, mb, tip, paths)
+    excluded: set = set()
+    code: List[str] = []
+    unit_lines: List[str] = []
+    idents: set = set()
+
+    for path in paths:
+        if path.endswith(".py"):
+            source = _git(top, "show", f"{tip}:{path}", check=False)
+            _py_code(path, source, hunks.get(path, ([], []))[0], code, unit_lines, idents, excluded)
+            continue
+        diff = _git(top, "diff", "-U5", "--no-renames", mb, tip, "--", path, check=False)
+        body = diff[diff.find("\n@@") + 1:].splitlines() if "\n@@" in diff else []
+        if not any(MATH_WORDS.search(l) for l in body):
+            continue
+        code.append(f"### {path} (changed hunks)")
+        for i, line in enumerate(body):
+            stripped = line[1:].strip()
+            if stripped.startswith(("#", "//")) and AUTHOR_WORDS.search(stripped):
+                excluded.add((path, i))
+                continue
+            code.append(_clip(line))
+
+    declared = _project_limit_paths(top)
+    limit_lines: List[str] = []
+    if declared is None:
+        limit_lines = ["(no limit_sources declared)"]
+    else:
+        for lp in declared:
+            defs = _module_defs(_git(top, "show", f"{tip}:{lp}", check=False))
+            for name in sorted(idents & defs.keys()):
+                limit_lines += [_clip(f"{lp}:{n}: {t}") for n, t in defs[name]]
+        limit_lines = limit_lines or ["(no collected identifier is defined in limit_sources)"]
+
+    ref_lines: List[str] = []
+    for path in paths:
+        if _is_test_path(path):
+            for n, text in hunks.get(path, ([], []))[1]:
+                if "assert" in text and NUMBER.search(text):
+                    ref_lines.append(_clip(f"{path}:{n}: {text.strip()}"))
+
+    try:
+        checklist = [l.rstrip() for l in CHECKLIST_PATH.read_text().splitlines() if l.strip()]
+        checklist = [l for l in checklist if not l.startswith("# ")]
+    except OSError:
+        checklist = [f"(checklist template missing: {CHECKLIST_PATH})"]
+
+    header = [f"# Safety-math brief: {branch}", f"- target: {target}",
+              f"- base: {base_rev} ({how}); merge-base {mb[:10]}", f"- tip: {tip}",
+              f"- files ({len(paths)}): " + ", ".join(paths)]
+    fixed_head = "\n".join(_clip(l) for l in header) + "\n"
+    tail = _render("## Excluded", [f"{len(excluded)} author-conclusion lines excluded "
+                                   "(commit messages, docs, reports, verified/safe comments)"])
+    variable = [
+        (_section("## Code under review", code), f"; git diff {mb[:10]}..{tip}"),
+        (_section("## Limit sources", limit_lines), ""),
+        (_section("## Units and frames", unit_lines), ""),
+        (_section("## Reference values (changed tests)", ref_lines), ""),
+    ]
+    budget = max_tokens * CHARS_PER_TOKEN
+    titles = sum(len(_render(t, b)) if b == ["(none)"] else len(t) + 1 for (t, b), _ in variable)
+    slack = 8 + sum(len(f"... (+{len(b)} more lines{h})") + 1 for (_, b), h in variable if b != ["(none)"])
+    check_room = (budget - len(fixed_head) - len(tail) - titles - slack - len("## Checklist\n")) // 2
+    check_text = _render("## Checklist", _fit(checklist, max(check_room, 0), "; see the template") or ["..."])
+    room = budget - len(fixed_head) - len(check_text) - len(tail) - titles - slack
+    sizes = [0 if b == ["(none)"] else sum(len(l) + 1 for l in b) for (_, b), _ in variable]
+    alloc = _share(sizes, max(room, 0))
+    parts = [fixed_head, check_text]
+    for ((title, body), hint), cap in zip(variable, alloc):
+        shown = body if body == ["(none)"] else (_fit(body, cap, hint) or ["..."])
+        parts.append(_render(title, shown))
+    parts.append(tail)
+    text = "".join(parts)
+    if len(text) > budget:
+        cut = f"\n... (brief cut at --max-tokens {max_tokens})\n"
+        text = text[: max(budget - len(cut), 0)].rsplit("\n", 1)[0] + cut
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cdx-agent --brief", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -365,6 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=None, help="repo to resolve a branch name in (default: cwd)")
     p.add_argument("--rules", default=None, help="rules block file (default: $CDX_BRIEF_RULES or "
                                                  "<tools_root>/base/brief_rules.md)")
+    p.add_argument("--focus", choices=("safety-math",), default=None,
+                   help="safety-math: verifier hand-off (formulas, code, limits; no author conclusions)")
     return p
 
 
@@ -374,6 +622,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("brief: --max-tokens must be >= 200", file=sys.stderr)
         return 2
     try:
+        if args.focus == "safety-math":
+            sys.stdout.write(build_safety_brief(args.target, args.base, args.max_tokens, args.repo))
+            return 0
         sys.stdout.write(build_brief(args.target, args.base, args.max_tokens, args.repo, args.rules))
     except BriefError as exc:
         print(f"brief: {exc}", file=sys.stderr)
