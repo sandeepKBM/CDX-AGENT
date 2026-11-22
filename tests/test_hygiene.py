@@ -129,5 +129,20 @@ def test_cli_hygiene_flag(repo, capsys):
     assert "hygiene report" in capsys.readouterr().out
 
 
+def test_merged_into_requires_head_contained_elsewhere(repo):
+    div = repo / ".claude" / "worktrees" / "div"
+    _g(repo, "worktree", "add", "-q", "-b", "div", str(div))
+    (div / "x.txt").write_text("x")
+    _g(div, "add", "-A")
+    _g(div, "commit", "-qm", "extra")  # not in any other branch
+    anc = repo / ".claude" / "worktrees" / "anc"
+    _g(repo, "worktree", "add", "-q", "-b", "anc", str(anc))  # tip == main's tip
+    wts = {w.branch: w for w in hygiene.list_worktrees(repo)}
+    assert hygiene._merged_into(repo, wts["div"]) == ""
+    assert hygiene._merged_into(repo, wts["anc"]) in ("main", "div")  # tip is an ancestor of main
+    rep = hygiene.build_report(repo, claude_home=repo / "c")
+    assert {w.branch for w, _ in rep.removable} == {"anc"}
+
+
 def test_sanitize_project_path():
     assert hygiene.sanitize_project_path(Path("/a/b.c/d")) == "-a-b-c-d"

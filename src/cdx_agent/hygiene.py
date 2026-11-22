@@ -158,12 +158,20 @@ class HygieneReport:
         )
 
 
+def contained_in_other_branch(repo: Path, head: str, own_branch: str = "") -> str:
+    """First branch (other than `own_branch`) that contains commit `head`, else ""."""
+    if not head:
+        return ""
+    out = _git(repo, "branch", "--format=%(refname:short)", "--contains", head)
+    others = [b.strip() for b in (out or "").splitlines() if b.strip() and b.strip() != own_branch]
+    return others[0] if others else ""
+
+
 def _merged_into(repo: Path, wt: Worktree) -> str:
+    """A worktree branch counts as merged only if its HEAD commit is contained in another branch."""
     if not wt.branch:
         return ""
-    out = _git(repo, "branch", "--format=%(refname:short)", "--merged", wt.branch)
-    others = [b.strip() for b in (out or "").splitlines() if b.strip() and b.strip() != wt.branch]
-    return others[0] if others else ""
+    return contained_in_other_branch(repo, wt.head, wt.branch)
 
 
 def build_report(

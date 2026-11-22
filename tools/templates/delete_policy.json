@@ -1,0 +1,9 @@
+{"version": 1,
+ "allow": [{"id": "pycache", "names": ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"]},
+           {"id": "own_scratch", "prefix": "${SESSION_SCRATCH}"},
+           {"id": "job_scratch", "manifest_scratch": ["finished", "failed", "gone"]},
+           {"id": "caches", "prefix": ["${HOME}/.cache/pip", "${HOME}/.cache/uv", "/freespace/local/ss5772/cache"]},
+           {"id": "merged_worktree", "git_worktree": ["clean", "contained_in_other_branch"]}],
+ "protect": [{"id": "ckpt", "glob": ["**/checkpoints/**", "**/*.pt", "**/*.ckpt", "**/*.safetensors"]},
+             {"id": "data", "glob": ["**/datasets/**", "**/logs/**", "**/results/**"]},
+             {"id": "cold", "prefix": ["/data/local/ss5772/coldbank"]}]}
