@@ -21,7 +21,7 @@ def test_build_hooks_payload_wires_all_four_scripts(tmp_path):
     # A6/D3 fix: the bash predecessor's generated hooks.json only referenced
     # 3 of the 4 installed scripts (silently dropped token_risk_warn.py).
     payload = hooks.build_hooks_payload(tmp_path / "hooks")
-    assert hooks.referenced_scripts(payload) == set(hooks.HOOK_SCRIPTS)
+    assert hooks.referenced_scripts(payload) == set(hooks.HOOK_SCRIPTS) - hooks.LINKED_ONLY
 
 
 def test_generated_hooks_json_matches_example_template_script_set(tmp_path):
@@ -88,7 +88,7 @@ def test_install_hooks_for_repo_end_to_end(tmp_path):
     assert result.hooks_json_path == repo / ".codex" / "hooks.json"
     assert result.hooks_json_path.is_file()
     payload = json.loads(result.hooks_json_path.read_text())
-    assert hooks.referenced_scripts(payload) == set(hooks.HOOK_SCRIPTS)
+    assert hooks.referenced_scripts(payload) == set(hooks.HOOK_SCRIPTS) - hooks.LINKED_ONLY
     assert len(result.linked_scripts) == len(hooks.HOOK_SCRIPTS)
 
 
@@ -111,7 +111,7 @@ def test_install_hooks_for_runtime_claude_writes_settings_file(tmp_path):
     assert result.claude_settings_path.is_file()
     payload = json.loads(result.claude_settings_path.read_text())
     assert "hooks" in payload
-    assert hooks.referenced_scripts(payload["hooks"]) == set(hooks.HOOK_SCRIPTS)
+    assert hooks.referenced_scripts(payload["hooks"]) == set(hooks.HOOK_SCRIPTS) - hooks.LINKED_ONLY
 
 
 def test_install_hooks_for_runtime_codex_has_no_settings_file(tmp_path):
@@ -124,7 +124,7 @@ def test_install_hooks_for_runtime_codex_has_no_settings_file(tmp_path):
 def test_build_claude_settings_payload_wraps_hooks_under_hooks_key(tmp_path):
     payload = hooks.build_claude_settings_payload(tmp_path / "hooks")
     assert set(payload.keys()) == {"hooks"}
-    assert hooks.referenced_scripts(payload["hooks"]) == set(hooks.HOOK_SCRIPTS)
+    assert hooks.referenced_scripts(payload["hooks"]) == set(hooks.HOOK_SCRIPTS) - hooks.LINKED_ONLY
 
 
 def test_build_claude_settings_payload_merges_base_settings(tmp_path):
@@ -228,3 +228,23 @@ def test_install_agent_defs_never_overwrites_user_files(tmp_path):
     assert [p.name for p in out] == ["Explore.md"]
     assert (dst / "Explore.md").read_text().endswith("v2\n") and (dst / "mine.md").read_text() == "user's own agent\n"
     assert hooks.install_agent_defs(src, dst) == []
+
+
+def test_safe_sandbox_block_only_when_enabled(tmp_path, monkeypatch):
+    import json as _json
+    from cdx_agent import hooks as _h
+    f = tmp_path / "sb.json"
+    f.write_text(_json.dumps({"_c": "x", "enabled": False, "filesystem": {"denyWrite": ["/p"]}}))
+    monkeypatch.delenv("CDX_SAFE_SANDBOX", raising=False)
+    assert "sandbox" not in _h.build_claude_settings_payload(tmp_path, None, None, f)
+    monkeypatch.setenv("CDX_SAFE_SANDBOX", "1")
+    sb = _h.build_claude_settings_payload(tmp_path, None, None, f)["sandbox"]
+    assert sb["enabled"] is True and sb["filesystem"]["denyWrite"] == ["/p"] and "_c" not in sb
+    assert "sandbox" not in _h.build_claude_settings_payload(tmp_path, None, None, None)
+
+
+def test_pretooluse_matcher_skips_edit_write(tmp_path):
+    from cdx_agent import hooks as _h
+    pre = _h.build_hooks_payload(tmp_path)["PreToolUse"]
+    assert pre[0]["matcher"] == "Bash|apply_patch"
+    assert not any("token_risk_warn" in h["command"] for e in pre for h in e["hooks"])

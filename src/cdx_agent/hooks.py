@@ -20,6 +20,7 @@ repo where destructive-command risk actually matters.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ HOOK_SCRIPTS: tuple[str, ...] = (
     "agent_model_gate.py",
     "output_cap.py",
 )
+# Linked into runtimes (older settings files still name them) but no longer wired: token_risk_warn is a no-op (F15).
+LINKED_ONLY = frozenset({"token_risk_warn.py"})
 
 Engine = Literal["codex", "claude"]
 
@@ -45,7 +48,7 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
     return {
         "PreToolUse": [
             {
-                "matcher": "Bash|Edit|Write|apply_patch",
+                "matcher": "Bash|apply_patch",  # F15: the policy returns at once for Edit/Write, so do not start it there
                 "hooks": [
                     {
                         "type": "command",
@@ -53,13 +56,7 @@ def build_hooks_payload(hooks_dir: Path) -> dict:
                         "timeout": 30,
                         "statusMessage": "Checking command or edit safety",
                     },
-                    {
-                        "type": "command",
-                        "command": f'/usr/bin/python3 "{hooks_dir / "token_risk_warn.py"}"',
-                        "timeout": 30,
-                        "statusMessage": "Checking token-risk command patterns",
-                    },
-                ],
+                ],  # token_risk_warn.py is a no-op now (F15): pre_tool_use_policy emits the token warnings
             },
             {   # every subagent names type / model / why; overrides of codex_tools/base/agent_policy.json ask the user
                 "matcher": "Agent|Task",
@@ -169,7 +166,8 @@ def write_hooks_json(hooks_dir: Path, hooks_json_path: Path) -> None:
     hooks_json_path.write_text(rendered)
 
 
-def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | None = None, env_file: Path | None = None) -> dict:
+def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | None = None, env_file: Path | None = None,
+                                  sandbox_file: Path | None = None) -> dict:
     """Claude Code loads hooks from a settings file's top-level "hooks" key
     (confirmed empirically: `claude --settings <path>` with
     `{"hooks": {...}}` fires the configured hooks) -- unlike Codex, which
@@ -186,7 +184,31 @@ def build_claude_settings_payload(hooks_dir: Path, base_settings_path: Path | No
     env_defaults = load_env_defaults(env_file)
     if env_defaults:
         payload["env"] = {**env_defaults, **(payload.get("env") or {})}       # the user's own env wins
+    sandbox = load_sandbox(sandbox_file)
+    if sandbox:
+        payload["sandbox"] = {**(payload.get("sandbox") or {}), **sandbox}    # ours wins: it is the --safe guard
     return payload
+
+
+def load_sandbox(sandbox_file: Path | None) -> dict:
+    """--safe sandbox block (user ruling Q4, 2026-11-20) from tools_root/base/claude_sandbox_safe.json.
+
+    Keys starting with '_' are comments. The file's "enabled" decides; CDX_SAFE_SANDBOX=1/0 overrides it (for the live
+    test). Returns {} when disabled or missing, so the settings carry no sandbox key at all.
+    """
+    if sandbox_file is None:
+        return {}
+    try:
+        data = json.loads(Path(sandbox_file).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    data = {k: v for k, v in data.items() if not k.startswith("_")}
+    force = os.environ.get("CDX_SAFE_SANDBOX")
+    enabled = force == "1" if force in ("0", "1") else bool(data.get("enabled"))
+    if not enabled:
+        return {}
+    data["enabled"] = True
+    return data
 
 
 def load_env_defaults(env_file: Path | None) -> dict:
@@ -230,8 +252,9 @@ def claude_settings_path_for_runtime(runtime_dir: Path) -> Path:
     return runtime_dir / "claude_hooks_settings.json"
 
 
-def write_claude_settings(hooks_dir: Path, base_settings_path: Path | None, output_path: Path, env_file: Path | None = None) -> None:
-    payload = build_claude_settings_payload(hooks_dir, base_settings_path, env_file)
+def write_claude_settings(hooks_dir: Path, base_settings_path: Path | None, output_path: Path, env_file: Path | None = None,
+                          sandbox_file: Path | None = None) -> None:
+    payload = build_claude_settings_payload(hooks_dir, base_settings_path, env_file, sandbox_file)
     rendered = json.dumps(payload, indent=2) + "\n"
     if output_path.exists():
         if output_path.read_text(errors="ignore") == rendered:
@@ -260,7 +283,8 @@ def install_hooks_for_repo(config: Config, repo: Path, engine: Engine = "codex")
     return HookInstallResult(hooks_dir=hooks_dir, hooks_json_path=hooks_json_path, linked_scripts=tuple(linked))
 
 
-def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine = "codex") -> HookInstallResult:
+def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine = "codex",
+                              access_mode: str = "full") -> HookInstallResult:
     hooks_dir, hooks_json_path = hooks_locations_for_runtime(runtime_dir)
     linked = install_hook_scripts(config.tools_root / "hooks", hooks_dir)
     write_hooks_json(hooks_dir, hooks_json_path)
@@ -268,7 +292,9 @@ def install_hooks_for_runtime(config: Config, runtime_dir: Path, engine: Engine 
     if engine == "claude":
         claude_settings_path = claude_settings_path_for_runtime(runtime_dir)
         base_settings_path = runtime_dir / "claude_settings.json"
-        write_claude_settings(hooks_dir, base_settings_path, claude_settings_path, config.tools_root / "base" / "claude_env.json")
+        sandbox_file = config.tools_root / "base" / "claude_sandbox_safe.json" if access_mode == "safe" else None
+        write_claude_settings(hooks_dir, base_settings_path, claude_settings_path, config.tools_root / "base" / "claude_env.json",
+                              sandbox_file)
         install_agent_defs(config.tools_root / "base" / "claude_agents", Path.home() / ".claude" / "agents")
     return HookInstallResult(
         hooks_dir=hooks_dir,

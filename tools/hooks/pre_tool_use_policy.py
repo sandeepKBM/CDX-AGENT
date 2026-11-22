@@ -302,6 +302,37 @@ def _common_cdx_dir(root: Path) -> Path:
     return root / ".cdx"
 
 
+def _hardware_verdict(command: str, payload: dict[str, Any]) -> str | None:
+    """`<repo>/.cdx/hardware.json` {"patterns": [regex...], "reason": "..."}: a Bash command that matches asks the user
+    (WP10; standing rule: no real robot/arm/gripper/motor actuation without approval in the current session)."""
+    root = _repo_root(payload.get("cwd"))
+    if root is None:
+        return None
+    for cdx in (root / ".cdx", _common_cdx_dir(root)):
+        f = cdx / "hardware.json"
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        for pat in data.get("patterns") or []:
+            try:
+                if re.search(pat, command):
+                    return (f"cdx-agent: this command matches a hardware pattern in {f} ({pat!r}). "
+                            f"{data.get('reason') or 'It can move or power real hardware.'} The user approves it in this session.")
+            except re.error:
+                continue
+        return None
+    return None
+
+
+def _ask(reason: str) -> int:
+    if os.environ.get("CDX_ENGINE") == "codex":   # Codex has no "ask"
+        return _deny(reason)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                             "permissionDecisionReason": reason}}))
+    return 0
+
+
 LONG_SUITE_TAGS = {"local-only"}   # `tests/test_x.py local-only`: needs workstation-local data, never send it to Slurm
 
 
@@ -710,6 +741,9 @@ def main() -> int:
         slurm = _slurm_verdict(command)
         if slurm:
             return _deny(slurm)
+        hw = _hardware_verdict(command, payload)
+        if hw:
+            return _ask(hw)
 
     ti = payload.get("tool_input") or {}
     poll = poll_guard(command, bool(ti.get("run_in_background")) if isinstance(ti, dict) else False)

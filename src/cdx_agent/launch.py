@@ -254,7 +254,7 @@ def prepare_launch(
         if stale:
             rendered_rules = rendered_rules.rstrip("\n") + "\n\n" + hygiene.stale_warning_line(list(stale)) + "\n"
         doc_sync = context_docs.sync_runtime_docs(rctx.runtime_dir, rendered_rules, engine=engine)
-        hook_install = hooks.install_hooks_for_runtime(config, rctx.runtime_dir, engine=engine)
+        hook_install = hooks.install_hooks_for_runtime(config, rctx.runtime_dir, engine=engine, access_mode=access_mode)
 
     plan = None
     if plan_allowed:
