@@ -41,3 +41,5 @@ Thumbs.db
 *.bak-*
 *.bak.*
 /.claude/worktrees/
+/.cdx/runs/
+/.cdx/jobs.jsonl
