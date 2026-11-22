@@ -13,7 +13,9 @@
   checkpoints, ...), ``external/*`` symlinks and every path in the command are resolved; if one lands under an
   ``--unreadable-prefix`` (default /data/local, env CDX_NODE_UNREADABLE, comma separated) the job is refused (exit 2) and the exact
   local background command is printed (niced, OMP/MKL/OPENBLAS=2, CUDA_VISIBLE_DEVICES=, timeout). ``--allow-local-data`` overrides.
-Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments, no node, or data not readable from nodes.
+- Node-cap guard: with the account's GrpTRES node cap (read live) reached by running jobs on another node, a new job would pend
+  (AssocGrpNodeLimit): exit 2 and print the exact ``cdx-agent --run ...`` line that places the command as a step in that hold.
+Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments, no node, node cap, or data not readable from nodes.
 """
 from __future__ import annotations
 
@@ -27,7 +29,9 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from cdx_agent.gpu_pick import _state_blocked, parse_mem_mb, parse_scontrol
+from cdx_agent.gpu_pick import (
+    _state_blocked, parse_mem_mb, parse_scontrol, parse_squeue, read_grptres, run_command, running_nodes,
+)
 
 FOOTPRINTS = "/common/users/ss5772/codex_tools/base/footprints.json"
 DEFAULT_UNREADABLE = ("/data/local",)
@@ -121,6 +125,21 @@ def _fetch(host: Optional[str]) -> tuple:
     sinfo = subprocess.run(_slurm("sinfo -N -O NodeList,CPUsState -h", host), capture_output=True, text=True, timeout=60).stdout
     scon = subprocess.run(_slurm("scontrol show node -o", host), capture_output=True, text=True, timeout=60).stdout
     return sinfo, scon
+
+
+def hold_state(host: Optional[str], user: Optional[str] = None) -> tuple:
+    """(node_limit, nodes of the user's RUNNING jobs) live from sacctmgr GrpTRES and squeue; (None, set()) when unreadable."""
+    user = user or os.environ.get("USER", "")
+    _, node_limit = read_grptres(user, host)
+    r = run_command(_slurm(f'squeue -u {shlex.quote(user)} -h -t RUNNING -o "%i|%j|%N|%b|%T|%r"', host))
+    if r.returncode != 0:
+        return None, set()
+    return node_limit, running_nodes(parse_squeue(r.stdout))
+
+
+def run_line(cmd: Sequence[str], cpus: int, mem: str, time_s: str, name: str) -> str:
+    """The ``cdx-agent --run`` command that places ``cmd`` as a step in the user's existing hold."""
+    return f"cdx-agent --run --cpus {cpus} --mem {mem} --time {time_s} --name {shlex.quote(name)} -- {shlex.join(cmd)}"
 
 
 def _under(path: str, prefixes: Sequence[str]) -> Optional[str]:
@@ -260,6 +279,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a.mem = mem
     mem_mb = parse_mem_mb(mem)
     prefixes = [s.strip() for s in a.prefix.split(",") if s.strip()]
+    limit, used = hold_state(a.slurm_host)
+    if limit is not None and used and len(used) >= limit and a.node not in used:
+        print(f"cpu_job: refused: node cap {limit} reached (running jobs on {', '.join(sorted(used))}); a job on another node "
+              "would pend: AssocGrpNodeLimit. Place it as a step in that hold instead:", file=sys.stderr)
+        print("  " + run_line(cmd, a.threads, mem, a.time, a.name), file=sys.stderr)
+        return 2
     sinfo, scon = _fetch(a.slurm_host)
     node, why = a.node, None
     if node is None:

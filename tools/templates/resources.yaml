@@ -1,0 +1,8 @@
+# <repo>/.cdx/resources.yaml: what `cdx-agent --run --profile NAME -- CMD` may ask the cluster for.
+profiles:
+  suite-cpu: {cpus: 48, gpus: 0, mem: 64G, time: 2h, threads_per_proc: 1,
+              host_class: [slurm-step, slurm-job, local], footprint: mujoco-mpc-sweep, snapshot: true}
+  render:    {cpus: 8, gpus: 1, gpu_mem: 8G, host_class: [westeros, slurm-step], env: {MUJOCO_GL: egl}}
+data:
+  /data/local/ss5772/x: {tier: COLD, readable_from: [westeros]}
+scratch: {BIMANUAL_PLAN_CACHE: plan}     # env var -> per-job dir on node-local disk

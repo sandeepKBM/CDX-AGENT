@@ -1,0 +1,4 @@
+PLAN class=slurm-job node=ilab3 cpus=48 gpus=0 mem=64G time=2h
+rejected slurm-step: no running hold
+rejected slurm-job node=ilab1: idle CPUs 44 < 48
+rejected slurm-job node=ilab2: idle CPUs 8 < 48

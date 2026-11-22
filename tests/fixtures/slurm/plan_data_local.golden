@@ -1,0 +1,4 @@
+PLAN class=local node=testbox cpus=8 gpus=0 mem=16G time=2h
+rejected slurm-step: data not readable from Slurm nodes (/data/local/x -> /data/local/x)
+rejected slurm-job: data not readable from Slurm nodes (/data/local/x -> /data/local/x)
+rejected westeros: no GPUs requested

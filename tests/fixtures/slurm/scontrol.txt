@@ -1,0 +1,5 @@
+NodeName=ilab1 CPUAlloc=4 CPUEfctv=48 CPUTot=48 RealMemory=256000 AllocMem=4000 State=MIXED
+NodeName=ilab2 CPUAlloc=40 CPUEfctv=48 CPUTot=48 RealMemory=256000 AllocMem=4000 State=MIXED
+NodeName=ilab3 CPUAlloc=0 CPUEfctv=48 CPUTot=48 RealMemory=256000 AllocMem=0 State=IDLE
+NodeName=rlab2 CPUAlloc=8 CPUEfctv=48 CPUTot=48 RealMemory=256000 AllocMem=8000 State=MIXED
+NodeName=rlab4 CPUAlloc=30 CPUEfctv=48 CPUTot=48 RealMemory=256000 AllocMem=60000 State=MIXED

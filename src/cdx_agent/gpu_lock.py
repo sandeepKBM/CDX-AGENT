@@ -2,7 +2,9 @@
 
     cdx-agent --gpu-lock HOLD_JOBID [--n K | --gpu G[,G2]] [--eta MIN] [--host rlab1] [--gres gpu:a100:4] [--mem 16G]
                          [--time MIN] [--who NAME] [--no-snapshot] [--dry-run] -- CMD...
-    cdx-agent --gpu-lock --status [--node NODE]          (NODE default $CDX_GPU_LOCK_NODE or rlab2; 'local' = here)
+    cdx-agent --gpu-lock --status [--node NODE]          (NODE default: $CDX_GPU_LOCK_NODE, else the node of your live
+                                                          running hold, else rlab2 with a printed note; 'local' = here)
+    --n 0: a CPU-only step in the hold (takes no GPU lock, CUDA_VISIBLE_DEVICES empty); --chdir DIR, --env K=V (repeatable).
 
 Submit side: ssh <host> srun --jobid=HOLD --overlap --gres=<the hold's gres> --mem=M [-t T] \\
                  python3 <this file> node-run ... -- CMD     (--dry-run prints this instead of running it)
@@ -44,7 +46,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_LOCK_DIR = "/freespace/local/ss5772/gpu_locks"
 DEFAULT_HOST = "rlab1"
-DEFAULT_STATUS_NODE = os.environ.get("CDX_GPU_LOCK_NODE", "rlab2")
+FALLBACK_STATUS_NODE = "rlab2"
 SHELLS = ("bash", "sh", "dash", "zsh", "ksh")
 EXIT_USAGE, EXIT_NO_LOCK, EXIT_BUSY = 2, 3, 4
 _SHELL_OPTS_WITH_ARG = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
@@ -275,6 +277,29 @@ def parse_gpus(spec: str) -> List[int]:
     return out
 
 
+def run_without_gpu(cmd: List[str], chdir: Optional[str], extra_env: Dict[str, str]) -> int:
+    """--n 0: a CPU-only step. No GPU lock, no owner file; CUDA_VISIBLE_DEVICES is emptied."""
+    env = dict(os.environ, **extra_env)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    print(f"gpu-lock: {socket.gethostname()} CPU-only step (--n 0), no GPU lock taken", file=sys.stderr, flush=True)
+    try:
+        proc = subprocess.Popen(cmd, env=env, cwd=chdir or None, start_new_session=True)
+    except OSError as exc:
+        print(f"gpu-lock: cannot start {cmd[0]}: {exc}", file=sys.stderr)
+        return 127
+
+    def forward(signum, _frame):
+        try:
+            os.killpg(proc.pid, signum)
+        except OSError:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward)
+    rc = proc.wait()
+    return 128 - rc if rc < 0 else rc
+
+
 def node_main(argv: Sequence[str], cmd: List[str]) -> int:
     p = argparse.ArgumentParser(prog="gpu_lock.py node-run")
     p.add_argument("--n", type=int, default=1)
@@ -285,10 +310,21 @@ def node_main(argv: Sequence[str], cmd: List[str]) -> int:
     p.add_argument("--busy-mib", type=int, default=1500)
     p.add_argument("--force-busy", action="store_true", help="skip the nvidia-smi idle check")
     p.add_argument("--no-snapshot", action="store_true")
+    p.add_argument("--chdir", default=None, help="directory CMD runs in")
+    p.add_argument("--env", action="append", default=[], metavar="K=V", help="extra environment for CMD (repeatable)")
     args = p.parse_args(argv)
     if not cmd:
         print("gpu-lock node-run: missing -- CMD", file=sys.stderr)
         return EXIT_USAGE
+    extra: Dict[str, str] = {}
+    for item in args.env:
+        if "=" not in item or not item.split("=", 1)[0]:
+            print(f"gpu-lock node-run: --env wants K=V, got {item!r}", file=sys.stderr)
+            return EXIT_USAGE
+        k, v = item.split("=", 1)
+        extra[k] = v
+    if args.n == 0:
+        return run_without_gpu(cmd, args.chdir, extra)
     pid = os.getpid()
     created: List[str] = []
     run_dir = os.environ.get("CDX_GPU_LOCK_RUN_DIR") or run_dir_for(args.lock_dir, pid)
@@ -326,7 +362,7 @@ def node_main(argv: Sequence[str], cmd: List[str]) -> int:
             write_owner(args.lock_dir, g, owner_line(args.who, g, pid, host, step, since, eta, cmd))
         run_cmd, copies, extra_env = (list(cmd), [], {}) if args.no_snapshot else snapshot_command(cmd, run_dir)
         created.extend(copies)
-        env = dict(os.environ, **extra_env)
+        env = dict(os.environ, **extra_env, **extra)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpus)
         env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # CUDA index == nvidia-smi index == lock index
         env["CDX_GPU_LOCKS"] = ",".join(lock_path(args.lock_dir, g) for g in gpus)
@@ -348,7 +384,7 @@ def node_main(argv: Sequence[str], cmd: List[str]) -> int:
             signal.signal(sig, forward)
         if received:  # stopped before CMD started
             return 128 + received[0]
-        proc = subprocess.Popen(run_cmd, env=env, pass_fds=[fd for _, fd in taken], start_new_session=True)
+        proc = subprocess.Popen(run_cmd, env=env, cwd=args.chdir or None, pass_fds=[fd for _, fd in taken], start_new_session=True)
         rc = proc.wait()
         if rc < 0:
             rc = 128 - rc
@@ -416,13 +452,53 @@ def status_lines(lock_dir: str, proc_locks: Optional[str] = None) -> List[str]:
     return lines
 
 
+def live_hold_node(host: str) -> Optional[str]:
+    """The node of the user's RUNNING job (the shared hold) from `squeue` over ssh, or None."""
+    user = os.environ.get("USER") or ""
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", host,
+                            f"squeue -h -t RUNNING -u {shlex.quote(user)} -o '%N'"],
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        from cdx_agent.gpu_pick import _expand_nodes
+    except ImportError:  # running as a bare script: first plain node name
+        _expand_nodes = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        nodes = sorted(_expand_nodes(line)) if _expand_nodes else [line.split(",")[0]]
+        if nodes:
+            return nodes[0]
+    return None
+
+
+def status_node(host: str) -> str:
+    env = os.environ.get("CDX_GPU_LOCK_NODE")
+    if env:
+        return env
+    node = live_hold_node(host)
+    if node:
+        return node
+    print(f"gpu-lock: no running hold found via squeue on {host}; falling back to {FALLBACK_STATUS_NODE} "
+          "(pass --node)", file=sys.stderr)
+    return FALLBACK_STATUS_NODE
+
+
 def status_main(argv: Sequence[str]) -> int:
     p = argparse.ArgumentParser(prog="cdx-agent --gpu-lock --status")
     p.add_argument("--status", action="store_true")
     p.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)  # status is read-only anyway
-    p.add_argument("--node", default=DEFAULT_STATUS_NODE, help="node holding the locks, or 'local'")
+    p.add_argument("--node", default=None, help="node holding the locks, or 'local' (default: the node of your live hold)")
+    p.add_argument("--host", default=DEFAULT_HOST, help="Slurm login host for the live-hold lookup (default rlab1)")
     p.add_argument("--lock-dir", default=DEFAULT_LOCK_DIR)
     args = p.parse_args(argv)
+    if args.node is None:
+        args.node = status_node(args.host)
     if args.node in ("local", "localhost", socket.gethostname(), socket.gethostname().split(".")[0]):
         print("\n".join(status_lines(args.lock_dir)))
         return 0
@@ -482,27 +558,35 @@ def default_who() -> str:
 def build_ssh_command(hold: str, host: str, gres: str, mem: str, time_min: Optional[int], n: int,
                       eta: Optional[float], who: str, lock_dir: str, python: str, cmd: Sequence[str],
                       no_snapshot: bool = False, force_busy: bool = False, wrapper: Optional[str] = None,
-                      gpus: Optional[str] = None) -> List[str]:
+                      gpus: Optional[str] = None, chdir: Optional[str] = None,
+                      env: Sequence[str] = ()) -> List[str]:
+    """ssh command running the node-side wrapper in a step of the hold. n == 0: CPU-only step (gres may be None)."""
     node = [python, wrapper or os.path.abspath(__file__), "node-run", "--n", str(n),
-            "--gpus", gpus or f"0-{gres_count(gres) - 1}", "--who", who, "--lock-dir", lock_dir]
+            "--gpus", gpus or (f"0-{gres_count(gres) - 1}" if gres else "0-3"), "--who", who, "--lock-dir", lock_dir]
+    if chdir:
+        node += ["--chdir", chdir]
+    for item in env:
+        node += ["--env", item]
     if eta:
         node += ["--eta", f"{eta:g}"]
     if no_snapshot:
         node.append("--no-snapshot")
     if force_busy:
         node.append("--force-busy")
-    srun = ["srun", f"--jobid={hold}", "--overlap", f"--gres={gres}", f"--mem={mem}"]
+    srun = ["srun", f"--jobid={hold}", "--overlap"] + ([f"--gres={gres}"] if n > 0 and gres else []) + [f"--mem={mem}"]
     if time_min:
         srun += ["-t", str(int(time_min))]
     remote = " ".join(shlex.quote(x) for x in srun + node + ["--"] + list(cmd))
-    return ["ssh", "-o", "BatchMode=yes", host, remote]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", host, remote]
 
 
 def submit_main(argv: Sequence[str], cmd: List[str]) -> int:
     p = argparse.ArgumentParser(prog="cdx-agent --gpu-lock", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("hold", help="job id of the shared GPU hold (owned by another session; never scancel it)")
-    p.add_argument("--n", type=int, default=1, help="GPUs (locks) to take (default 1)")
+    p.add_argument("--n", type=int, default=1, help="GPUs (locks) to take (default 1; 0 = CPU-only step, no lock)")
+    p.add_argument("--chdir", help="directory CMD runs in on the node")
+    p.add_argument("--env", action="append", default=[], metavar="K=V", help="environment for CMD (repeatable)")
     p.add_argument("--gpu", help="lock exactly these GPU indices of the hold (e.g. 2 or 1,3), all or nothing; "
                                  "use when peers agreed on indices (default: the lowest K free)")
     p.add_argument("--eta", type=float, help="expected minutes, written into the owner file")
@@ -523,11 +607,14 @@ def submit_main(argv: Sequence[str], cmd: List[str]) -> int:
     if not re.fullmatch(r"\d+", args.hold):
         print(f"gpu-lock: HOLD_JOBID must be a job number, got {args.hold!r}", file=sys.stderr)
         return EXIT_USAGE
+    if args.n < 0 or any("=" not in e for e in args.env):
+        print("gpu-lock: --n must be >= 0 and --env wants K=V", file=sys.stderr)
+        return EXIT_USAGE
     gres = parse_gres(args.gres) if args.gres else None
     if args.gres and not gres:
         print(f"gpu-lock: cannot parse --gres {args.gres!r} (want gpu[:type]:count)", file=sys.stderr)
         return EXIT_USAGE
-    if gres is None:
+    if gres is None and args.n > 0:
         state, gres, detail = query_hold(args.host, args.hold)
         print(f"gpu-lock: {detail}", file=sys.stderr)
         if gres is None:
@@ -536,10 +623,13 @@ def submit_main(argv: Sequence[str], cmd: List[str]) -> int:
         if state != "RUNNING" and not args.dry_run:
             print(f"gpu-lock: hold {args.hold} is {state}, not RUNNING", file=sys.stderr)
             return EXIT_USAGE
-    if args.n < 1 or args.n > gres_count(gres):
+    if args.n > 0 and args.n > gres_count(gres):
         print(f"gpu-lock: --n {args.n} outside 1..{gres_count(gres)} ({gres})", file=sys.stderr)
         return EXIT_USAGE
     n, gpus = args.n, None
+    if args.gpu and n == 0:
+        print("gpu-lock: --gpu needs --n >= 1", file=sys.stderr)
+        return EXIT_USAGE
     if args.gpu:
         try:
             idx = parse_gpus(args.gpu)
@@ -556,7 +646,8 @@ def submit_main(argv: Sequence[str], cmd: List[str]) -> int:
     time_min = args.time or (int(max(10, round(2 * args.eta))) if args.eta else None)
     ssh_cmd = build_ssh_command(args.hold, args.host, gres, args.mem, time_min, n, args.eta,
                                 args.who or default_who(), args.lock_dir, args.python, cmd,
-                                no_snapshot=args.no_snapshot, force_busy=args.force_busy, gpus=gpus)
+                                no_snapshot=args.no_snapshot, force_busy=args.force_busy, gpus=gpus,
+                                chdir=args.chdir, env=args.env)
     line = " ".join(shlex.quote(x) for x in ssh_cmd)
     if args.dry_run:
         print(line)

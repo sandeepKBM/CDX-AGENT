@@ -1,4 +1,14 @@
+import pytest
+
 from cdx_agent import cpu_job
+
+REAL_HOLD_STATE = cpu_job.hold_state
+
+
+@pytest.fixture(autouse=True)
+def _no_hold(monkeypatch):
+    """No live Slurm: by default the user has no running jobs (node cap not reached)."""
+    monkeypatch.setattr(cpu_job, "hold_state", lambda host, user=None: (1, set()))
 
 SINFO = """ilab1               46/18/0/64
 ilab2               18/46/0/64
@@ -129,3 +139,26 @@ def test_per_proc_threads():
     assert per_proc_threads(8, 3) == 2
     assert per_proc_threads(2, 16) == 1
     assert "OMP_NUM_THREADS=1 " in build_script(["true"], "/tmp", per_proc_threads(8, 8))
+
+
+def test_node_cap_reached_refuses_and_prints_the_run_line(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: pytest.fail("no node pick when the cap is reached"))
+    monkeypatch.setattr(cpu_job, "hold_state", lambda host, user=None: (1, {"rlab4"}))
+    rc = cpu_job.main(["--threads", "48", "--mem", "64G", "--time", "2:00:00", "--name", "suite", "--cwd", str(tmp_path),
+                       "--", "python", "-m", "pytest", "-q", "tests/a b.py"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "node cap 1 reached (running jobs on rlab4)" in err
+    assert ("  cdx-agent --run --cpus 48 --mem 64G --time 2:00:00 --name suite -- python -m pytest -q 'tests/a b.py'"
+            in err.splitlines())
+    # a node that is the hold's own node is not refused
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
+    assert cpu_job.main(["--node", "rlab4", "--force", "--dry-run", "--cwd", str(tmp_path), "--", "echo", "hi"]) == 0
+
+
+def test_hold_state_reads_grptres_and_running_nodes(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(cpu_job, "read_grptres", lambda user, host: (8, 1))
+    monkeypatch.setattr(cpu_job, "run_command", lambda cmd: subprocess.CompletedProcess(
+        cmd, 0, "7|hold|rlab4|gres/gpu:a4000:4|RUNNING|None\n8|q|ilab1|N/A|PENDING|Resources\n", ""))
+    assert REAL_HOLD_STATE(None, "u") == (1, {"rlab4"})
