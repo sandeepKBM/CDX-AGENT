@@ -117,3 +117,29 @@ def test_probe_script_runs(tmp_path):
     script = f"ROOT = {str(p)!r}\n" + inuse.PROBE_SRC + inuse._PROBE_MAIN
     r = subprocess.run([sys.executable, "-"], input=script, capture_output=True, text=True)
     assert r.returncode == 0
+
+
+def test_ancestor_cmdline_ignored_but_cwd_counts(tmp_path):
+    from cdx_agent import inuse
+    proc = tmp_path / "proc"
+    target = tmp_path / "t"
+    target.mkdir()
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+
+    def mk(pid, ppid, cmd, cwd):
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "comm").write_text("bash\n")
+        (d / "cmdline").write_bytes("\0".join(cmd).encode())
+        (d / "status").write_text(f"Name:\tbash\nPPid:\t{ppid}\n")
+        (d / "cwd").symlink_to(cwd)
+        (d / "fd").mkdir()
+    mk(100, 1, ["bash", "-c", f"cdx-agent --rm {target}"], other)
+    mk(200, 100, ["python3", "-m", "cdx_agent.trash", "rm", str(target)], other)
+    ns: dict = {}
+    exec(inuse.PROBE_SRC, ns)
+    assert ns["_scan"](str(target), str(proc), 200) == []
+    (proc / "100" / "cwd").unlink()
+    (proc / "100" / "cwd").symlink_to(target)
+    assert ns["_scan"](str(target), str(proc), 200)

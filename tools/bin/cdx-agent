@@ -2159,7 +2159,7 @@ while [[ $# -gt 0 ]]; do
       COMPRESS_COMMAND=("$@")
       break
       ;;
-    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene)
+    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse)
       MODE="${1#--}"
       shift
       MODULE_ARGS=("$@")
@@ -2529,6 +2529,21 @@ case "$MODE" in
     ;;
   coldbank)
     cdx_agent_mod coldbank "${MODULE_ARGS[@]}"
+    ;;
+  deploy)
+    if cdx_is_dry_run; then cdx_agent_mod deploy --dry-run "${MODULE_ARGS[@]}"; else cdx_agent_mod deploy "${MODULE_ARGS[@]}"; fi
+    ;;
+  value)
+    cdx_agent_mod values "${MODULE_ARGS[@]}"
+    ;;
+  rm)
+    if cdx_is_dry_run; then cdx_agent_mod trash rm --dry-run "${MODULE_ARGS[@]}"; else cdx_agent_mod trash rm "${MODULE_ARGS[@]}"; fi
+    ;;
+  trash)
+    cdx_agent_mod trash "${MODULE_ARGS[@]}"
+    ;;
+  inuse)
+    cdx_agent_mod inuse "${MODULE_ARGS[@]}"
     ;;
   cpu-job)
     cdx_agent_mod cpu_job "${MODULE_ARGS[@]}"

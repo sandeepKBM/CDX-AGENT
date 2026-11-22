@@ -36,6 +36,17 @@ def _scan(root, proc_root="/proc", me=None):
         pids = [int(p) for p in os.listdir(proc_root) if p.isdigit()]
     except OSError:
         return out
+    # the caller's own ancestors (the shell running `cdx-agent --rm PATH`) carry PATH in argv: ignore
+    # their command lines, but keep checking their cwd and open files.
+    ancestors = set()
+    cur = me
+    while cur and cur > 1 and cur not in ancestors:
+        ancestors.add(cur)
+        try:
+            with open(os.path.join(proc_root, str(cur), "status")) as fh:
+                cur = int(next(x for x in fh if x.startswith("PPid:")).split()[1])
+        except (OSError, StopIteration, ValueError):
+            break
     for pid in pids:
         if pid == me:
             continue
@@ -51,7 +62,7 @@ def _scan(root, proc_root="/proc", me=None):
         except OSError:
             args = []
         hit = None
-        for a in args:
+        for a in ([] if pid in ancestors else args):
             if a.startswith("/") and inside(os.path.normpath(a)):
                 hit = "cmdline " + a
                 break

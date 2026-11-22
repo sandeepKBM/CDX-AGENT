@@ -110,3 +110,46 @@ def test_hook_git_reset_hard_only_when_executed(tmp_path):
     p = _hook({"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD"}, "cwd": str(tmp_path),
                "session_id": "t"}, env)
     assert json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.fixture
+def real_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("CDX_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setenv("CDX_DELETE_POLICY", str(Path(__file__).resolve().parents[1] / "tools/templates/delete_policy.json"))
+    monkeypatch.setenv("CDX_AGENT_PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    monkeypatch.setenv("CDX_TRASH_ROOTS", json.dumps([str(tmp_path / "trash")]))
+    work = tmp_path / "work"
+    work.mkdir()
+    return work
+
+
+def test_tier_a_pycache_allowed_and_logged(real_policy, tmp_path):
+    (real_policy / "__pycache__").mkdir()
+    v = dg.check("rm -rf __pycache__", str(real_policy))
+    assert v.action == "allow"
+    rows = [json.loads(x) for f in (tmp_path / "audit").iterdir() for x in f.read_text().splitlines()]
+    assert rows[-1]["action"] == "allowed" and rows[-1]["tier"] == "a"
+
+
+def test_tier_b_plain_folder_denied_with_rm_hint(real_policy):
+    (real_policy / "build").mkdir()
+    v = dg.check("rm -r build", str(real_policy))
+    assert v.action == "deny" and "cdx-agent --rm" in v.reason and "tier b" in v.reason
+
+
+@pytest.mark.parametrize("make, cmd", [
+    (lambda w: (w / "checkpoints" / "run1").mkdir(parents=True), "rm -rf checkpoints"),
+    (lambda w: (w / "model.pt").write_text("x"), "rm model.pt"),
+    (lambda w: (w / "repo" / ".git").mkdir(parents=True), "rm -rf repo/.git"),
+])
+def test_tier_c_protected_denied_with_user_line(real_policy, make, cmd):
+    make(real_policy)
+    v = dg.check(cmd, str(real_policy))
+    assert v.action == "deny" and "tier c" in v.reason and "! rm -r" in v.reason
+
+
+def test_mixed_targets_strictest_wins(real_policy):
+    (real_policy / "__pycache__").mkdir()
+    (real_policy / "keep").mkdir()
+    v = dg.check("rm -rf __pycache__ keep", str(real_policy))
+    assert v.action == "deny" and "tier b" in v.reason
