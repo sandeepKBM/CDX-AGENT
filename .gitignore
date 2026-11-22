@@ -35,3 +35,8 @@ codex_runtime/
 codex_runtime_danger_auto/
 .DS_Store
 Thumbs.db
+
+# personal/site files: own local git repo, never pushed (decision Q7, 2026-11-22)
+/site/
+*.bak-*
+*.bak.*
