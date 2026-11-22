@@ -237,12 +237,11 @@ def test_advisory_hooks_dedupe_messages_but_not_permission_decisions(tmp_path):
     assert second_deny["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     risk = _script_copy(tmp_path, "token_risk_warn.py")
-    assert _run_hook(risk, _pre_payload("ls -R .", session_id="a")).stdout.strip() != ""
-    assert _run_hook(risk, _pre_payload("ls -R .", session_id="a")).stdout.strip() == ""
+    assert _run_hook(risk, _pre_payload("ls -R .", session_id="a")).stdout.strip() == ""   # F15: token_risk_warn is a no-op
 
 
 def test_advisory_state_corruption_is_tolerated(tmp_path):
-    script = _script_copy(tmp_path, "token_risk_warn.py")
+    script = _script_copy(tmp_path, "pre_tool_use_policy.py")
     (script.parent / ".risk_advisory_state.json").write_text("not json")
     proc = _run_hook(script, _pre_payload("find ."))
     assert proc.returncode == 0 and proc.stdout.strip()
@@ -279,6 +278,8 @@ def test_post_review_stats_rotate(tmp_path):
 # --- agent_model_gate.py: every Agent launch names type / model / why; overrides ask the user -------------------------------
 def _agent_payload(prompt: str, model=None, sub=None, tool_name: str = "Agent") -> dict:
     ti = {"prompt": prompt, "description": "t"}
+    if sub is None:   # F16: search/run types only accept their own subagent_types
+        sub = "runner" if "type=run " in prompt else "Explore" if "type=search " in prompt else None
     if model is not None:
         ti["model"] = model
     if sub is not None:
@@ -524,3 +525,15 @@ def test_post_review_restart_nudge_levels_and_missing_or_small_transcripts(tmp_p
     small_payload = _bash_payload(tmp_path, "true", session_id="small-transcript-session")
     small_payload["transcript_path"] = str(small)
     assert _run_hook(script, small_payload).stdout.strip() == ""
+
+
+def test_post_review_restart_nudge_uses_last_usage_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("CDX_RESTART_NUDGE_MB", "0.0001")
+    script = _script_copy(tmp_path, "post_tool_use_review.py")
+    transcript = tmp_path / "t.jsonl"
+    usage = {"input_tokens": 5, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 20, "output_tokens": 9}
+    transcript.write_text(json.dumps({"message": {"role": "assistant", "usage": usage}}) + "\n")
+    payload = _bash_payload(tmp_path, "true", session_id="usage-session")
+    payload["transcript_path"] = str(transcript)
+    ctx = json.loads(_run_hook(script, payload).stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "(1025 tokens)" in ctx and "~1025" not in ctx

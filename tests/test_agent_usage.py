@@ -58,3 +58,25 @@ def test_json_output_and_big_flag(tmp_path, capsys):
     assert data[0]["id"] == "adeadbeef"
     assert "BIG" in data[0]["flags"]
     assert "x" not in capsys.readouterr().out
+
+
+def _tu(tid, name, **inp):
+    return record("assistant", {"role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": name, "input": inp}]})
+
+
+def _tr(tid):
+    return record("user", {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": "ok"}]})
+
+
+def test_waiting_clears_after_later_tool_use(tmp_path):
+    """F17: only the LAST tool use decides WAITING; a sleep followed by a Read is not waiting."""
+    path = tmp_path / "a1.output"
+    path.write_text("\n".join([_tu("t1", "Bash", command="sleep 30"), _tr("t1"), _tu("t2", "Read", file_path="/x"), _tr("t2")]) + "\n")
+    assert "WAITING" not in agent_usage.parse_transcript(path).flags
+    path.write_text("\n".join([_tu("t1", "Bash", command="sleep 30"), _tr("t1"), _tu("t2", "Bash", command="ls")]) + "\n")
+    assert "WAITING" not in agent_usage.parse_transcript(path).flags
+    text = record("assistant", {"role": "assistant", "content": [{"type": "text", "text": "done"}]})
+    path.write_text("\n".join([_tu("t1", "Bash", command="sleep 30"), _tr("t1"), text]) + "\n")
+    assert "WAITING" not in agent_usage.parse_transcript(path).flags
+    path.write_text(_tu("t1", "Bash", command="sleep 30") + "\n")
+    assert "WAITING" in agent_usage.parse_transcript(path).flags
