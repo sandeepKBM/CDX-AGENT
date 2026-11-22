@@ -93,6 +93,8 @@ MODES: List[Mode] = [
     _m("--rm", "move files to trash instead of deleting", "data", "python", "trash", dry=True, writes=True),
     _m("--trash", "trash index, restore, drain", "data", "python", "trash", writes=True),
     _m("--inuse", "check whether paths are in use", "data", "python", "inuse"),
+    _m("--suite", "per-file pytest fan-out with the test-routing map", "session", "python", "suite"),
+    _m("--check", "check .cdx conventions, docs drift, report wording, refs", "session", "python", "check"),
     _m("--verify-log", "subagent claims and the owner's re-checks", "session", "python", "verify_log"),
     # site
     _m("--site-facts", "live GPU caps, free space and quota", "site", "python", "site_facts", net=True),

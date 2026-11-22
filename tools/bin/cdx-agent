@@ -2160,7 +2160,7 @@ while [[ $# -gt 0 ]]; do
       COMPRESS_COMMAND=("$@")
       break
       ;;
-    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse|--site-facts|--verify-log)
+    --offload|--notify|--move-verify|--gpu-lock|--brief|--handoff|--cpu-job|--watch|--agent-usage|--gpu-pick|--coldbank|--hash-repro|--teardown|--hygiene|--deploy|--value|--rm|--trash|--inuse|--site-facts|--verify-log|--suite|--check)
       MODE="${1#--}"
       shift
       MODULE_ARGS=("$@")
@@ -2564,6 +2564,12 @@ case "$MODE" in
     ;;
   verify-log)
     cdx_agent_mod verify_log "${MODULE_ARGS[@]}"
+    ;;
+  suite)
+    cdx_agent_mod suite "${MODULE_ARGS[@]}"
+    ;;
+  check)
+    cdx_agent_mod check "${MODULE_ARGS[@]}"
     ;;
   site-facts)
     cdx_agent_mod site_facts "${MODULE_ARGS[@]}"
