@@ -182,10 +182,18 @@ def user_line(src: str, dst: str) -> str:
     return f"! rm -rf {shlex.quote(s)} && ln -s {shlex.quote(d)} {shlex.quote(s)}"
 
 
+def _dir_time_only(line: str) -> bool:
+    """An itemize line for a directory whose only difference is its mtime (`.d..t...... a/`). Creating or removing an entry
+    in DST (or a listing tool's temp file) changes it; it says nothing about content, and the tree counts below still catch
+    an extra or missing entry."""
+    code = line.split(" ", 1)[0]
+    return len(code) >= 5 and code[0] == "." and code[1] == "d" and set(code[2:]) <= {".", "t", "T"} and "t" in code[2:].lower()
+
+
 def verify(src: str, dst: str) -> Tuple[bool, List[str]]:
     msgs: List[str] = []
     r = subprocess.run(checksum_command(src, dst), capture_output=True, text=True)
-    changes = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    changes = [ln for ln in r.stdout.splitlines() if ln.strip() and not _dir_time_only(ln)]
     ok = True
     if r.returncode != 0:
         ok = False

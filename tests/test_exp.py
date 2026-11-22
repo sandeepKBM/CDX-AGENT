@@ -153,5 +153,20 @@ def test_archive_calls_put(tmp_path, monkeypatch):
     _mk_run(a, "h1", [])
     seen = {}
     monkeypatch.setattr(exp, "_coldbank_put", lambda s, n, meta: seen.update(s=s, n=n, meta=meta) or 0)
-    assert exp.main(["archive", str(a)]) == 0
+    assert exp.main(["archive", str(a), "--regenerable", "no"]) == 0
     assert seen["s"] == str(a) and any(x.startswith("owner=") for x in seen["meta"])
+    assert "regenerable=no" in seen["meta"]
+
+
+def test_new_assumed_bound_refuses_scored_run_but_not_smoke(env, capsys, monkeypatch):
+    tmp, entry, units = env
+    monkeypatch.setenv("CDX_VALUES_FILE", str(tmp / "values.jsonl"))
+    conf = tmp / "c.yaml"
+    conf.write_text("margin: {value: 0.05, tag: ASSUMED, on: world}\n")
+    rd = tmp / "r9"
+    rd.mkdir()
+    (rd / "PREREG.md").write_text("x")
+    assert exp.main(["run", entry, "-c", str(conf), "--units-file", units, "--run-dir", str(rd)]) == 2
+    assert "margin" in capsys.readouterr().err
+    rd2 = tmp / "r10"
+    assert exp.main(["run", entry, "-c", str(conf), "--units-file", units, "--run-dir", str(rd2), "--smoke"]) == 0

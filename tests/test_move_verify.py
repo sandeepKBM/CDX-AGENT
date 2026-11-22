@@ -131,3 +131,11 @@ def test_finish_refused_keeps_source(tmp_path, monkeypatch, capsys):
     rc = mv.main([str(src), str(dst), "--no-lsof", "--finish"])
     assert rc == mv.EXIT_REFUSED
     assert src.is_dir() and not src.is_symlink()
+
+
+def test_dir_mtime_only_lines_are_not_differences():
+    assert mv._dir_time_only(".d..t...... ./")
+    assert mv._dir_time_only(".d..t...... a/b/")
+    assert not mv._dir_time_only(">fc........ a/f1.txt")
+    assert not mv._dir_time_only("cd+++++++++ new/")
+    assert not mv._dir_time_only(".d...p..... a/")

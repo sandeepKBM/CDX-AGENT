@@ -47,3 +47,9 @@ def test_new_assumed(tmp_path):
     conf = {"box": {"known": {"value": 1, "tag": "ASSUMED"}, "fresh": {"value": 2, "tag": "ASSUMED"},
                     "m": {"value": 3, "tag": "USER"}}}
     assert ec.new_assumed(conf, str(tmp_path), str(ledger)) == ["box.fresh"]
+
+
+def test_on_key_stays_a_string_and_true_is_bool():
+    from cdx_agent import expconfig
+    d = expconfig._load("b: {value: 1, tag: USER, on: world}\nflag: true\nmode: yes\n")
+    assert d["b"]["on"] == "world" and d["flag"] is True and d["mode"] == "yes"

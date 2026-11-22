@@ -245,7 +245,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             return EXIT_REFUSED
         new = expconfig.new_assumed(c, repo)
         if new:
-            print("exp run: new ASSUMED bounds not in the ledger: " + ", ".join(new), file=sys.stderr)
+            msg = "new ASSUMED bounds not in the values ledger: " + ", ".join(new)
+            if not args.smoke:  # spec N3: raised to the user before a scored claim rests on it
+                print(f"exp run: refused: {msg}. Raise them to the user; once approved record each with "
+                      "`cdx-agent --value set KEY VALUE --tag ASSUMED --reason \"...\"`, then re-run.", file=sys.stderr)
+                return EXIT_REFUSED
+            print(f"exp run: smoke only: {msg}", file=sys.stderr)
         if args.profile:
             inner = [sys.executable, "-m", "cdx_agent.exp", "run", args.entry, "--run-dir", run_dir, "--name", name]
             if args.config:
@@ -492,7 +497,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
     name = _slug(m.get("job_id") or os.path.basename(run_dir))
     code = m.get("code") or {}
     meta = [f"source={m.get('project') or ''}:{' '.join(m.get('command') or [])}".strip(),
-            f"owner={os.environ.get('USER', 'unknown')}", "regenerable=yes",
+            f"owner={os.environ.get('USER', 'unknown')}", f"regenerable={args.regenerable}",
             f"cost={m.get('started') or ''}..{m.get('finished') or ''}",
             f"head={code.get('head')}", f"world_set_hash={m.get('world_set_hash')}"]
     meta = [x.replace("\n", " ") for x in meta]
@@ -530,6 +535,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--all", action="store_true")
     a = sub.add_parser("archive")
     a.add_argument("run")
+    a.add_argument("--regenerable", required=True, choices=("yes", "no"),
+                   help="can the run be regenerated from code + inputs? 'no' = irreplaceable (resource plan: 2 copies)")
     return p
 
 

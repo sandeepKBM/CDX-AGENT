@@ -19,6 +19,21 @@ from typing import Any
 
 import yaml
 
+
+class _Loader(yaml.SafeLoader):
+    """YAML 1.2 booleans: only true/false. YAML 1.1 reads `on`/`off`/`yes`/`no` as bool, which turns the bound key `on:`
+    (spec bounds are {value, tag, source, on}) into True."""
+
+
+_Loader.yaml_implicit_resolvers = {k: [(t, r) for t, r in v if t != "tag:yaml.org,2002:bool"]
+                                   for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()}
+_Loader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+                              list("tTfF"))
+
+
+def _load(text):
+    return yaml.load(text, Loader=_Loader)
+
 from cdx_agent import values
 
 TAGS = ("MEASURED", "MODEL", "ASSUMED", "USER")
@@ -40,7 +55,7 @@ def load(path: str, _seen: tuple[str, ...] = ()) -> dict[str, Any]:
     if path in _seen:
         raise ValueError(f"config defaults cycle at {path}")
     with open(path, encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh) or {}
+        raw = _load(fh) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: top level must be a mapping")
     defaults = raw.pop("defaults", None) or []
@@ -56,7 +71,7 @@ def parse_override(text: str) -> tuple[str, Any]:
     key, rhs = text.split("=", 1)
     if not key or any(not p for p in key.split(".")):
         raise ValueError(f"bad override key: {key!r}")
-    return key, yaml.safe_load(rhs)
+    return key, _load(rhs)
 
 
 def set_dotted(conf: dict[str, Any], key: str, value: Any) -> None:
