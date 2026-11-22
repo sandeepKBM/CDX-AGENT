@@ -95,3 +95,15 @@ def test_active_only_excludes_finished_transcript(tmp_path):
     assert {r.id: ("DONE" in r.flags) for r in reports} == {"a111": False, "a222": True}
     active = agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=True)
     assert [r.id for r in active] == ["a111"]
+
+
+def test_handback_ending_transcript_is_done(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "a333.output").write_text(
+        record("user", {"role": "user", "content": "go"}) + "\n"
+        + record("assistant", {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t9", "name": "SubagentHandback", "input": {"message": "report"}}]}) + "\n")
+    reports = agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=False)
+    assert "DONE" in reports[0].flags
+    assert agent_usage.collect_reports([str(tasks)], now=time.time(), active_only=True) == []
