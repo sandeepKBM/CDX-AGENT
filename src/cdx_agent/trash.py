@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cdx_agent import audit
+from cdx_agent import site as _site
 
-DEFAULT_ROOTS = [
+DEFAULT_ROOTS = _site.get("trash_roots") or [
     "/data/local/ss5772/trash",
     "/freespace/local/ss5772/trash",
     "/common/users/ss5772/.cdx/trash_staging",

@@ -31,6 +31,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from cdx_agent import site as _site
 
 
 @dataclass
@@ -113,7 +114,7 @@ class Evaluation:
 
 
 def _slurm(command: str, host: Optional[str] = None) -> List[str]:
-    host = host or os.environ.get("CDX_SLURM_HOST", "rlab1")
+    host = host or os.environ.get("CDX_SLURM_HOST", _site.get("hosts.gateway", "rlab1"))
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command]
 
 
