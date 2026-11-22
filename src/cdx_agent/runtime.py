@@ -26,10 +26,14 @@ import hashlib
 import json
 import shutil
 import time
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+try:  # Python 3.11+ ships tomllib; 3.10 uses tomli (a declared dependency there)
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
 
 from .config import Config, hostname_short, load_config, repo_root, repo_slug
 

@@ -144,6 +144,7 @@ def test_per_proc_threads():
 def test_node_cap_reached_refuses_and_prints_the_run_line(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cpu_job, "_fetch", lambda h: pytest.fail("no node pick when the cap is reached"))
     monkeypatch.setattr(cpu_job, "hold_state", lambda host, user=None: (1, {"rlab4"}))
+    monkeypatch.setattr(cpu_job, "find_unreadable", lambda *a, **k: [])   # tmp_path may sit under /data/local
     rc = cpu_job.main(["--threads", "48", "--mem", "64G", "--time", "2:00:00", "--name", "suite", "--cwd", str(tmp_path),
                        "--", "python", "-m", "pytest", "-q", "tests/a b.py"])
     assert rc == 2

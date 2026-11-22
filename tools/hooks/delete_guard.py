@@ -201,9 +201,12 @@ def parse(command: str, depth: int = 0) -> Parsed:
 
 
 def _load_policy_module():
-    src = os.environ.get("CDX_AGENT_PYTHONPATH", "/common/home/ss5772/CDX-AGENT/src")
-    if src and src not in sys.path:
-        sys.path.insert(0, src)
+    repo_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "src")
+    for src in (os.environ.get("CDX_AGENT_PYTHONPATH"), "/common/home/ss5772/CDX-AGENT/src", repo_src):
+        if src and os.path.isdir(os.path.join(src, "cdx_agent")):   # first existing: env, live dev tree, this checkout
+            if src not in sys.path:
+                sys.path.insert(0, src)
+            break
     from cdx_agent import delete_policy, inuse  # noqa: F401  (import errors handled by caller)
     return delete_policy, inuse
 

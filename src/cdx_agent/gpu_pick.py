@@ -228,7 +228,7 @@ def parse_other_user_nodes(text: str, user: str) -> Set[str]:
 
 def parse_df_free_gb(text: str) -> Optional[float]:
     """``df -P`` output -> free GB of the last line (Available column, 1K blocks), or None when unparseable."""
-    for line in reversed([l for l in text.splitlines() if l.strip()]):
+    for line in reversed([ln for ln in text.splitlines() if ln.strip()]):
         parts = line.split()
         if len(parts) >= 6 and parts[3].isdigit():
             return int(parts[3]) / (1024 * 1024)

@@ -187,7 +187,7 @@ def extract_open_sections(text: str, whole_if_none: bool = False) -> List[Tuple[
     if current:
         sections.append((current[1], current[2]))
     if not sections and whole_if_none:
-        body = [_clip(l.rstrip()) for l in lines if l.strip()]
+        body = [_clip(ln.rstrip()) for ln in lines if ln.strip()]
         if body:
             sections.append(("(whole file)", body))
     return sections
@@ -220,7 +220,7 @@ def _section(title: str, body: List[str], empty: str = "(none)") -> Tuple[str, L
 
 def _fit(body: List[str], budget: int, hint: str) -> List[str]:
     """Keep whole lines from the head within `budget` chars (incl. newlines)."""
-    total = sum(len(l) + 1 for l in body)
+    total = sum(len(ln) + 1 for ln in body)
     if total <= budget:
         return body
     kept: List[str] = []
@@ -288,7 +288,7 @@ def build_brief(target: str, base: Optional[str] = None, max_tokens: int = 3000,
     ]
 
     commits = _git(top, "log", "--no-decorate", "--no-merges", "--format=%h %s", f"{mb}..{tip}")
-    commit_lines = [_clip(l) for l in commits.splitlines() if l]
+    commit_lines = [_clip(ln) for ln in commits.splitlines() if ln]
 
     numstat = _git(top, "diff", "--numstat", "--no-renames", mb, tip)
     rows, tot_ins, tot_del = [], 0, 0
@@ -327,8 +327,8 @@ def build_brief(target: str, base: Optional[str] = None, max_tokens: int = 3000,
 
     rules_file = Path(rules_path) if rules_path else default_rules_path()
     try:
-        rules = [l.rstrip() for l in rules_file.read_text().splitlines() if l.strip()]
-        rules = [l for l in rules if not l.startswith("# ")]  # drop the file's own title
+        rules = [ln.rstrip() for ln in rules_file.read_text().splitlines() if ln.strip()]
+        rules = [ln for ln in rules if not ln.startswith("# ")]  # drop the file's own title
     except OSError:
         rules = [f"(rules file missing: {rules_file})"]
 
@@ -353,7 +353,7 @@ def build_brief(target: str, base: Optional[str] = None, max_tokens: int = 3000,
     rules_room = budget - len(fixed_head) - len(contract) - titles - slack - len("## Rules\n")
     rules_text = _render("## Rules", _fit(rules, max(rules_room, 0), "; see the rules file") or ["..."])
     room = budget - len(fixed_head) - len(rules_text) - len(contract) - titles - slack
-    sizes = [0 if body == ["(none)"] else sum(len(l) + 1 for l in body) for (_, body), _ in variable]
+    sizes = [0 if body == ["(none)"] else sum(len(ln) + 1 for ln in body) for (_, body), _ in variable]
     alloc = _share(sizes, max(room, 0))
     parts = [fixed_head]
     for ((title, body), hint), cap in zip(variable, alloc):
@@ -536,7 +536,7 @@ def build_safety_brief(target: str, base: Optional[str] = None, max_tokens: int 
             continue
         diff = _git(top, "diff", "-U5", "--no-renames", mb, tip, "--", path, check=False)
         body = diff[diff.find("\n@@") + 1:].splitlines() if "\n@@" in diff else []
-        if not any(MATH_WORDS.search(l) for l in body):
+        if not any(MATH_WORDS.search(ln) for ln in body):
             continue
         code.append(f"### {path} (changed hunks)")
         for i, line in enumerate(body):
@@ -565,15 +565,15 @@ def build_safety_brief(target: str, base: Optional[str] = None, max_tokens: int 
                     ref_lines.append(_clip(f"{path}:{n}: {text.strip()}"))
 
     try:
-        checklist = [l.rstrip() for l in CHECKLIST_PATH.read_text().splitlines() if l.strip()]
-        checklist = [l for l in checklist if not l.startswith("# ")]
+        checklist = [ln.rstrip() for ln in CHECKLIST_PATH.read_text().splitlines() if ln.strip()]
+        checklist = [ln for ln in checklist if not ln.startswith("# ")]
     except OSError:
         checklist = [f"(checklist template missing: {CHECKLIST_PATH})"]
 
     header = [f"# Safety-math brief: {branch}", f"- target: {target}",
               f"- base: {base_rev} ({how}); merge-base {mb[:10]}", f"- tip: {tip}",
               f"- files ({len(paths)}): " + ", ".join(paths)]
-    fixed_head = "\n".join(_clip(l) for l in header) + "\n"
+    fixed_head = "\n".join(_clip(ln) for ln in header) + "\n"
     tail = _render("## Excluded", [f"{len(excluded)} author-conclusion lines excluded "
                                    "(commit messages, docs, reports, verified/safe comments)"])
     variable = [
@@ -588,7 +588,7 @@ def build_safety_brief(target: str, base: Optional[str] = None, max_tokens: int 
     check_room = (budget - len(fixed_head) - len(tail) - titles - slack - len("## Checklist\n")) // 2
     check_text = _render("## Checklist", _fit(checklist, max(check_room, 0), "; see the template") or ["..."])
     room = budget - len(fixed_head) - len(check_text) - len(tail) - titles - slack
-    sizes = [0 if b == ["(none)"] else sum(len(l) + 1 for l in b) for (_, b), _ in variable]
+    sizes = [0 if b == ["(none)"] else sum(len(ln) + 1 for ln in b) for (_, b), _ in variable]
     alloc = _share(sizes, max(room, 0))
     parts = [fixed_head, check_text]
     for ((title, body), hint), cap in zip(variable, alloc):

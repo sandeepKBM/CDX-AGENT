@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
 
 DEFAULT_ACCESS_MODE = "safe"
 DEFAULT_STALE_RETENTION_DAYS = 14
@@ -122,6 +121,8 @@ def load_config(explicit_path: str | os.PathLike | None = None) -> Config:
     base = Config.defaults()
     if not path.is_file():
         return base
+    import yaml  # lazy: hooks import this module under a system python that may lack PyYAML
+
     data = yaml.safe_load(path.read_text()) or {}
     return _apply_overrides(base, data, source_path=path)
 
@@ -191,6 +192,8 @@ def write_config(config: Config, path: Path) -> None:
         "engines": config.engines,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
+    import yaml
+
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
 
