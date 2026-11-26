@@ -237,6 +237,36 @@ def test_provision_codex_keeps_top_level_skills_dir(tmp_path):
     assert rctx.skills_dir.is_dir()
 
 
+def test_provision_claude_creates_sandbox_protected_paths(tmp_path):
+    # Missing protected paths make bwrap create placeholders on NFS, and parallel sandboxed commands collide on them.
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+    rctx = runtime_mod.provision_runtime(cfg, repo, access_mode="safe", engine="claude")
+    for rel in runtime_mod.CLAUDE_PROTECTED_DIRS:
+        assert (rctx.runtime_dir / rel).is_dir()
+    for rel, content in runtime_mod.CLAUDE_PROTECTED_FILES.items():
+        assert (rctx.runtime_dir / rel).read_text() == content
+    assert not (repo / ".claude").exists()  # the repo is left alone
+
+
+def test_ensure_claude_protected_paths_keeps_existing_entries(tmp_path):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text('{"x": 1}')
+    (tmp_path / ".claude" / "hooks").symlink_to(tmp_path / "missing-target")  # dangling: still not replaced
+    created = runtime_mod.ensure_claude_protected_paths(tmp_path)
+    assert (tmp_path / ".claude" / "settings.json").read_text() == '{"x": 1}'
+    assert (tmp_path / ".claude" / "hooks").is_symlink()
+    assert tmp_path / ".claude" / "settings.json" not in created
+    assert runtime_mod.ensure_claude_protected_paths(tmp_path) == []  # idempotent
+
+
+def test_provision_codex_does_not_create_claude_paths(tmp_path):
+    cfg = _make_config(tmp_path)
+    repo = _make_repo(tmp_path)
+    rctx = runtime_mod.provision_runtime(cfg, repo, access_mode="safe", engine="codex")
+    assert not (rctx.runtime_dir / ".claude").exists()
+
+
 def test_provision_claude_dry_run_does_not_prune(tmp_path):
     cfg = _make_config(tmp_path)
     repo = _make_repo(tmp_path)

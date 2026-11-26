@@ -294,9 +294,46 @@ def provision_runtime(
     if not dry_run:
         rctx.runtime_dir.mkdir(parents=True, exist_ok=True)
         _remove_legacy_claude_skills_dir(config, rctx)
+        if rctx.engine == "claude":
+            ensure_claude_protected_paths(rctx.runtime_dir)
     sync_runtime_config(config, rctx, dry_run=dry_run)
     sync_runtime_auth(config, rctx, dry_run=dry_run)
     return rctx
+
+
+# Paths Claude Code's Bash sandbox write-protects in every directory it adds (cwd and each --add-dir), read from the
+# claude 2.1.331 sandbox builder. When one is missing, bwrap creates a read-only 0-byte placeholder file for it on the
+# host and removes it when the command ends. On NFS, two sandboxed commands that start together collide on the same
+# placeholder: the second one fails with "bwrap: Can't create file at <path>: Permission denied". With every path
+# present, bwrap binds the existing entry and creates nothing.
+CLAUDE_PROTECTED_DIRS = (".claude/agents", ".claude/commands", ".claude/hooks", ".claude/output-styles",
+                         ".claude/routines", ".claude/skills", ".claude/workflows")
+CLAUDE_PROTECTED_FILES = {  # relative path -> content of a valid empty file
+    ".claude/settings.json": "{}\n",
+    ".claude/settings.local.json": "{}\n",
+    ".claude/scheduled_tasks.json": '{"tasks": []}\n',  # claude reads an empty file or {"tasks": [...]} as a task list
+    ".claude/launch.json": "",  # same as the sandbox's own placeholder
+    ".claude/loop.md": "",
+    ".mcp.json": '{"mcpServers": {}}\n',
+}
+
+
+def ensure_claude_protected_paths(root: Path) -> list[Path]:
+    """Create each missing Claude-protected path under `root` (see CLAUDE_PROTECTED_DIRS/FILES). Never replaces an
+    existing entry, including a dangling symlink. Returns the paths it created."""
+    created: list[Path] = []
+    for rel in CLAUDE_PROTECTED_DIRS:
+        p = root / rel
+        if not p.exists() and not p.is_symlink():
+            p.mkdir(parents=True)
+            created.append(p)
+    for rel, content in CLAUDE_PROTECTED_FILES.items():
+        p = root / rel
+        if not p.exists() and not p.is_symlink():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            created.append(p)
+    return created
 
 
 def _remove_legacy_claude_skills_dir(config: Config, rctx: RuntimeContext) -> None:

@@ -239,6 +239,35 @@ def test_prepare_launch_claude_end_to_end_wires_skills_docs_and_hooks(tmp_path):
         session.release_lock(result.lock_handle)
 
 
+def test_prepare_launch_claude_safe_creates_repo_protected_paths(tmp_path):
+    # The repo (cwd) gets bwrap placeholders like the runtime dir; parallel sandboxed commands collide on them.
+    from cdx_agent import runtime, session
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text('{"keep": true}')
+    result = launch.prepare_launch(cfg, repo, engine="claude", access_mode="safe")
+    for rel in runtime.CLAUDE_PROTECTED_DIRS:
+        assert (repo / rel).is_dir()
+    assert (repo / ".claude" / "settings.json").read_text() == '{"keep": true}'
+    assert (repo / ".mcp.json").is_file()
+    if result.lock_handle is not None:
+        session.release_lock(result.lock_handle)
+
+
+def test_prepare_launch_claude_full_leaves_repo_alone(tmp_path):
+    from cdx_agent import session
+
+    cfg = _cfg(tmp_path)
+    repo = _repo(tmp_path)
+    result = launch.prepare_launch(cfg, repo, engine="claude", access_mode="full")
+    assert not (repo / ".mcp.json").exists()
+    assert not (repo / ".claude" / "hooks").exists()
+    if result.lock_handle is not None:
+        session.release_lock(result.lock_handle)
+
+
 def test_prepare_launch_writes_working_rules_not_repo_template(tmp_path):
     # Regression test: prepare_launch's runtime-dir doc must come from the
     # fuller working-rules template (base/AGENTS.md, with the TOKEN_SAVER
