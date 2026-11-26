@@ -15,7 +15,14 @@
   local background command is printed (niced, OMP/MKL/OPENBLAS=2, CUDA_VISIBLE_DEVICES=, timeout). ``--allow-local-data`` overrides.
 - Node-cap guard: with the account's GrpTRES node cap (read live) reached by running jobs on another node, a new job would pend
   (AssocGrpNodeLimit): exit 2 and print the exact ``cdx-agent --run ...`` line that places the command as a step in that hold.
-Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments, no node, node cap, or data not readable from nodes.
+- Node requirements (``--needs``, comma list, repeatable): each candidate node is probed (a short ``srun`` step, results cached
+  ``--needs-ttl`` s) and the first ranked node that has ALL of them is picked; ``--node`` is refused without them (``--force``).
+  Items: ``lib:NAME`` shared library (ldconfig or /usr/lib*), ``py:MODULE`` importable by the job's python, ``cmd:NAME`` on PATH,
+  ``path:/abs`` exists, ``gl:BACKEND`` a MuJoCo GL context opens (osmesa / egl / glfw).  Aliases: ``osmesa`` = gl:osmesa,
+  ``egl`` = gl:egl, ``mujoco`` = py:mujoco.  ``MUJOCO_GL=X`` in the command adds gl:X (``--no-infer-needs`` turns that off).
+  The job's python = the first ``python*`` word of the command (else ``--python``, default python3).  When no node has them,
+  this machine is probed too and the local background command is printed.
+Exit: 0 submitted / command ok, 1 command failed, 2 bad arguments, no node, node cap, missing needs, or data not readable from nodes.
 """
 from __future__ import annotations
 
@@ -23,9 +30,11 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -207,6 +216,165 @@ def find_unreadable(cmd: Sequence[str], cwd: str, prefixes: Sequence[str] = DEFA
     return found
 
 
+NEED_KINDS = ("lib", "py", "cmd", "path", "gl")
+NEED_ALIASES = {"osmesa": ("gl:osmesa",), "egl": ("gl:egl",), "mujoco": ("py:mujoco",)}
+NEED_MARK = "CDXNEED"
+_SAFE_ITEM = re.compile(r"^[A-Za-z0-9_.+:/=-]+$")
+
+
+def parse_needs(specs: Sequence[str]) -> list[str]:
+    """``["osmesa,py:numpy", "lib:libEGL.so"]`` -> ``["gl:osmesa", "py:numpy", "lib:libEGL.so"]`` (aliases expanded, order kept,
+    duplicates dropped).  ValueError on an unknown kind, an empty value or characters outside [A-Za-z0-9_.+:/=-]."""
+    out: list[str] = []
+    for spec in specs or ():
+        for raw in str(spec).split(","):
+            item = raw.strip()
+            if not item:
+                continue
+            for it in NEED_ALIASES.get(item.lower(), (item,)):
+                kind, _, val = it.partition(":")
+                if kind not in NEED_KINDS or not val:
+                    raise ValueError(f"need {it!r}: use KIND:VALUE with KIND in {', '.join(NEED_KINDS)} or an alias "
+                                     f"({', '.join(sorted(NEED_ALIASES))})")
+                if not _SAFE_ITEM.match(it):
+                    raise ValueError(f"need {it!r}: only [A-Za-z0-9_.+:/=-] allowed")
+                if it not in out:
+                    out.append(it)
+    return out
+
+
+def _cmd_words(cmd: Sequence[str]) -> list[str]:
+    words: list[str] = []
+    for word in cmd:       # a quoted shell string (bash -c '...') is split further
+        try:
+            words.extend(shlex.split(word) if (" " in word or "\n" in word) else [word])
+        except ValueError:
+            words.append(word)
+    return words
+
+
+def infer_needs(cmd: Sequence[str]) -> list[str]:
+    """``MUJOCO_GL=X`` anywhere in the command -> ``gl:X`` (the job renders with that backend)."""
+    out: list[str] = []
+    for w in _cmd_words(cmd):
+        m = re.fullmatch(r"MUJOCO_GL=([A-Za-z0-9_]+)", w)
+        if m and m.group(1) not in ("disable", "disabled", "") and f"gl:{m.group(1)}" not in out:
+            out.append(f"gl:{m.group(1)}")
+    return out
+
+
+def job_python(cmd: Sequence[str], default: str = "python3") -> str:
+    """The interpreter the job runs: the first word whose basename starts with ``python`` (e.g. an env's bin/python)."""
+    for w in _cmd_words(cmd):
+        if os.path.basename(w).startswith("python") and "=" not in w:
+            return w
+    return default
+
+
+def probe_script(needs: Sequence[str], python: str) -> str:
+    """bash that prints ``CDXNEED<TAB>item<TAB>OK`` or ``CDXNEED<TAB>item<TAB>MISSING<TAB>detail`` per item (never fails)."""
+    py = shlex.quote(python)
+    lines = [f'ok() {{ printf "{NEED_MARK}\\t%s\\tOK\\n" "$1"; }}',
+             f'miss() {{ printf "{NEED_MARK}\\t%s\\tMISSING\\t%s\\n" "$1" "$(printf %s "$2" | tail -n 1 | tr "\\t\\r" "  " | cut -c1-200)"; }}']
+    for it in needs:
+        kind, _, val = it.partition(":")
+        q, qi = shlex.quote(val), shlex.quote(it)
+        if kind == "lib":
+            test = (f"ldconfig -p 2>/dev/null | grep -qF -- {q} || compgen -G {shlex.quote('/usr/lib/x86_64-linux-gnu/' + val + '*')} >/dev/null "
+                    f"|| compgen -G {shlex.quote('/usr/lib64/' + val + '*')} >/dev/null || compgen -G {shlex.quote('/usr/lib/' + val + '*')} >/dev/null")
+            lines.append(f'if {test}; then ok {qi}; else miss {qi} "not in ldconfig or /usr/lib*"; fi')
+        elif kind == "py":
+            lines.append(f'if out=$({py} -c {shlex.quote("import " + val)} 2>&1); then ok {qi}; else miss {qi} "$out"; fi')
+        elif kind == "cmd":
+            lines.append(f'if command -v {q} >/dev/null 2>&1; then ok {qi}; else miss {qi} "not on PATH"; fi')
+        elif kind == "path":
+            lines.append(f'if [ -e {q} ]; then ok {qi}; else miss {qi} "does not exist"; fi')
+        elif kind == "gl":
+            plat = f"PYOPENGL_PLATFORM={q} " if val in ("osmesa", "egl") else ""
+            code = "import mujoco; c = mujoco.GLContext(16, 16); c.make_current(); c.free()"
+            lines.append(f'if out=$(MUJOCO_GL={q} {plat}CUDA_VISIBLE_DEVICES= timeout 120 {py} -c {shlex.quote(code)} 2>&1); then ok {qi}; '
+                         f'else miss {qi} "$out"; fi')
+    return "\n".join(lines) + "\n"
+
+
+def parse_probe(text: str, needs: Sequence[str]) -> dict:
+    """probe output -> {item: (ok, detail)}; an item with no line is (False, "no probe output")."""
+    res = {}
+    for line in (text or "").splitlines():
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 3 and parts[0] == NEED_MARK:
+            res[parts[1]] = (parts[2] == "OK", parts[3] if len(parts) > 3 else "")
+    return {it: res.get(it, (False, "no probe output")) for it in needs}
+
+
+def _needs_cache_path() -> str:
+    root = _site.get("user_root", default="/common/users/ss5772")
+    return os.environ.get("CDX_NEEDS_CACHE", os.path.join(root, "codex_runtime", "cpu_jobs", "needs_cache.json"))
+
+
+def _cache_load(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_save(path: str, data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def probe_node(node: str, needs: Sequence[str], python: str, host: Optional[str], ttl: int = 86400) -> dict:
+    """{item: (ok, detail)} for ``node``: cached results younger than ``ttl`` s, the rest from one short srun step on the node."""
+    path, now = _needs_cache_path(), time.time()
+    cache = _cache_load(path) if ttl > 0 else {}
+    key = lambda it: f"{node}|{python}|{it}"      # noqa: E731
+    res, todo = {}, []
+    for it in needs:
+        c = cache.get(key(it))
+        if c and now - float(c.get("t", 0)) < ttl:
+            res[it] = (bool(c["ok"]), str(c.get("detail", "")) + " (cached)")
+        else:
+            todo.append(it)
+    if todo:
+        remote = (f"timeout 300 srun -w {shlex.quote(node)} --immediate=120 --mem=2G -t 0:05:00 -J cdxneeds "
+                  f"bash -c {shlex.quote(probe_script(todo, python))}")
+        try:
+            r = subprocess.run(_slurm(remote, host), capture_output=True, text=True, timeout=330)
+            out, err = r.stdout, (r.stderr or "").strip().splitlines()[-1:] or [""]
+        except subprocess.TimeoutExpired:
+            out, err = "", ["probe timed out"]
+        got = parse_probe(out, todo)
+        for it, (ok, detail) in got.items():
+            if detail == "no probe output":
+                detail = f"no probe output ({err[0][:150]})"      # srun could not run: not cached
+            else:
+                cache[key(it)] = dict(ok=ok, detail=detail, t=now)
+            res[it] = (ok, detail)
+        if ttl > 0:
+            _cache_save(path, cache)
+    return {it: res[it] for it in needs}
+
+
+def probe_local(needs: Sequence[str], python: str) -> dict:
+    try:
+        r = subprocess.run(["bash", "-c", probe_script(needs, python)], capture_output=True, text=True, timeout=300)
+        return parse_probe(r.stdout, needs)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {it: (False, f"local probe failed: {e!r}"[:150]) for it in needs}
+
+
+def missing_of(res: dict) -> list[str]:
+    return [f"{it} ({d})" if d else it for it, (ok, d) in res.items() if not ok]
+
+
 def log_dir(cwd: str) -> str:
     """Default log directory: NFS under the runtime root (node-readable), never inside the repo/worktree.
     Override with env CDX_CPU_JOB_LOG_DIR (or --log for one sbatch job)."""
@@ -254,7 +422,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unreadable-prefix", default=os.environ.get("CDX_NODE_UNREADABLE", ",".join(DEFAULT_UNREADABLE)),
                    help="comma list of path prefixes Slurm nodes cannot read (workstation-local disks)")
     p.add_argument("--allow-local-data", action="store_true", help="submit even if data resolves under an unreadable prefix")
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--needs", action="append", default=[], metavar="ITEMS",
+                   help="comma list the node must have: lib:NAME, py:MODULE, cmd:NAME, path:/abs, gl:BACKEND; aliases osmesa, egl, mujoco")
+    p.add_argument("--no-infer-needs", action="store_true", help="do not add gl:X for MUJOCO_GL=X found in the command")
+    p.add_argument("--python", default=None, help="interpreter for py:/gl: probes (default: the command's first python* word, else python3)")
+    p.add_argument("--needs-ttl", type=int, default=86400, help="seconds a node probe result stays cached (0 = always probe)")
+    p.add_argument("--dry-run", action="store_true", help="print the submit line; node probes for --needs still run (a short srun step)")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
 
@@ -278,6 +451,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"(local log: {os.path.join(log_dir(cwd), f'local_{a.name}.log')})", file=sys.stderr)
         print("(override: --allow-local-data)", file=sys.stderr)
         return 2
+    try:
+        needs = parse_needs(a.needs)
+    except ValueError as e:
+        print(f"cpu_job: {e}", file=sys.stderr)
+        return 2
+    if not a.no_infer_needs:
+        needs += [it for it in infer_needs(cmd) if it not in needs]
+    python = a.python or job_python(cmd)
     mem = a.mem
     if a.profile:
         ensure_footprints()
@@ -308,12 +489,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("  " + fmt_row(r), file=sys.stderr)
             return 2
         node, why = ok[0][0], fmt_row(ok[0])
+        if needs:
+            failed = []
+            node = None
+            for r in ok:
+                miss = missing_of(probe_node(r[0], needs, python, a.slurm_host, a.needs_ttl))
+                if not miss:
+                    node, why = r[0], fmt_row(r) + f"; has {', '.join(needs)}"
+                    break
+                failed.append((r[0], miss))
+            if node is None:
+                print(f"cpu_job: no qualifying {a.prefix} node has all of: {', '.join(needs)} (python {python})", file=sys.stderr)
+                for n, miss in failed:
+                    print(f"  {n}: missing {'; '.join(miss)}", file=sys.stderr)
+                lmiss = missing_of(probe_local(needs, python))
+                if lmiss:
+                    print(f"  this machine: missing {'; '.join(lmiss)}", file=sys.stderr)
+                else:
+                    print("  this machine has them; run it here instead (background, niced, threads capped; do not wait on it):\n  "
+                          + local_command(cmd, cwd, a.name, a.timeout), file=sys.stderr)
+                return 2
     else:
         r = node_rows(sinfo, scon, prefixes, a.threads, mem_mb, nodes=[node])[0]
         why = fmt_row(r)
         if r[4] and not a.force:
             print(f"cpu_job: refused --node {node}: {r[4]} ({why}); add --force to submit anyway", file=sys.stderr)
             return 2
+        if needs:
+            miss = missing_of(probe_node(node, needs, python, a.slurm_host, a.needs_ttl))
+            if miss and not a.force:
+                print(f"cpu_job: refused --node {node}: missing {'; '.join(miss)} (python {python}); add --force to submit anyway",
+                      file=sys.stderr)
+                return 2
+            why += f"; needs {'missing ' + '; '.join(miss) + ' (--force)' if miss else 'ok: ' + ', '.join(needs)}"
     script = build_script(cmd, cwd, per_proc_threads(a.threads, a.procs))   # --procs N: threads per process = threads // N
     if a.wait:
         remote = f"timeout {a.timeout} srun -w {node} --mem={a.mem} -t {a.time} -J {shlex.quote(a.name)} bash -c {shlex.quote(script)}"

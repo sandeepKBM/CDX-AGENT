@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 from cdx_agent import cpu_job
@@ -177,3 +180,98 @@ def test_default_log_dir_is_outside_the_repo(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
     assert cpu_job.main(["--dry-run", "--cwd", str(repo), "--", "true"]) == 0
     assert str(tmp_path / "ovr") in capsys.readouterr().out and not (repo / "logs").exists()
+
+
+# ---- --needs: the node must have the job's libraries / modules / GL backend
+SCON_TWO_OK = (
+    "NodeName=ilab1 CPUTot=64 CPUAlloc=18 RealMemory=524288 AllocMem=100000 State=MIXED\n"
+    "NodeName=ilab3 CPUTot=96 CPUAlloc=16 RealMemory=524288 AllocMem=100000 State=MIXED\n"
+)
+
+
+def test_parse_needs_aliases_dedup_and_errors():
+    assert cpu_job.parse_needs(["osmesa,py:numpy", "lib:libEGL.so", "gl:osmesa", "mujoco"]) == [
+        "gl:osmesa", "py:numpy", "lib:libEGL.so", "py:mujoco"]
+    assert cpu_job.parse_needs([]) == []
+    for bad in (["foo:bar"], ["py:"], ["nokind"], ["py:a;rm -rf /"], ["path:/x y"]):
+        with pytest.raises(ValueError):
+            cpu_job.parse_needs(bad)
+
+
+def test_infer_needs_and_job_python():
+    cmd = ["bash", "-lc", "cd /w && export MUJOCO_GL=osmesa X=1 && /env/bin/python -m pytest -q"]
+    assert cpu_job.infer_needs(cmd) == ["gl:osmesa"]
+    assert cpu_job.infer_needs(["env", "MUJOCO_GL=disable", "python3", "x.py"]) == []
+    assert cpu_job.job_python(cmd) == "/env/bin/python"
+    assert cpu_job.job_python(["true"]) == "python3"
+
+
+def test_probe_script_runs_locally_and_parses():
+    needs = ["cmd:bash", "cmd:definitely-not-a-cmd-xyz", "path:/", "path:/no/such/path/xyz", "py:json", "py:no_such_mod_xyz",
+             "lib:libc.so"]
+    res = cpu_job.probe_local(needs, sys.executable)
+    assert {it for it, (ok, _) in res.items() if ok} == {"cmd:bash", "path:/", "py:json", "lib:libc.so"}
+    assert "No module named" in res["py:no_such_mod_xyz"][1]
+    assert cpu_job.parse_probe("motd line\nCDXNEED\tpy:x\tOK\n", ["py:x", "py:y"]) == {
+        "py:x": (True, ""), "py:y": (False, "no probe output")}
+
+
+def test_main_skips_node_without_needs_and_picks_next(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON_TWO_OK))
+    seen = []
+
+    def fake_probe(node, needs, python, host, ttl=0):
+        seen.append((node, tuple(needs), python))
+        return {it: (node == "ilab1", "" if node == "ilab1" else "libOSMesa missing") for it in needs}
+    monkeypatch.setattr(cpu_job, "probe_node", fake_probe)
+    cmd = ["bash", "-lc", "export MUJOCO_GL=osmesa && /env/bin/python run.py"]
+    assert cpu_job.main(["--dry-run", "--cwd", str(tmp_path), "--needs", "py:mujoco", "--"] + cmd) == 0
+    cap = capsys.readouterr()
+    assert "-w ilab1 " in cap.out and "has py:mujoco, gl:osmesa" in cap.err
+    assert seen == [("ilab3", ("py:mujoco", "gl:osmesa"), "/env/bin/python"), ("ilab1", ("py:mujoco", "gl:osmesa"), "/env/bin/python")]
+
+
+def test_main_no_node_has_needs_reports_and_offers_local(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON_TWO_OK))
+    monkeypatch.setattr(cpu_job, "probe_node", lambda node, needs, python, host, ttl=0: {it: (False, "not here") for it in needs})
+    monkeypatch.setattr(cpu_job, "probe_local", lambda needs, python: {it: (True, "") for it in needs})
+    assert cpu_job.main(["--dry-run", "--cwd", str(tmp_path), "--needs", "osmesa", "--", "true"]) == 2
+    err = capsys.readouterr().err
+    assert "ilab3: missing gl:osmesa (not here)" in err and "ilab1: missing" in err
+    assert "this machine has them" in err and "nohup nice" in err
+    assert cpu_job.main(["--dry-run", "--cwd", str(tmp_path), "--needs", "bogus:x", "--", "true"]) == 2
+
+
+def test_main_explicit_node_refused_without_needs_unless_force(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
+    monkeypatch.setattr(cpu_job, "probe_node", lambda node, needs, python, host, ttl=0: {it: (False, "absent") for it in needs})
+    base = ["--node", "ilab3", "--dry-run", "--cwd", str(tmp_path), "--needs", "lib:libOSMesa.so"]
+    assert cpu_job.main(base + ["--", "true"]) == 2
+    assert "missing lib:libOSMesa.so (absent)" in capsys.readouterr().err
+    assert cpu_job.main(base + ["--force", "--", "true"]) == 0
+    assert "--force" in capsys.readouterr().err
+
+
+def test_main_no_infer_needs_and_no_needs_means_no_probe(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cpu_job, "_fetch", lambda h: (SINFO, SCON))
+    monkeypatch.setattr(cpu_job, "probe_node", lambda *a, **k: pytest.fail("no probe without needs"))
+    cmd = ["bash", "-lc", "MUJOCO_GL=osmesa python3 x.py"]
+    assert cpu_job.main(["--dry-run", "--cwd", str(tmp_path), "--no-infer-needs", "--"] + cmd) == 0
+    assert cpu_job.main(["--dry-run", "--cwd", str(tmp_path), "--", "true"]) == 0
+
+
+def test_probe_node_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDX_NEEDS_CACHE", str(tmp_path / "c.json"))
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="CDXNEED\tpy:a\tOK\nCDXNEED\tpy:b\tMISSING\tNo module named b\n", stderr="")
+    monkeypatch.setattr(cpu_job.subprocess, "run", fake_run)
+    r1 = cpu_job.probe_node("ilab9", ["py:a", "py:b"], "python3", "gw", ttl=3600)
+    assert r1 == {"py:a": (True, ""), "py:b": (False, "No module named b")} and len(calls) == 1
+    assert "srun -w ilab9" in calls[0][-1]
+    r2 = cpu_job.probe_node("ilab9", ["py:a", "py:b"], "python3", "gw", ttl=3600)
+    assert len(calls) == 1 and r2["py:a"][0] is True and r2["py:b"] == (False, "No module named b (cached)")
+    cpu_job.probe_node("ilab9", ["py:a"], "python3", "gw", ttl=0)
+    assert len(calls) == 2
